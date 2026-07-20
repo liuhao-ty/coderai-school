@@ -1,0 +1,46 @@
+{
+  "name": "coderai-kids-ai-suite",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently \"npm run dev:api\" \"npm run dev:web\"",
+    "dev:web": "vite --host 127.0.0.1 --port 5173",
+    "dev:api": "python -m uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000",
+    "build": "tsc && vite build",
+    "test": "python -m unittest discover -s tests -v",
+    "test:ppt-conversion": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/test-libreoffice-conversion.ps1",
+    "pretest:e2e": "node tests/e2e/prepare.mjs",
+    "test:e2e": "playwright test",
+    "check": "npm run test && npm run build",
+    "check:full": "npm run check && npm run test:e2e",
+    "preview": "vite preview --host 127.0.0.1 --port 4173",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.5.0",
+    "antd": "^5.27.0",
+    "axios": "^1.11.0",
+    "dayjs": "^1.11.13",
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-markdown": "^10.1.0",
+    "react-router-dom": "^7.18.1",
+    "reactflow": "^11.11.4",
+    "remark-gfm": "^4.0.1",
+    "zustand": "^5.0.8"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "^4.10.2",
+    "@playwright/test": "^1.61.1",
+    "@tauri-apps/cli": "^2.5.0",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.2",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.6"
+  }
+}

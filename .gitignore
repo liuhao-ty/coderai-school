@@ -1,0 +1,14 @@
+node_modules/
+dist/
+playwright-report/
+test-results/
+workspace_data/
+.codex-*.pid
+*.log
+__pycache__/
+*.pyc
+.venv/
+*.license-private.pem
+.license-issuer/
+*.plugin-private.pem
+.plugin-publisher/
