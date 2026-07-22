@@ -10,6 +10,8 @@
 
 生产对象存储与备份存储的 endpoint + bucket 组合必须不同。备份位置不能与生产数据盘共享故障域。
 
+封闭技术内测暂无独立存储时，可设置 `CODERAI_BACKUP_ENABLED=false`。`backup` 服务会保持运行并写入 `coderai_backup_enabled 0`，监控会显示 `CoderAIIndependentBackupDisabled` 告警。该模式不会产生任何异机备份，只能用于已接受数据丢失风险的限定内测。
+
 ## 自动备份
 
 Compose 中的 `backup` 服务每 24 小时执行：

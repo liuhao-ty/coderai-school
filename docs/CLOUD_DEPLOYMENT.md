@@ -8,7 +8,7 @@
 - 4 核、8 GB 内存、100 GB 独立数据盘的 Linux 主机
 - Docker Engine 和 Docker Compose v2
 - 固定公网 IPv4（建议绑定 EIP），80/443 端口可用
-- 与生产主机/MinIO 独立的 S3 兼容备份位置
+- 与生产主机/MinIO 独立的 S3 兼容备份位置；仅封闭内测可显式禁用并接受风险
 - 私有 Git 仓库和固定的发布提交
 - 正式机构代码，建议只使用小写字母、数字和连字符
 - 可接收证书通知的运维邮箱
@@ -49,7 +49,8 @@ python -m backend.app.cli generate-secret-key
 - PostgreSQL、MinIO 和备份密码均为独立随机强密码
 - `CODERAI_DATABASE_URL` 中的密码与 `POSTGRES_PASSWORD` 一致并正确 URL 编码
 - `CODERAI_S3_*` 指向生产 MinIO
-- `CODERAI_BACKUP_S3_*` 指向独立存储，不能与生产 endpoint + bucket 相同
+- `CODERAI_BACKUP_ENABLED=true` 时，`CODERAI_BACKUP_S3_*` 必须指向独立存储，不能与生产 endpoint + bucket 相同
+- 暂无独立存储的封闭内测可设置 `CODERAI_BACKUP_ENABLED=false` 并留空 `CODERAI_BACKUP_S3_*`；此状态会持续产生备份禁用告警，不得宣称为生产安全环境
 - `CODERAI_SECRET_KEY` 是 32 字节 URL-safe Base64
 - `CODERAI_CORS_ORIGINS` 不含 `*`
 - `CODERAI_ALERT_WEBHOOK_URL` 使用 HTTPS；留空时不会向外发送告警
@@ -61,6 +62,8 @@ python -m backend.app.cli generate-secret-key
 docker compose --env-file /srv/coderai/config/deploy.env -f deploy/docker-compose.yml config > /tmp/coderai-compose.yml
 grep -E 'replace-|example\.|203\.0\.113\.10|<[^>]+>' /tmp/coderai-compose.yml && exit 1 || true
 ```
+
+当 `CODERAI_BACKUP_ENABLED=false` 时，上述占位值检查不应包含已留空的 `CODERAI_BACKUP_S3_*`。上线独立存储后必须改回 `true`、手工执行首次备份并完成恢复演练。
 
 ## 3. 首次签发公网 IP 证书
 

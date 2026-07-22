@@ -43,6 +43,14 @@ class PublicIpDeploymentConfigTests(unittest.TestCase):
         self.assertIn("CODERAI_UPDATE_DIR=", environment)
         self.assertNotIn("CODERAI_DOMAIN=", environment)
 
+    def test_disabled_backup_mode_is_explicit_and_monitored(self):
+        compose = (ROOT / "deploy" / "docker-compose.yml").read_text(encoding="utf-8")
+        alerts = (ROOT / "deploy" / "monitoring" / "alerts.yml").read_text(encoding="utf-8")
+        environment = (ROOT / "deploy" / ".env.example").read_text(encoding="utf-8")
+        self.assertIn("CODERAI_BACKUP_ENABLED: ${CODERAI_BACKUP_ENABLED:-true}", compose)
+        self.assertIn("CODERAI_BACKUP_ENABLED=true", environment)
+        self.assertIn("CoderAIIndependentBackupDisabled", alerts)
+
 
 if __name__ == "__main__":
     unittest.main()

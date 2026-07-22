@@ -26,11 +26,17 @@ groups:
         annotations:
           summary: "CoderAI server data disk has less than 15 percent free"
       - alert: CoderAIBackupStale
-        expr: absent(coderai_backup_last_success_timestamp_seconds) OR time() - coderai_backup_last_success_timestamp_seconds > 129600
+        expr: coderai_backup_enabled == 1 and time() - coderai_backup_last_success_timestamp_seconds > 129600
         for: 10m
         labels: { severity: critical }
         annotations:
           summary: "CoderAI independent backup is older than 36 hours"
+      - alert: CoderAIIndependentBackupDisabled
+        expr: coderai_backup_enabled == 0
+        for: 1h
+        labels: { severity: warning }
+        annotations:
+          summary: "CoderAI independent backup is disabled"
       - alert: CoderAITlsCertificateRenewalRequired
         expr: absent(coderai_tls_certificate_valid_beyond_48h) OR coderai_tls_certificate_valid_beyond_48h == 0
         for: 15m

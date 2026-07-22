@@ -39,7 +39,13 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _write_metrics(success: bool, object_count: int = 0, total_bytes: int = 0) -> None:
+def _write_metrics(
+    success: bool,
+    object_count: int = 0,
+    total_bytes: int = 0,
+    *,
+    enabled: bool = True,
+) -> None:
     target = Path(os.environ.get("CODERAI_BACKUP_METRICS_FILE", "/tmp/coderai_backup.prom"))
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(".tmp")
@@ -53,8 +59,9 @@ def _write_metrics(success: bool, object_count: int = 0, total_bytes: int = 0) -
                 except ValueError:
                     pass
     lines = [
+        f"coderai_backup_enabled {1 if enabled else 0}",
         f"coderai_backup_last_success_timestamp_seconds {current if success else previous_success}",
-        f"coderai_backup_last_failure_timestamp_seconds {0 if success else current}",
+        f"coderai_backup_last_failure_timestamp_seconds {0 if success or not enabled else current}",
         f"coderai_backup_objects {object_count}",
         f"coderai_backup_bytes {total_bytes}",
     ]
@@ -215,6 +222,15 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--loop", action="store_true")
     args = parser.parse_args()
+    enabled = os.environ.get("CODERAI_BACKUP_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+    if not enabled:
+        _write_metrics(False, enabled=False)
+        print(json.dumps({"status": "disabled", "reason": "independent backup is not configured"}), flush=True)
+        if not args.loop:
+            return 0
+        while True:
+            time.sleep(max(3600, int(os.environ.get("CODERAI_BACKUP_INTERVAL_SECONDS", "86400"))))
+            _write_metrics(False, enabled=False)
     while True:
         try:
             print(json.dumps(run_backup(), ensure_ascii=False), flush=True)
