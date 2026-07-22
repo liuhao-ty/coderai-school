@@ -10,6 +10,7 @@ class PublicIpDeploymentConfigTests(unittest.TestCase):
         caddyfile = (ROOT / "deploy" / "Caddyfile").read_text(encoding="utf-8")
         self.assertIn("http://{$CODERAI_PUBLIC_IP}", caddyfile)
         self.assertIn("https://{$CODERAI_PUBLIC_IP}", caddyfile)
+        self.assertIn("default_sni {$CODERAI_PUBLIC_IP}", caddyfile)
         self.assertIn("/etc/letsencrypt/live/coderai-ip/fullchain.pem", caddyfile)
         self.assertIn("handle_path /desktop-updates/*", caddyfile)
         self.assertNotIn("CODERAI_DOMAIN", caddyfile)
@@ -60,6 +61,8 @@ class PublicIpDeploymentConfigTests(unittest.TestCase):
         self.assertIn("CODERAI_BACKUP_ENABLED: ${CODERAI_BACKUP_ENABLED:-true}", compose)
         self.assertIn("CODERAI_BACKUP_ENABLED=true", environment)
         self.assertIn("CoderAIIndependentBackupDisabled", alerts)
+        deployment = (ROOT / "docs" / "CLOUD_DEPLOYMENT.md").read_text(encoding="utf-8")
+        self.assertIn("-o 10001 -g 10001 -m 0755 /srv/coderai/metrics", deployment)
 
 
 if __name__ == "__main__":

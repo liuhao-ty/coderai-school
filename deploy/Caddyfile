@@ -1,3 +1,7 @@
+{
+	default_sni {$CODERAI_PUBLIC_IP}
+}
+
 http://{$CODERAI_PUBLIC_IP} {
 	route {
 		handle_path /.well-known/acme-challenge/* {

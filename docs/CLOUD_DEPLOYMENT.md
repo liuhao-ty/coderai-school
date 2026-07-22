@@ -36,7 +36,7 @@ cd /srv/coderai/app
 cp deploy/.env.example /srv/coderai/config/deploy.env
 chmod 600 /srv/coderai/config/deploy.env
 install -d -m 0755 /srv/coderai/acme /srv/coderai/updates
-install -d -o 10001 -g 10001 -m 0750 /srv/coderai/metrics
+install -d -o 10001 -g 10001 -m 0755 /srv/coderai/metrics
 python -m backend.app.cli generate-secret-key
 ```
 
