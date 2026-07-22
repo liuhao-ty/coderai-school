@@ -6,11 +6,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class PublicIpDeploymentConfigTests(unittest.TestCase):
-    def test_caddy_uses_public_ip_tls_and_hosts_updates(self):
+    def test_caddy_uses_no_sni_ip_tls_and_hosts_updates(self):
         caddyfile = (ROOT / "deploy" / "Caddyfile").read_text(encoding="utf-8")
         self.assertIn("http://{$CODERAI_PUBLIC_IP}", caddyfile)
-        self.assertIn("https://{$CODERAI_PUBLIC_IP}", caddyfile)
-        self.assertIn("default_sni {$CODERAI_PUBLIC_IP}", caddyfile)
+        self.assertIn("\n:443 {", caddyfile)
+        self.assertNotIn("\nhttps://{$CODERAI_PUBLIC_IP} {", caddyfile)
+        self.assertNotIn("default_sni", caddyfile)
         self.assertIn("/etc/letsencrypt/live/coderai-ip/fullchain.pem", caddyfile)
         self.assertIn("handle_path /desktop-updates/*", caddyfile)
         self.assertNotIn("CODERAI_DOMAIN", caddyfile)
