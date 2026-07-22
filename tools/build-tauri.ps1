@@ -50,7 +50,7 @@ if (-not $UnsignedUpdater) {
     if (-not (Test-Path -LiteralPath $privateKeyPath) -or -not (Test-Path -LiteralPath $passwordPath)) {
         throw "Updater signing material was not found under $SecretRoot."
     }
-    $securePassword = Get-Content -LiteralPath $passwordPath -Raw | ConvertTo-SecureString
+    $securePassword = (Get-Content -LiteralPath $passwordPath -Raw).Trim() | ConvertTo-SecureString
     $credential = [PSCredential]::new("updater", $securePassword)
     $env:TAURI_SIGNING_PRIVATE_KEY = $privateKeyPath
     $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = $credential.GetNetworkCredential().Password

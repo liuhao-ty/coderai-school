@@ -65,6 +65,10 @@ class PublicIpDeploymentConfigTests(unittest.TestCase):
         deployment = (ROOT / "docs" / "CLOUD_DEPLOYMENT.md").read_text(encoding="utf-8")
         self.assertIn("-o 10001 -g 10001 -m 0755 /srv/coderai/metrics", deployment)
 
+    def test_windows_build_trims_the_encrypted_updater_password(self):
+        build_script = (ROOT / "tools" / "build-tauri.ps1").read_text(encoding="utf-8")
+        self.assertIn("(Get-Content -LiteralPath $passwordPath -Raw).Trim() | ConvertTo-SecureString", build_script)
+
 
 if __name__ == "__main__":
     unittest.main()
