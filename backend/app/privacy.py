@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.audit import record_teacher_audit
 from backend.app.auth import SECRET_SETTING_KEY, ensure_auth_settings, get_setting, require_admin, require_student_or_teacher, require_teacher
-from backend.app.db import DATA_DIR, get_db
+from backend.app.db import CLOUD_MODE, DATA_DIR, get_db
 from backend.app.models import (
     Asset,
     GuardianConsent,
@@ -44,6 +44,14 @@ from backend.app.schemas import (
     StudentDataDeleteRequest,
 )
 from backend.app.secrets import SecretProtectionError, decrypt_secret, encrypt_secret
+from backend.app.storage import (
+    is_object_reference,
+    list_organization_objects,
+    purge_quarantined_objects,
+    quarantine_objects,
+    read_bytes as read_stored_bytes,
+    restore_quarantined_objects,
+)
 
 
 BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
@@ -56,7 +64,7 @@ DEFAULT_POLICY_MARKDOWN = """# CoderAI 学堂隐私与未成年人数据保护�
 
 ## 我们处理哪些数据
 
-软件仅为课堂学习处理学生姓名、用户名、密码强哈希、班级、学龄分类、课程任务、AI 输入、生成结果、作品、提交与批改记录。学生账号由管理员创建，登录会话只用于本机身份隔离。
+软件仅为课堂学习处理学生姓名、用户名、密码强哈希、班级、学龄分类、课程任务、AI 输入、生成结果、作品、提交与批改记录。学生账号由管理员创建，登录会话用于云端身份与机构数据隔离。
 
 ## 为什么处理
 
@@ -68,11 +76,11 @@ DEFAULT_POLICY_MARKDOWN = """# CoderAI 学堂隐私与未成年人数据保护�
 
 ## 数据最小化与安全
 
-学生只能访问自己的作品、提交和运行记录。教师高风险操作会记录脱敏审计日志；API 密钥使用 Windows DPAPI 加密；内容经过学龄分类策略和安全审核。
+学生只能访问自己的作品、提交和运行记录。教师高风险操作会记录脱敏审计日志；云端 API 密钥使用 AES-GCM 和服务器主密钥加密；内容经过学龄分类策略和安全审核。
 
 ## 保存、导出与删除
 
-课堂数据默认保留 365 天，机构可发布新政策调整期限。教师或学生可导出学生个人数据；删除必须由教师完成预检和二次确认，并同时处理数据库记录、受管文件、旧导出与可能包含该学生数据的本地备份。
+课堂数据默认保留 365 天，机构可发布新政策调整期限。教师或学生可导出学生个人数据；删除必须由管理员完成预检、审批和二次确认，并同时处理数据库记录、受管对象、旧导出与独立备份中的到期副本。
 
 ## 监护人权利
 
@@ -327,7 +335,7 @@ def _raw_record_paths(records: dict[str, list[Any]]) -> list[str]:
 
 
 def _managed_file(raw_path: str) -> Path | None:
-    if not raw_path or raw_path.startswith(("http://", "https://", "data:")):
+    if not raw_path or raw_path.startswith(("http://", "https://", "data:")) or is_object_reference(raw_path):
         return None
     candidate = Path(raw_path)
     try:
@@ -352,6 +360,18 @@ def _other_referenced_paths(db: Session, records: dict[str, list[Any]]) -> set[P
     return {path for raw in raw_paths if (path := _managed_file(raw)) is not None}
 
 
+def _other_referenced_objects(db: Session, records: dict[str, list[Any]]) -> set[str]:
+    excluded = {key: {item.id for item in values} for key, values in records.items()}
+    raw_paths: list[str] = []
+    raw_paths.extend(item.file_path for item in db.query(Project).filter(~Project.id.in_(excluded["projects"] or [-1])).all())
+    raw_paths.extend(item.file_path for item in db.query(Asset).filter(~Asset.id.in_(excluded["assets"] or [-1])).all())
+    raw_paths.extend(item.project_file_path for item in db.query(SubmissionVersion).filter(~SubmissionVersion.id.in_(excluded["submission_versions"] or [-1])).all())
+    for item in db.query(VideoTask).filter(~VideoTask.id.in_(excluded["video_tasks"] or [-1])).all():
+        raw_paths.extend([item.file_path, item.source_image_path])
+    raw_paths.extend(item.resource_path for item in db.query(ModerationLog).filter(~ModerationLog.id.in_(excluded["moderation_logs"] or [-1])).all())
+    return {str(raw) for raw in raw_paths if is_object_reference(str(raw or ""))}
+
+
 def _files_under(root: Path) -> set[Path]:
     if not root.is_dir():
         return set()
@@ -372,6 +392,37 @@ def _student_file_scope(
     records: dict[str, list[Any]],
     include_cleanup_artifacts: bool = True,
 ) -> dict[str, Any]:
+    if CLOUD_MODE:
+        all_objects = {str(item["reference"]): item for item in list_organization_objects()}
+        referenced = {item for item in _raw_record_paths(records) if is_object_reference(item)}
+        other_references = _other_referenced_objects(db, records)
+        shared = referenced & other_references
+        managed = referenced - shared
+        input_marker = f"/ai_inputs/student-{student_id}/"
+        managed.update(reference for reference in all_objects if input_marker in reference)
+        details = []
+        for reference in sorted(managed):
+            metadata = all_objects.get(reference)
+            if not metadata:
+                continue
+            basename = Path(reference.split("/", 3)[-1]).name or "object"
+            details.append({
+                "reference": reference,
+                "relative": f"objects/{hashlib.sha256(reference.encode('utf-8')).hexdigest()[:16]}-{basename}",
+                "size": int(metadata.get("size_bytes") or 0),
+                "mtime_ns": str(metadata.get("last_modified") or ""),
+            })
+        external_references = sum(
+            1 for item in _raw_record_paths(records) if not is_object_reference(item)
+        )
+        return {
+            "files": details,
+            "shared_files": len(shared),
+            "external_references": external_references,
+            "workflow_cache_files": 0,
+            "backup_files": 0,
+        }
+
     referenced = {_managed_file(item) for item in _raw_record_paths(records)}
     referenced.discard(None)
     other_references = _other_referenced_paths(db, records)
@@ -586,7 +637,10 @@ def build_student_export(db: Session, student: User, include_guardian_contact: b
             "# CoderAI 学生个人数据导出\n\n本压缩包只包含该学生可归属的数据和受管文件，不包含教师密码、API Key、其他学生数据或共享素材。\n",
         )
         for item in file_scope["files"]:
-            archive.write(item["path"], f"files/{item['relative']}")
+            if item.get("reference"):
+                archive.writestr(f"files/{item['relative']}", read_stored_bytes(item["reference"]))
+            else:
+                archive.write(item["path"], f"files/{item['relative']}")
     return package_path
 
 
@@ -695,13 +749,22 @@ def delete_student_data(
     request_id = "pdr_" + secrets.token_urlsafe(12)
     quarantine: Path | None = None
     moved: list[tuple[Path, Path]] = []
+    moved_objects: list[tuple[str, str]] = []
     try:
-        quarantine, moved = _move_to_quarantine(file_scope["files"], request_id)
+        if CLOUD_MODE:
+            moved_objects = quarantine_objects(
+                [str(item["reference"]) for item in file_scope["files"] if item.get("reference")],
+                request_id,
+            )
+        else:
+            quarantine, moved = _move_to_quarantine(file_scope["files"], request_id)
         _delete_database_records(db, student, records, teacher, request_id, summary, reason)
         db.commit()
     except Exception as exc:
         db.rollback()
         _restore_quarantine(moved)
+        if moved_objects:
+            restore_quarantined_objects(moved_objects)
         if quarantine:
             shutil.rmtree(quarantine, ignore_errors=True)
         raise HTTPException(
@@ -715,6 +778,8 @@ def delete_student_data(
             shutil.rmtree(quarantine)
         except OSError:
             warnings.append("隔离区清理失败，系统会在下次启动时重试。")
+    if moved_objects:
+        purge_quarantined_objects(moved_objects)
     return request_id, warnings
 
 
@@ -803,7 +868,7 @@ def publish_privacy_policy(
 
 @router.get("/students")
 def list_student_privacy(teacher: TeacherSession = Depends(require_teacher), db: Session = Depends(get_db)):
-    actor = _privacy_teacher_actor(db, teacher)
+    _privacy_teacher_actor(db, teacher)
     query = db.query(User).filter(User.role == "student")
     students = query.order_by(User.name, User.id).all()
     return {"students": [_student_privacy_payload(db, student, include_history=False) for student in students]}

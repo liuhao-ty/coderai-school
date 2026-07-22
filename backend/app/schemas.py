@@ -306,6 +306,7 @@ class StudentBatchRestoreRequest(StudentBatchRequest):
 
 
 class StudentLoginRequest(BaseModel):
+    organization_code: str = Field(default="coderai-pilot", min_length=2, max_length=80)
     username: str = Field(default="", max_length=80)
     password: str = Field(default="", max_length=200)
     device_name: str = Field(default="此设备", max_length=160)
@@ -374,6 +375,7 @@ class FeedbackTemplateRequest(BaseModel):
 
 
 class TeacherLoginRequest(BaseModel):
+    organization_code: str = Field(default="coderai-pilot", min_length=2, max_length=80)
     username: str = Field(default="admin", max_length=80)
     password: str = Field(min_length=1)
     device_name: str = Field(default="此设备", max_length=160)

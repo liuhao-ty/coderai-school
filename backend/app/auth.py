@@ -8,8 +8,9 @@ from fastapi import Depends, Header, HTTPException
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from backend.app.db import get_db
-from backend.app.models import AppSetting, StudentSession, TeacherSession, User, now
+from backend.app.db import CLOUD_MODE, get_db
+from backend.app.models import AppSetting, Organization, StudentSession, TeacherSession, User, now
+from backend.app.tenancy import current_organization_code
 
 
 DEFAULT_TEACHER_PASSWORD = "123456"
@@ -124,6 +125,8 @@ def generate_temporary_password() -> str:
 def account_payload(user: User) -> dict:
     return {
         "id": user.id,
+        "organization_id": user.organization_id,
+        "organization_code": current_organization_code(),
         "name": user.name,
         "username": user.username,
         "role": user.role,
@@ -154,6 +157,8 @@ def ensure_auth_settings(db: Session):
 
     teacher_accounts = db.query(User).filter(User.role.in_(TEACHER_ROLES)).order_by(User.id.asc()).all()
     if not teacher_accounts:
+        if CLOUD_MODE:
+            return
         password_hash = get_setting(db, PASSWORD_SETTING_KEY) or hash_password(DEFAULT_TEACHER_PASSWORD)
         admin = User(
             name="机构管理员",
@@ -263,6 +268,8 @@ def _token_hash(token: str) -> str:
 def teacher_session_payload(session: TeacherSession, access_token: str = "", refresh_token: str = "") -> dict:
     payload = {
         "session_id": session.id,
+        "organization_id": session.organization_id,
+        "organization_code": current_organization_code(),
         "device_name": session.device_name,
         "created_at": session.created_at.isoformat(),
         "last_seen_at": session.last_seen_at.isoformat(),
@@ -278,7 +285,41 @@ def teacher_session_payload(session: TeacherSession, access_token: str = "", ref
     return payload
 
 
+def ensure_cloud_session_capacity(db: Session, user_id: int) -> None:
+    if not CLOUD_MODE:
+        return
+    from backend.app.tenancy import current_organization_id
+
+    organization = db.get(Organization, current_organization_id())
+    if not organization:
+        raise HTTPException(status_code=403, detail={"code": "ORGANIZATION_NOT_FOUND", "message": "当前机构不存在。"})
+    current = now()
+    active_user_ids = {
+        int(item[0])
+        for item in db.query(TeacherSession.user_id).filter(
+            TeacherSession.user_id.is_not(None),
+            TeacherSession.revoked_at.is_(None),
+            TeacherSession.expires_at > current,
+        ).distinct().all()
+    }
+    active_user_ids.update(
+        int(item[0])
+        for item in db.query(StudentSession.user_id).filter(
+            StudentSession.user_id.is_not(None),
+            StudentSession.revoked_at.is_(None),
+            StudentSession.expires_at > current,
+        ).distinct().all()
+    )
+    if user_id not in active_user_ids and len(active_user_ids) >= max(1, organization.seat_limit):
+        raise HTTPException(
+            status_code=429,
+            detail={"code": "ORGANIZATION_SEAT_LIMIT", "message": f"当前机构同时在线人数已达到 {organization.seat_limit} 人上限。"},
+            headers={"Retry-After": "60"},
+        )
+
+
 def issue_teacher_session(db: Session, user: User, device_name: str = "此设备") -> dict:
+    ensure_cloud_session_capacity(db, user.id)
     access_token = "cta_" + secrets.token_urlsafe(32)
     refresh_token = "ctr_" + secrets.token_urlsafe(48)
     current = now()
@@ -359,6 +400,7 @@ def revoke_all_teacher_sessions(db: Session, user_id: int | None = None) -> None
 
 
 def issue_student_session(db: Session, student: User, device_name: str = "此设备") -> dict:
+    ensure_cloud_session_capacity(db, student.id)
     token = "csa_" + secrets.token_urlsafe(40)
     current = now()
     session = StudentSession(

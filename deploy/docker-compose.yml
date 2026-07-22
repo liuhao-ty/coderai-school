@@ -1,0 +1,255 @@
+name: coderai-pilot
+
+x-app-environment: &app-environment
+  CODERAI_CLOUD_MODE: "true"
+  CODERAI_TASK_QUEUE_ENABLED: "true"
+  CODERAI_STORAGE_BACKEND: s3
+  CODERAI_AUTO_CREATE_SCHEMA: "false"
+  CODERAI_DATABASE_URL: ${CODERAI_DATABASE_URL}
+  CODERAI_REDIS_URL: ${CODERAI_REDIS_URL:-redis://redis:6379/0}
+  CODERAI_S3_BUCKET: ${CODERAI_S3_BUCKET:-coderai-pilot}
+  CODERAI_S3_ENDPOINT: ${CODERAI_S3_ENDPOINT:-http://minio:9000}
+  CODERAI_S3_REGION: ${CODERAI_S3_REGION:-us-east-1}
+  CODERAI_S3_ACCESS_KEY: ${CODERAI_S3_ACCESS_KEY}
+  CODERAI_S3_SECRET_KEY: ${CODERAI_S3_SECRET_KEY}
+  CODERAI_S3_SECURE: ${CODERAI_S3_SECURE:-false}
+  CODERAI_SECRET_KEY: ${CODERAI_SECRET_KEY}
+  CODERAI_SECRET_KEY_PREVIOUS: ${CODERAI_SECRET_KEY_PREVIOUS:-}
+  CODERAI_DEFAULT_ORGANIZATION_CODE: ${CODERAI_DEFAULT_ORGANIZATION_CODE:-coderai-pilot}
+  CODERAI_DEFAULT_ORGANIZATION_NAME: ${CODERAI_DEFAULT_ORGANIZATION_NAME:-CoderAI 试点机构}
+  CODERAI_MINIMUM_CLIENT_VERSION: ${CODERAI_MINIMUM_CLIENT_VERSION:-0.2.0-beta.1}
+  CODERAI_RELEASE_CHANNEL: ${CODERAI_RELEASE_CHANNEL:-beta}
+  CODERAI_BUILD_COMMIT: ${CODERAI_BUILD_COMMIT:-development}
+  CODERAI_CORS_ORIGINS: ${CODERAI_CORS_ORIGINS:-tauri://localhost,http://tauri.localhost,https://tauri.localhost}
+  CODERAI_JSON_LOGS: ${CODERAI_JSON_LOGS:-true}
+  CODERAI_LOG_LEVEL: ${CODERAI_LOG_LEVEL:-INFO}
+
+services:
+  postgres:
+    image: postgres:17.5-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-coderai}
+      POSTGRES_USER: ${POSTGRES_USER:-coderai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    security_opt:
+      - no-new-privileges:true
+
+  redis:
+    image: redis:7.4.5-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    security_opt:
+      - no-new-privileges:true
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    security_opt:
+      - no-new-privileges:true
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}" &&
+        mc mb --ignore-existing "local/$${CODERAI_S3_BUCKET}" &&
+        mc anonymous set none "local/$${CODERAI_S3_BUCKET}"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      CODERAI_S3_BUCKET: ${CODERAI_S3_BUCKET:-coderai-pilot}
+
+  migrate:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: coderai-api:0.2.0-beta.1
+    restart: "no"
+    command: ["migrate"]
+    environment: *app-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+
+  api:
+    image: coderai-api:0.2.0-beta.1
+    restart: unless-stopped
+    command: ["api"]
+    environment:
+      <<: *app-environment
+      CODERAI_API_WORKERS: ${CODERAI_API_WORKERS:-2}
+    volumes:
+      - app_runtime:/app/runtime
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    security_opt:
+      - no-new-privileges:true
+
+  worker:
+    image: coderai-api:0.2.0-beta.1
+    restart: unless-stopped
+    command: ["worker"]
+    environment:
+      <<: *app-environment
+      CODERAI_CELERY_CONCURRENCY: ${CODERAI_CELERY_CONCURRENCY:-2}
+    volumes:
+      - app_runtime:/app/runtime
+    depends_on:
+      api:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+
+  beat:
+    image: coderai-api:0.2.0-beta.1
+    restart: unless-stopped
+    command: ["beat"]
+    environment: *app-environment
+    volumes:
+      - app_runtime:/app/runtime
+    depends_on:
+      api:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+
+  caddy:
+    image: caddy:2.10.0-alpine
+    restart: unless-stopped
+    environment:
+      CODERAI_DOMAIN: ${CODERAI_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+
+  backup:
+    image: coderai-api:0.2.0-beta.1
+    restart: unless-stopped
+    command: ["backup", "--loop"]
+    environment:
+      <<: *app-environment
+      CODERAI_BACKUP_S3_ENDPOINT: ${CODERAI_BACKUP_S3_ENDPOINT}
+      CODERAI_BACKUP_S3_BUCKET: ${CODERAI_BACKUP_S3_BUCKET}
+      CODERAI_BACKUP_S3_ACCESS_KEY: ${CODERAI_BACKUP_S3_ACCESS_KEY}
+      CODERAI_BACKUP_S3_SECRET_KEY: ${CODERAI_BACKUP_S3_SECRET_KEY}
+      CODERAI_BACKUP_S3_REGION: ${CODERAI_BACKUP_S3_REGION:-us-east-1}
+      CODERAI_BACKUP_INTERVAL_SECONDS: ${CODERAI_BACKUP_INTERVAL_SECONDS:-86400}
+      CODERAI_BACKUP_METRICS_FILE: /metrics/coderai_backup.prom
+    volumes:
+      - backup_work:/app/runtime/backups
+      - monitoring_metrics:/metrics
+    depends_on:
+      api:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    restart: unless-stopped
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=30d"]
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - api
+      - alertmanager
+
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/etc/alertmanager/coderai-entrypoint.sh"]
+    environment:
+      CODERAI_ALERT_WEBHOOK_URL: ${CODERAI_ALERT_WEBHOOK_URL:-}
+    volumes:
+      - ./monitoring/alertmanager-entrypoint.sh:/etc/alertmanager/coderai-entrypoint.sh:ro
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.17.1
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_NAME: postgresql://${POSTGRES_USER:-coderai}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-coderai}?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.76.0
+    restart: unless-stopped
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  node-exporter:
+    image: prom/node-exporter:v1.9.1
+    restart: unless-stopped
+    command: ["--path.rootfs=/host", "--collector.textfile.directory=/metrics"]
+    volumes:
+      - /:/host:ro,rslave
+      - monitoring_metrics:/metrics:ro
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  app_runtime:
+  backup_work:
+  caddy_data:
+  caddy_config:
+  prometheus_data:
+  monitoring_metrics:

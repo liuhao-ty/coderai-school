@@ -9,6 +9,7 @@ import {
   CalendarClock,
   ClipboardCheck,
   DatabaseBackup,
+  Download,
   GraduationCap,
   KeyRound,
   LayoutDashboard,
@@ -21,6 +22,7 @@ import {
   ShieldCheck,
   UserRoundCog,
   UsersRound,
+  WifiOff,
   Workflow,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -46,6 +48,7 @@ import {
   api,
   clearStudentAuth,
   clearTeacherAuth,
+  getAuthValue,
   loadStudentProfile,
   loadTeacherProfile,
   storeStudentAuth,
@@ -58,6 +61,7 @@ import {
   TEACHER_WEAK_PASSWORD_SESSION_KEY,
 } from "./lib/api";
 import { allowedToolsFromTasks } from "./lib/domain";
+import { checkDesktopUpdate, compareVersions, currentClientVersion, installDesktopUpdate } from "./lib/desktopRuntime";
 import { useAppStore, type WorkspaceRole } from "./store/appStore";
 import type { StudentAuth, TeacherAuth } from "./types";
 
@@ -126,6 +130,9 @@ export default function App() {
   const navigate = useNavigate();
   const returningToLaunch = useRef(false);
   const [weakPasswordPromptOpen, setWeakPasswordPromptOpen] = useState(false);
+  const [online, setOnline] = useState(() => navigator.onLine);
+  const [updateState, setUpdateState] = useState<{ version: string; required: boolean; body: string } | null>(null);
+  const [updateProgress, setUpdateProgress] = useState<number | null>(null);
   const { mode, page } = routeState(location.pathname);
   const {
     projects,
@@ -164,6 +171,40 @@ export default function App() {
   const selectedMenuKey = selectedCoursePackageId === null ? page : `course-package-${selectedCoursePackageId}`;
 
   useEffect(() => {
+    const updateOnline = () => setOnline(navigator.onLine);
+    window.addEventListener("online", updateOnline);
+    window.addEventListener("offline", updateOnline);
+    return () => {
+      window.removeEventListener("online", updateOnline);
+      window.removeEventListener("offline", updateOnline);
+    };
+  }, []);
+
+  useEffect(() => {
+    const inspectVersion = async () => {
+      try {
+        const [versionResponse, currentVersion, update] = await Promise.all([
+          api.get("/api/version"),
+          currentClientVersion(),
+          checkDesktopUpdate().catch(() => null),
+        ]);
+        const minimumVersion = String(versionResponse.data.minimum_client_version || "");
+        const required = Boolean(minimumVersion && compareVersions(currentVersion, minimumVersion) < 0);
+        if (update || required) {
+          setUpdateState({
+            version: update?.version || minimumVersion,
+            required,
+            body: update?.body || (required ? "当前客户端版本已停止访问，请安装管理员发布的新版本。" : ""),
+          });
+        }
+      } catch {
+        // Network state is presented separately; version checks retry on the next launch.
+      }
+    };
+    void inspectVersion();
+  }, []);
+
+  useEffect(() => {
     const authTitle = mode === "teacher-password-change" || mode === "student-password-change"
       ? "修改密码"
       : mode === "teacher-login"
@@ -198,19 +239,19 @@ export default function App() {
       if (mode === "launch") returningToLaunch.current = false;
       return;
     }
-    if (mode === "student" && !localStorage.getItem(STUDENT_TOKEN_KEY)) {
+    if (mode === "student" && !getAuthValue(STUDENT_TOKEN_KEY)) {
       navigate("/student/login", { replace: true });
       return;
     }
-    if (mode === "student-password-change" && !localStorage.getItem(STUDENT_TOKEN_KEY)) {
+    if (mode === "student-password-change" && !getAuthValue(STUDENT_TOKEN_KEY)) {
       navigate("/student/login", { replace: true });
       return;
     }
-    if (staffMode && !localStorage.getItem(TEACHER_REFRESH_TOKEN_KEY)) {
+    if (staffMode && !getAuthValue(TEACHER_REFRESH_TOKEN_KEY)) {
       navigate("/teacher/login", { replace: true });
       return;
     }
-    if (mode === "teacher-password-change" && !localStorage.getItem(TEACHER_REFRESH_TOKEN_KEY)) {
+    if (mode === "teacher-password-change" && !getAuthValue(TEACHER_REFRESH_TOKEN_KEY)) {
       navigate("/teacher/login", { replace: true });
       return;
     }
@@ -239,7 +280,7 @@ export default function App() {
   useEffect(() => {
     if (!staffMode) return;
     const refreshAuthIfNeeded = async () => {
-      const refreshToken = localStorage.getItem(TEACHER_REFRESH_TOKEN_KEY);
+      const refreshToken = getAuthValue(TEACHER_REFRESH_TOKEN_KEY);
       const accessExpiresAt = localStorage.getItem(TEACHER_ACCESS_EXPIRES_KEY);
       if (!refreshToken) {
         clearTeacherAuth();
@@ -332,8 +373,8 @@ export default function App() {
   };
 
   const leaveWorkspace = async () => {
-    const refreshToken = localStorage.getItem(TEACHER_REFRESH_TOKEN_KEY);
-    const studentToken = localStorage.getItem(STUDENT_TOKEN_KEY);
+    const refreshToken = getAuthValue(TEACHER_REFRESH_TOKEN_KEY);
+    const studentToken = getAuthValue(STUDENT_TOKEN_KEY);
     if (staffMode && refreshToken) {
       try {
         await api.post("/api/auth/teacher-logout", { refresh_token: refreshToken });
@@ -572,6 +613,7 @@ export default function App() {
               </Text>
             </div>
             <Space size={12} wrap>
+              {!online && <Tag color="error" icon={<WifiOff size={14} />}>网络已断开</Tag>}
               <Tag color={mode === "admin" ? "purple" : mode === "teacher" ? "cyan" : "blue"}>
                 {mode === "student"
                   ? `${studentProfile?.name || "学生"}${studentProfile?.username ? ` · ${studentProfile.username}` : ""}`
@@ -599,6 +641,33 @@ export default function App() {
       }}
     >
       <AntApp>
+        <Modal
+          open={Boolean(updateState)}
+          title={updateState?.required ? "需要更新后继续使用" : "发现新版本"}
+          closable={!updateState?.required && updateProgress === null}
+          maskClosable={false}
+          keyboard={!updateState?.required}
+          onCancel={() => !updateState?.required && setUpdateState(null)}
+          footer={[
+            !updateState?.required && (
+              <Button key="later" disabled={updateProgress !== null} onClick={() => setUpdateState(null)}>稍后更新</Button>
+            ),
+            <Button
+              key="install"
+              type="primary"
+              icon={<Download size={16} />}
+              loading={updateProgress !== null}
+              onClick={() => {
+                setUpdateProgress(0);
+                void installDesktopUpdate(setUpdateProgress).catch(() => setUpdateProgress(null));
+              }}
+            >
+              {updateProgress === null ? `安装 ${updateState?.version || "新版本"}` : `正在更新 ${updateProgress}%`}
+            </Button>,
+          ].filter(Boolean)}
+        >
+          <Typography.Paragraph>{updateState?.body || "新版本已准备好，安装完成后应用会自动重新启动。"}</Typography.Paragraph>
+        </Modal>
         <Modal
           open={weakPasswordPromptOpen && mode === "teacher"}
           title="当前教师密码安全性较弱"

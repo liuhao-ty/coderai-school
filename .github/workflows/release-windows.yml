@@ -1,0 +1,96 @@
+name: Release Windows Beta
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_notes:
+        description: Release notes shown by the desktop updater
+        required: true
+        type: string
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  signed-release:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    environment: pilot-production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.15.0"
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - name: Validate release configuration and import Authenticode certificate
+        id: signing
+        shell: pwsh
+        env:
+          CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          PRODUCTION_API_URL: ${{ vars.CODERAI_PRODUCTION_API_URL }}
+          UPDATER_ENDPOINT: ${{ vars.CODERAI_UPDATER_ENDPOINT }}
+        run: |
+          if (-not $env:CERTIFICATE_PFX_BASE64 -or -not $env:CERTIFICATE_PASSWORD) { throw "Windows signing certificate secrets are missing." }
+          if (-not $env:PRODUCTION_API_URL.StartsWith("https://")) { throw "CODERAI_PRODUCTION_API_URL must be HTTPS." }
+          if (-not $env:UPDATER_ENDPOINT.StartsWith("https://")) { throw "CODERAI_UPDATER_ENDPOINT must be HTTPS." }
+          $certificatePath = Join-Path $env:RUNNER_TEMP "coderai-signing.pfx"
+          [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:CERTIFICATE_PFX_BASE64))
+          $password = ConvertTo-SecureString $env:CERTIFICATE_PASSWORD -AsPlainText -Force
+          $certificate = Import-PfxCertificate -FilePath $certificatePath -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          if (-not $certificate.Thumbprint) { throw "Unable to import Windows signing certificate." }
+          "certificate_thumbprint=$($certificate.Thumbprint)" >> $env:GITHUB_OUTPUT
+      - name: Build signed NSIS installer and updater artifact
+        shell: pwsh
+        env:
+          VITE_API_URL: ${{ vars.CODERAI_PRODUCTION_API_URL }}
+          VITE_ORGANIZATION_CODE: ${{ vars.CODERAI_ORGANIZATION_CODE }}
+          VITE_UPDATER_ENABLED: "true"
+          UPDATER_ENDPOINT: ${{ vars.CODERAI_UPDATER_ENDPOINT }}
+          API_URL: ${{ vars.CODERAI_PRODUCTION_API_URL }}
+          CERTIFICATE_THUMBPRINT: ${{ steps.signing.outputs.certificate_thumbprint }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_UPDATER_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_UPDATER_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if (-not $env:TAURI_SIGNING_PRIVATE_KEY -or -not $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) { throw "Tauri updater signing secrets are missing." }
+          $apiOrigin = ([Uri]$env:API_URL).GetLeftPart([UriPartial]::Authority)
+          $updateValidation = $env:UPDATER_ENDPOINT.Replace("{{target}}", "windows").Replace("{{arch}}", "x86_64").Replace("{{current_version}}", "0.0.0")
+          $updateOrigin = ([Uri]$updateValidation).GetLeftPart([UriPartial]::Authority)
+          $csp = "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost $apiOrigin $updateOrigin; img-src 'self' asset: http://asset.localhost data: blob: $apiOrigin; media-src 'self' asset: http://asset.localhost blob: $apiOrigin; frame-src 'self' blob: $apiOrigin"
+          $env:TAURI_CONFIG = @{
+            app = @{ security = @{ csp = $csp } }
+            bundle = @{ windows = @{
+              certificateThumbprint = $env:CERTIFICATE_THUMBPRINT
+              digestAlgorithm = "sha256"
+              timestampUrl = "http://timestamp.digicert.com"
+            }}
+            plugins = @{ updater = @{ endpoints = @($env:UPDATER_ENDPOINT) } }
+          } | ConvertTo-Json -Depth 8 -Compress
+          npm run tauri:build
+      - name: Generate updater manifest
+        shell: pwsh
+        env:
+          RELEASE_NOTES: ${{ inputs.release_notes || github.ref_name }}
+          UPDATE_ASSET_BASE_URL: ${{ vars.CODERAI_UPDATE_ASSET_BASE_URL }}
+        run: |
+          if (-not $env:UPDATE_ASSET_BASE_URL.StartsWith("https://")) { throw "CODERAI_UPDATE_ASSET_BASE_URL must be HTTPS." }
+          ./tools/generate-update-manifest.ps1 -AssetBaseUrl $env:UPDATE_ASSET_BASE_URL -Notes $env:RELEASE_NOTES
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coderai-0.2.0-beta.1-windows-signed
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/nsis/*.zip
+            src-tauri/target/release/bundle/nsis/*.sig
+            src-tauri/target/release/bundle/nsis/latest.json
+          if-no-files-found: error
+          retention-days: 90

@@ -8,6 +8,7 @@ import sqlite3
 import zipfile
 from urllib.parse import urlparse
 
+from fastapi import Header, HTTPException, Request
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
@@ -15,10 +16,21 @@ from sqlalchemy.orm import DeclarativeBase, sessionmaker
 ROOT_DIR = Path(__file__).resolve().parents[2]
 DATA_DIR = Path(os.environ.get("CODERAI_DATA_DIR", ROOT_DIR / "workspace_data")).resolve()
 DB_PATH = DATA_DIR / "coderai.db"
+DATABASE_URL = os.environ.get("CODERAI_DATABASE_URL", f"sqlite:///{DB_PATH}").strip()
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = "postgresql+psycopg://" + DATABASE_URL.removeprefix("postgres://")
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = "postgresql+psycopg://" + DATABASE_URL.removeprefix("postgresql://")
+IS_SQLITE = DATABASE_URL.startswith("sqlite:")
+CLOUD_MODE = os.environ.get("CODERAI_CLOUD_MODE", "false").lower() in {"1", "true", "yes"} or not IS_SQLITE
+CLOUD_INITIALIZATION_LOCK_ID = 4_341_737_391
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
+engine_options: dict = {"pool_pre_ping": True}
+if IS_SQLITE:
+    engine_options["connect_args"] = {"check_same_thread": False}
+engine = create_engine(DATABASE_URL, **engine_options)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
@@ -26,48 +38,135 @@ class Base(DeclarativeBase):
     pass
 
 
-def get_db():
+async def get_db(
+    request: Request,
+    x_coderai_organization_code: str = Header(default="", alias="X-CoderAI-Organization-Code"),
+):
+    from backend.app.models import Organization
+    from backend.app.tenancy import organization_context, without_tenant_filter
+
     db = SessionLocal()
     try:
-        yield db
+        code = (x_coderai_organization_code or default_organization_code()).strip().lower()
+        with without_tenant_filter():
+            organization = db.query(Organization).filter(Organization.code == code).first()
+        if not organization:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "ORGANIZATION_NOT_FOUND", "message": "机构代码不存在。"},
+            )
+        if not organization.active:
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "ORGANIZATION_DISABLED", "message": "当前机构已停用。"},
+            )
+        request.state.organization = organization
+        with organization_context(organization.id, organization.code):
+            yield db
     finally:
         db.close()
 
 
 def init_db():
-    from backend.app import models
+    from backend.app import models  # noqa: F401
     from backend.app.auth import ensure_auth_settings
+    from backend.app.models import Organization
     from backend.app.privacy import cleanup_stale_privacy_artifacts, ensure_default_privacy_policy
     from backend.app.secrets import migrate_provider_secrets
     from backend.app.services import ensure_default_provider_routes
+    from backend.app.tenancy import organization_context, without_tenant_filter
 
-    backup_database_before_school_stage_migration()
-    backup_database_before_course_package_author_migration()
-    backup_database_before_course_package_teacher_migration()
-    backup_database_before_curriculum_migration()
-    backup_database_before_account_migration()
-    Base.metadata.create_all(bind=engine)
-    migrate_sqlite_schema()
+    if IS_SQLITE:
+        backup_database_before_organization_migration()
+        backup_database_before_school_stage_migration()
+        backup_database_before_course_package_author_migration()
+        backup_database_before_course_package_teacher_migration()
+        backup_database_before_curriculum_migration()
+        backup_database_before_account_migration()
+        Base.metadata.create_all(bind=engine)
+        migrate_sqlite_schema()
+    elif os.environ.get("CODERAI_AUTO_CREATE_SCHEMA", "false").lower() in {"1", "true", "yes"}:
+        Base.metadata.create_all(bind=engine)
+
+    initialization_lock = None
+    if not IS_SQLITE:
+        initialization_lock = engine.connect()
+        initialization_lock.execute(
+            text("SELECT pg_advisory_lock(:lock_id)"),
+            {"lock_id": CLOUD_INITIALIZATION_LOCK_ID},
+        )
+
     db = SessionLocal()
     try:
-        ensure_auth_settings(db)
-        backfill_teacher_ownership(db)
-        migrate_global_student_accounts_and_classroom_teachers(db)
-        migrate_legacy_curriculum(db)
-        migrate_course_package_authors(db)
-        migrate_school_stages(db)
-        migrate_provider_secrets(db)
-        ensure_default_provider_routes(db)
-        ensure_default_privacy_policy(db)
+        with without_tenant_filter():
+            organization = db.query(Organization).filter(
+                Organization.code == default_organization_code()
+            ).first()
+            if not organization:
+                organization = Organization(
+                    id=1 if not db.query(Organization.id).first() else None,
+                    code=default_organization_code(),
+                    name=default_organization_name(),
+                    active=True,
+                    seat_limit=50,
+                )
+                db.add(organization)
+                db.commit()
+                db.refresh(organization)
+
+        with organization_context(organization.id, organization.code):
+            ensure_auth_settings(db)
+            backfill_teacher_ownership(db)
+            migrate_global_student_accounts_and_classroom_teachers(db)
+            migrate_legacy_curriculum(db)
+            migrate_course_package_authors(db)
+            migrate_school_stages(db)
+            migrate_provider_secrets(db)
+            ensure_default_provider_routes(db)
+            ensure_default_privacy_policy(db)
+            cleanup_stale_privacy_artifacts()
+            if not CLOUD_MODE:
+                seed_default_classroom_and_student()
+            backfill_asset_metadata()
     finally:
         db.close()
-    cleanup_stale_privacy_artifacts()
-    seed_default_classroom_and_student()
-    backfill_asset_metadata()
+        if initialization_lock is not None:
+            try:
+                initialization_lock.execute(
+                    text("SELECT pg_advisory_unlock(:lock_id)"),
+                    {"lock_id": CLOUD_INITIALIZATION_LOCK_ID},
+                )
+            finally:
+                initialization_lock.close()
+
+
+def default_organization_code() -> str:
+    value = os.environ.get("CODERAI_DEFAULT_ORGANIZATION_CODE", "coderai-pilot").strip().lower()
+    return value or "coderai-pilot"
+
+
+def default_organization_name() -> str:
+    value = os.environ.get("CODERAI_DEFAULT_ORGANIZATION_NAME", "CoderAI 试点机构").strip()
+    return value or "CoderAI 试点机构"
 
 
 def migrate_sqlite_schema():
     with engine.begin() as conn:
+        rebuild_tenant_key_tables(conn)
+        tenant_tables = (
+            "users", "classrooms", "classroom_teachers", "course_packages",
+            "course_package_teachers", "curriculum_courses", "course_materials",
+            "course_schedules", "courses", "lessons", "tasks", "projects",
+            "task_submissions", "submission_versions", "feedback_templates", "assets",
+            "workflows", "workflow_runs", "video_tasks", "ai_providers",
+            "ai_provider_routes", "usage_logs", "provider_acceptance_runs",
+            "moderation_logs", "app_settings", "privacy_policies", "guardian_consents",
+            "teacher_audit_logs", "auth_login_attempts", "teacher_sessions", "student_sessions",
+        )
+        for table_name in tenant_tables:
+            ensure_column(conn, table_name, "organization_id", "INTEGER NOT NULL DEFAULT 1")
+            conn.execute(text(f"UPDATE {table_name} SET organization_id = 1 WHERE organization_id IS NULL"))
+            conn.execute(text(f"CREATE INDEX IF NOT EXISTS ix_{table_name}_organization_id ON {table_name}(organization_id)"))
         ensure_column(conn, "users", "username", "VARCHAR(80) DEFAULT ''")
         ensure_column(conn, "users", "password_hash", "TEXT DEFAULT ''")
         ensure_column(conn, "users", "password_change_required", "BOOLEAN DEFAULT 0")
@@ -174,7 +273,8 @@ def migrate_sqlite_schema():
         ensure_column(conn, "teacher_audit_logs", "actor_name", "VARCHAR(120) DEFAULT ''")
         ensure_column(conn, "course_packages", "author_user_id", "INTEGER")
         ensure_column(conn, "course_packages", "school_stages_json", "TEXT DEFAULT '[\"primary_lower\",\"primary_upper\",\"secondary\"]'")
-        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_users_username_nocase ON users(username COLLATE NOCASE) WHERE username != ''"))
+        conn.execute(text("DROP INDEX IF EXISTS ux_users_username_nocase"))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_users_org_username_nocase ON users(organization_id, username COLLATE NOCASE) WHERE username != ''"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_teacher_sessions_user_id ON teacher_sessions(user_id)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_teacher_audit_logs_actor_user_id ON teacher_audit_logs(actor_user_id)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_student_sessions_user_id ON student_sessions(user_id)"))
@@ -342,10 +442,80 @@ def migrate_sqlite_schema():
         )
 
 
+def rebuild_tenant_key_tables(conn) -> None:
+    app_setting_info = conn.execute(text("PRAGMA table_info(app_settings)")).fetchall()
+    app_setting_columns = [row[1] for row in app_setting_info]
+    app_setting_id_type = next((str(row[2] or "").upper() for row in app_setting_info if row[1] == "id"), "")
+    if app_setting_columns and ("id" not in app_setting_columns or "CHAR" not in app_setting_id_type):
+        conn.exec_driver_sql("ALTER TABLE app_settings RENAME TO app_settings_pre_cloud")
+        conn.exec_driver_sql(
+            """
+            CREATE TABLE app_settings (
+                id VARCHAR(220) PRIMARY KEY,
+                organization_id INTEGER NOT NULL DEFAULT 1,
+                key VARCHAR(120) NOT NULL,
+                value TEXT DEFAULT '',
+                updated_at DATETIME,
+                FOREIGN KEY(organization_id) REFERENCES organizations(id),
+                CONSTRAINT ux_app_settings_org_key UNIQUE (organization_id, key)
+            )
+            """
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO app_settings (id, organization_id, key, value, updated_at) "
+            "SELECT CASE WHEN COALESCE(organization_id, 1) = 1 THEN key ELSE CAST(organization_id AS TEXT) || ':' || key END, "
+            "COALESCE(organization_id, 1), key, value, updated_at FROM app_settings_pre_cloud"
+            if "organization_id" in app_setting_columns
+            else
+            "INSERT INTO app_settings (id, organization_id, key, value, updated_at) "
+            "SELECT key, 1, key, value, updated_at FROM app_settings_pre_cloud"
+        )
+        conn.exec_driver_sql("DROP TABLE app_settings_pre_cloud")
+
+    route_columns = [row[1] for row in conn.execute(text("PRAGMA table_info(ai_provider_routes)")).fetchall()]
+    if route_columns and "id" not in route_columns:
+        conn.exec_driver_sql("ALTER TABLE ai_provider_routes RENAME TO ai_provider_routes_pre_cloud")
+        conn.exec_driver_sql(
+            """
+            CREATE TABLE ai_provider_routes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                organization_id INTEGER NOT NULL DEFAULT 1,
+                capability VARCHAR(20) NOT NULL,
+                provider_ids_json TEXT DEFAULT '[]',
+                updated_at DATETIME,
+                FOREIGN KEY(organization_id) REFERENCES organizations(id),
+                CONSTRAINT ux_ai_routes_org_capability UNIQUE (organization_id, capability)
+            )
+            """
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO ai_provider_routes (organization_id, capability, provider_ids_json, updated_at) "
+            "SELECT 1, capability, provider_ids_json, updated_at FROM ai_provider_routes_pre_cloud"
+        )
+        conn.exec_driver_sql("DROP TABLE ai_provider_routes_pre_cloud")
+
+
 def ensure_column(conn, table_name: str, column_name: str, column_sql: str):
     columns = [row[1] for row in conn.execute(text(f"PRAGMA table_info({table_name})")).fetchall()]
     if column_name not in columns:
         conn.exec_driver_sql(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}")
+
+
+def backup_database_before_organization_migration() -> None:
+    if not IS_SQLITE or not DB_PATH.is_file() or DB_PATH.stat().st_size == 0:
+        return
+    backup_dir = DATA_DIR / "migration-backups"
+    backup_path = backup_dir / "coderai-before-organizations.db"
+    if backup_path.exists():
+        return
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    source = sqlite3.connect(DB_PATH)
+    destination = sqlite3.connect(backup_path)
+    try:
+        source.backup(destination)
+    finally:
+        destination.close()
+        source.close()
 
 
 def backup_database_before_account_migration() -> None:

@@ -1,0 +1,39 @@
+groups:
+  - name: coderai
+    rules:
+      - alert: CoderAIApiDown
+        expr: up{job="coderai-api"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "CoderAI API unavailable"
+      - alert: CoderAIHighServerErrorRate
+        expr: sum(rate(coderai_http_requests_total{status=~"5.."}[5m])) / clamp_min(sum(rate(coderai_http_requests_total[5m])), 0.001) > 0.01
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "CoderAI API 5xx rate exceeds 1 percent"
+      - alert: CoderAIDomainQueueBacklog
+        expr: sum(coderai_domain_jobs) > 20
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "CoderAI workflow or video backlog exceeds 20"
+      - alert: CoderAIDiskSpaceLow
+        expr: node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"} < 0.15
+        for: 10m
+        labels: { severity: critical }
+        annotations:
+          summary: "CoderAI server data disk has less than 15 percent free"
+      - alert: CoderAIBackupStale
+        expr: absent(coderai_backup_last_success_timestamp_seconds) OR time() - coderai_backup_last_success_timestamp_seconds > 129600
+        for: 10m
+        labels: { severity: critical }
+        annotations:
+          summary: "CoderAI independent backup is older than 36 hours"
+      - alert: CoderAIAiFailureBurst
+        expr: sum(delta(coderai_ai_calls_total{status=~"failed|blocked"}[15m])) > 20
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "CoderAI recorded an unusual number of AI failures"

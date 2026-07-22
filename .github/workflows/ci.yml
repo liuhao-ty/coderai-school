@@ -1,0 +1,165 @@
+name: CoderAI CI
+
+on:
+  push:
+    branches: [main, release/**]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.10"
+          cache: pip
+          cache-dependency-path: requirements-dev.lock
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.15.0"
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88.0"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Install dependencies
+        run: |
+          python -m pip install --requirement requirements-dev.lock
+          npm ci
+      - name: Static analysis and dependency audit
+        run: |
+          python -m ruff check backend tests deploy tools/pilot-load-test.py
+          pip-audit --requirement requirements.lock
+          npm audit --audit-level=high
+      - name: Backend and frontend tests
+        run: |
+          python -m unittest discover -s tests -v
+          npm run build
+          cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - name: Install browser
+        run: npx playwright install --with-deps chrome
+      - name: End-to-end tests
+        run: npm run test:e2e
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            playwright-report
+            test-results
+          retention-days: 14
+
+  cloud-integration:
+    needs: quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:17.5-alpine
+        env:
+          POSTGRES_DB: coderai
+          POSTGRES_USER: coderai
+          POSTGRES_PASSWORD: coderai-integration-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U coderai -d coderai"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7.4.5-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      CODERAI_INTEGRATION_TESTS: "true"
+      CODERAI_CLOUD_MODE: "true"
+      CODERAI_TASK_QUEUE_ENABLED: "true"
+      CODERAI_AUTO_CREATE_SCHEMA: "false"
+      CODERAI_DATABASE_URL: postgresql+psycopg://coderai:coderai-integration-password@127.0.0.1:5432/coderai
+      CODERAI_REDIS_URL: redis://127.0.0.1:6379/0
+      CODERAI_STORAGE_BACKEND: s3
+      CODERAI_S3_BUCKET: coderai-integration
+      CODERAI_S3_ENDPOINT: http://127.0.0.1:9000
+      CODERAI_S3_REGION: us-east-1
+      CODERAI_S3_ACCESS_KEY: coderai-minio
+      CODERAI_S3_SECRET_KEY: coderai-minio-password
+      CODERAI_S3_SECURE: "false"
+      CODERAI_SECRET_KEY: MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=
+      CODERAI_DATA_DIR: ${{ github.workspace }}/test-results/cloud-runtime
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.10"
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - name: Install backend dependencies
+        run: python -m pip install --requirement requirements.lock
+      - name: Start MinIO
+        run: |
+          docker run --detach --name coderai-minio \
+            --publish 9000:9000 \
+            --env MINIO_ROOT_USER=coderai-minio \
+            --env MINIO_ROOT_PASSWORD=coderai-minio-password \
+            minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
+          for attempt in $(seq 1 30); do
+            curl --fail --silent http://127.0.0.1:9000/minio/health/live && exit 0
+            sleep 2
+          done
+          docker logs coderai-minio
+          exit 1
+      - name: Initialize PostgreSQL schema
+        run: python -m alembic upgrade head
+      - name: Run cloud migration integration test
+        run: python -m unittest discover -s tests -p "test_cloud_integration.py" -v
+      - name: Show service logs on failure
+        if: failure()
+        run: docker logs coderai-minio || true
+
+  windows-desktop:
+    needs: quality
+    runs-on: windows-2022
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.15.0"
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - name: Build unsigned desktop executable
+        shell: pwsh
+        env:
+          VITE_API_URL: https://api.coderai.example.invalid
+          VITE_ORGANIZATION_CODE: coderai-pilot
+          VITE_UPDATER_ENABLED: "false"
+          TAURI_CONFIG: '{"bundle":{"createUpdaterArtifacts":false}}'
+        run: npm run tauri:build -- --no-bundle
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coderai-windows-smoke
+          path: src-tauri/target/release/coderai-school.exe
+          retention-days: 14

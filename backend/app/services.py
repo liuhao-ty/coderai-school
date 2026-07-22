@@ -18,6 +18,7 @@ from backend.app.models import AIProvider, AIProviderRoute, AppSetting, Asset, C
 from backend.app.provider_presets import get_provider_preset, list_provider_presets, provider_capabilities
 from backend.app.school_stages import SCHOOL_STAGES, normalize_school_stage, school_stage_label
 from backend.app.secrets import SecretProtectionError, decrypt_secret
+from backend.app.storage import object_exists, put_bytes, read_bytes as read_stored_bytes, reference_name
 
 
 OUTPUT_DIR = DATA_DIR / "outputs"
@@ -432,11 +433,22 @@ def _record_image_moderation(
 def _image_moderation_reference(file_path: str, image_url: str) -> str:
     if image_url:
         return image_url
-    path = Path(file_path)
-    if not path.is_file() or path.stat().st_size > 20 * 1024 * 1024:
-        return ""
-    mime_type = mimetypes.guess_type(path.name)[0] or "image/png"
-    return f"data:{mime_type};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
+    try:
+        content = read_stored_bytes(file_path, maximum_bytes=20 * 1024 * 1024)
+    except (FileNotFoundError, OSError, ValueError):
+        # Provider adapters may return a temporary local file before it is
+        # copied into managed storage. It is safe to read here because this
+        # helper is only called with server-produced output, never a client
+        # supplied download path.
+        try:
+            temporary_path = Path(file_path).resolve()
+            if not temporary_path.is_file() or temporary_path.stat().st_size > 20 * 1024 * 1024:
+                return ""
+            content = temporary_path.read_bytes()
+        except (FileNotFoundError, OSError, ValueError):
+            return ""
+    mime_type = mimetypes.guess_type(reference_name(file_path))[0] or "image/png"
+    return f"data:{mime_type};base64,{base64.b64encode(content).decode('ascii')}"
 
 
 async def moderate_image_output(
@@ -977,21 +989,22 @@ async def generate_openai_image_edit(
     source_image_path: str,
     user_id: int | None = None,
 ) -> dict[str, Any]:
-    path = Path(source_image_path)
-    if not path.is_file():
+    try:
+        image_content = read_stored_bytes(source_image_path, maximum_bytes=10 * 1024 * 1024)
+    except (FileNotFoundError, OSError, ValueError):
         raise HTTPException(status_code=400, detail={"code": "AI_INPUT_MISSING", "message": "参考图片文件已丢失，请重新上传。"})
+    image_name = reference_name(source_image_path)
     url = provider.base_url.rstrip("/") + "/images/edits"
     classroom_prompt = f"{prompt}\n风格：{style}。适合少儿编程课堂，明亮、清晰、无危险内容。"
-    content_type = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}.get(path.suffix.lower(), "application/octet-stream")
+    content_type = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}.get(Path(image_name).suffix.lower(), "application/octet-stream")
     try:
         async with httpx.AsyncClient(timeout=120) as client:
-            with path.open("rb") as image_file:
-                response = await client.post(
-                    url,
-                    headers={"Authorization": f"Bearer {provider_api_key(provider)}"},
-                    data={"model": provider.image_model, "prompt": classroom_prompt, "size": size},
-                    files={"image": (path.name, image_file, content_type)},
-                )
+            response = await client.post(
+                url,
+                headers={"Authorization": f"Bearer {provider_api_key(provider)}"},
+                data={"model": provider.image_model, "prompt": classroom_prompt, "size": size},
+                files={"image": (image_name, image_content, content_type)},
+            )
             response.raise_for_status()
         data = response.json()
         item = data["data"][0]
@@ -1418,24 +1431,21 @@ def _headers(api_key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
 
-def _write_bytes(target: Path, data: bytes) -> Path:
-    index = 1
-    candidate = target
-    while candidate.exists():
-        candidate = target.with_name(f"{target.stem}-{index}{target.suffix}")
-        index += 1
-    candidate.write_bytes(data)
-    return candidate
+def _write_bytes(target: Path, data: bytes) -> str:
+    return put_bytes(
+        "outputs",
+        target.name,
+        data,
+        content_type=mimetypes.guess_type(target.name)[0] or "application/octet-stream",
+    )
 
 
 def local_image_data_url(source_image_path: str) -> str:
-    path = Path(source_image_path)
-    if not path.is_file():
+    try:
+        content = read_stored_bytes(source_image_path, maximum_bytes=10 * 1024 * 1024)
+    except (FileNotFoundError, OSError, ValueError):
         raise HTTPException(status_code=400, detail={"code": "AI_INPUT_MISSING", "message": "参考图片文件已丢失，请重新上传。"})
-    content = path.read_bytes()
-    if len(content) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail={"code": "AI_INPUT_TOO_LARGE", "message": "参考图片不能超过 10 MB。"})
-    media_type = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}.get(path.suffix.lower())
+    media_type = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}.get(Path(reference_name(source_image_path)).suffix.lower())
     if not media_type:
         raise HTTPException(status_code=400, detail={"code": "AI_INPUT_TYPE_INVALID", "message": "仅支持 PNG、JPEG 或 WebP 图片。"})
     return f"data:{media_type};base64,{base64.b64encode(content).decode('ascii')}"
@@ -1453,17 +1463,13 @@ async def _download_video_result(url: str, task_id: int) -> str:
     if "text/html" in content_type or "application/json" in content_type:
         raise ValueError("视频下载链接返回了非视频内容")
     suffix = ".webm" if "webm" in content_type else ".mp4"
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    return str(_write_bytes(OUTPUT_DIR / f"video-{task_id}{suffix}", response.content))
+    return _write_bytes(OUTPUT_DIR / f"video-{task_id}{suffix}", response.content)
 
 
 def _video_file_available(task: VideoTask) -> bool:
     if not task.file_path or task.file_path.startswith(("http://", "https://")):
         return False
-    try:
-        return Path(task.file_path).is_file()
-    except OSError:
-        return False
+    return object_exists(task.file_path)
 
 
 def _sync_video_project(task: VideoTask) -> None:
@@ -1951,7 +1957,8 @@ def project_file_status(file_path: str) -> tuple[bool, str]:
         return False, "none"
     if file_path.startswith(("http://", "https://")):
         return False, "remote"
-    return Path(file_path).exists(), "ok" if Path(file_path).exists() else "missing"
+    exists = object_exists(file_path)
+    return exists, "ok" if exists else "missing"
 
 
 def asset_file_status(file_path: str) -> tuple[bool, str]:
@@ -1959,7 +1966,8 @@ def asset_file_status(file_path: str) -> tuple[bool, str]:
         return False, "none"
     if file_path.startswith(("http://", "https://")):
         return False, "remote"
-    return Path(file_path).exists(), "ok" if Path(file_path).exists() else "missing"
+    exists = object_exists(file_path)
+    return exists, "ok" if exists else "missing"
 
 
 def to_asset_dict(asset: Asset) -> dict[str, Any]:

@@ -12,3 +12,13 @@ __pycache__/
 .license-issuer/
 *.plugin-private.pem
 .plugin-publisher/
+src-tauri/target/
+src-tauri/gen/
+*.updater-private.key
+*.updater-private.key.password.dpapi
+deploy/.env
+.env
+.env.*
+!.env.example
+*.pfx
+tools/pilot-load-accounts.json

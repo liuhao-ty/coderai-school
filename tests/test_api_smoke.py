@@ -20,9 +20,9 @@ from sqlalchemy.orm import sessionmaker
 
 from backend.app.auth import PASSWORD_CHANGE_REQUIRED_KEY, PASSWORD_SETTING_KEY, SECRET_SETTING_KEY, set_setting
 from backend.app import db as db_module
-from backend.app.db import Base, get_db
+from backend.app.db import Base, CLOUD_MODE, get_db
 from backend.app.main import app
-from backend.app.models import AIProvider, AppSetting, Asset, Classroom, ClassroomTeacher, Course, CourseMaterial, CoursePackage, CoursePackageTeacher, CourseSchedule, CurriculumCourse, GuardianConsent, Lesson, ModerationLog, PrivacyPolicy, Project, ProviderAcceptanceRun, SubmissionVersion, Task, TaskSubmission, TeacherAuditLog, TeacherSession, UsageLog, User, VideoTask, Workflow, WorkflowRun, now
+from backend.app.models import AIProvider, AppSetting, Asset, Classroom, ClassroomTeacher, Course, CourseMaterial, CoursePackage, CoursePackageTeacher, CurriculumCourse, GuardianConsent, Lesson, ModerationLog, PrivacyPolicy, Project, ProviderAcceptanceRun, SubmissionVersion, Task, TaskSubmission, TeacherAuditLog, TeacherSession, UsageLog, User, VideoTask, Workflow, WorkflowRun, now
 from backend.app.licensing import canonical_license_payload
 from backend.app.plugins import canonical_plugin_manifest
 from backend.app.secrets import decrypt_secret, encrypt_secret, is_encrypted_secret, migrate_provider_secrets
@@ -135,6 +135,11 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post("/api/auth/teacher-login", json={"username": username, "password": password})
         self.assertEqual(response.status_code, 200, response.text)
         return teacher_id, {"X-CoderAI-Teacher-Token": response.json()["token"]}
+
+    async def test_version_reports_deployment_mode(self):
+        response = await self.client.get("/api/version")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["deployment_mode"], "cloud" if CLOUD_MODE else "local")
 
     def _configure_minimax_video_provider(self):
         db = self.Session()
@@ -4786,6 +4791,98 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(imported.json()["package"]["status"], "draft")
             self.assertEqual(imported.json()["package"]["course_count"], 1)
             self.assertEqual(imported.json()["package"]["school_stages"], ["primary_upper", "secondary"])
+
+
+    async def test_retention_preview_exception_approval_and_execution(self):
+        old = now() - timedelta(days=400)
+        db = self.Session()
+        try:
+            student = db.query(User).filter(User.name == "Student A").one()
+            project = Project(
+                title="Expired draft",
+                project_type="text",
+                user_id=student.id,
+                classroom_id=student.classroom_id,
+                updated_at=old,
+            )
+            audit = TeacherAuditLog(
+                actor_user_id=self.admin_user_id,
+                actor_username="admin",
+                actor_name="Admin",
+                action="legacy.action",
+                target_type="project",
+                target_id="old-project",
+                summary="Old audit",
+                created_at=old,
+            )
+            db.add_all([project, audit])
+            db.commit()
+            project_id = project.id
+            audit_id = audit.id
+            student_id = student.id
+        finally:
+            db.close()
+
+        created_exception = await self.client.post(
+            "/api/privacy/retention/exceptions",
+            headers=self.teacher_headers,
+            json={"target_type": "student", "target_id": str(student_id), "reason": "监护人要求保留"},
+        )
+        self.assertEqual(created_exception.status_code, 200, created_exception.text)
+        exception_id = created_exception.json()["exception"]["id"]
+
+        excluded = await self.client.post(
+            "/api/privacy/retention/preview",
+            headers=self.teacher_headers,
+            json={"retention_days": 365},
+        )
+        self.assertEqual(excluded.status_code, 200, excluded.text)
+        self.assertEqual(excluded.json()["preview"]["counts"]["projects"], 0)
+        self.assertFalse(excluded.json()["preview"]["automatic_deletion"])
+
+        removed = await self.client.delete(
+            f"/api/privacy/retention/exceptions/{exception_id}", headers=self.teacher_headers,
+        )
+        self.assertEqual(removed.status_code, 200, removed.text)
+        requested = await self.client.post(
+            "/api/privacy/retention/requests",
+            headers=self.teacher_headers,
+            json={"retention_days": 365},
+        )
+        self.assertEqual(requested.status_code, 200, requested.text)
+        request_payload = requested.json()["request"]
+        self.assertEqual(request_payload["preview"]["counts"]["projects"], 1)
+        request_id = request_payload["id"]
+
+        approved = await self.client.post(
+            f"/api/privacy/retention/requests/{request_id}/approve",
+            headers=self.teacher_headers,
+            json={"note": "已核对保留范围"},
+        )
+        self.assertEqual(approved.status_code, 200, approved.text)
+        self.assertEqual(approved.json()["request"]["status"], "approved")
+        rejected = await self.client.post(
+            f"/api/privacy/retention/requests/{request_id}/execute",
+            headers=self.teacher_headers,
+            json={"confirmation": "delete"},
+        )
+        self.assertEqual(rejected.status_code, 400, rejected.text)
+
+        executed = await self.client.post(
+            f"/api/privacy/retention/requests/{request_id}/execute",
+            headers=self.teacher_headers,
+            json={"confirmation": "确认执行到期数据删除"},
+        )
+        self.assertEqual(executed.status_code, 200, executed.text)
+        self.assertEqual(executed.json()["request"]["status"], "executed")
+        db = self.Session()
+        try:
+            self.assertIsNone(db.get(Project, project_id))
+            redacted = db.get(TeacherAuditLog, audit_id)
+            self.assertEqual(redacted.actor_username, "")
+            self.assertEqual(redacted.target_id, "retention-redacted")
+        finally:
+            db.close()
 
 
 class AccountMigrationTests(unittest.TestCase):

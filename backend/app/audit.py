@@ -99,6 +99,9 @@ def record_teacher_audit_to_sqlite(
             connection.execute("ALTER TABLE teacher_audit_logs ADD COLUMN actor_username VARCHAR(80) DEFAULT '' NOT NULL")
         if "actor_name" not in columns:
             connection.execute("ALTER TABLE teacher_audit_logs ADD COLUMN actor_name VARCHAR(120) DEFAULT '' NOT NULL")
+        if "organization_id" not in columns:
+            connection.execute("ALTER TABLE teacher_audit_logs ADD COLUMN organization_id INTEGER NOT NULL DEFAULT 1")
+        organization_id = 1
         actor_user_id = None
         actor_username = ""
         actor_name = ""
@@ -114,13 +117,24 @@ def record_teacher_audit_to_sqlite(
             ).fetchone()
             if actor:
                 actor_user_id, actor_username, actor_name = actor[0], str(actor[1] or ""), str(actor[2] or "")
+            session_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(teacher_sessions)").fetchall()
+            }
+            if "organization_id" in session_columns:
+                organization_row = connection.execute(
+                    "SELECT organization_id FROM teacher_sessions WHERE id = ?",
+                    (teacher_session_id,),
+                ).fetchone()
+                if organization_row and organization_row[0]:
+                    organization_id = int(organization_row[0])
         connection.execute(
             """
             INSERT INTO teacher_audit_logs
-                (session_id, actor_user_id, actor_username, actor_name, action, target_type, target_id, summary, details_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (organization_id, session_id, actor_user_id, actor_username, actor_name, action, target_type, target_id, summary, details_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                organization_id,
                 teacher_session_id,
                 actor_user_id,
                 actor_username,

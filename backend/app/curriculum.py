@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import mimetypes
 import os
+from contextlib import contextmanager
 from pathlib import Path
 import shutil
 import subprocess
@@ -10,6 +11,8 @@ import tempfile
 
 from backend.app.db import DATA_DIR, SessionLocal
 from backend.app.models import CourseMaterial
+from backend.app.storage import STORAGE_BACKEND, delete_object, is_object_reference, materialize, put_bytes, put_file
+from backend.app.tenancy import current_organization_code, current_organization_id, organization_context
 
 
 CURRICULUM_DIR = DATA_DIR / "curriculum"
@@ -27,6 +30,39 @@ def curriculum_course_dir(package_id: int, course_id: int) -> Path:
     target = CURRICULUM_DIR / str(package_id) / str(course_id)
     target.mkdir(parents=True, exist_ok=True)
     return target
+
+
+def store_curriculum_bytes(
+    package_id: int,
+    course_id: int,
+    filename: str,
+    content: bytes,
+    content_type: str,
+) -> str:
+    if STORAGE_BACKEND == "local":
+        target = curriculum_course_dir(package_id, course_id) / filename
+        target.write_bytes(content)
+        return str(target)
+    return put_bytes(
+        f"curriculum/{package_id}/{course_id}",
+        filename,
+        content,
+        content_type=content_type,
+        stable_name=filename,
+    )
+
+
+@contextmanager
+def materialize_curriculum(reference: str, *, suffix: str = ""):
+    if is_object_reference(reference):
+        with materialize(reference, suffix=suffix) as path:
+            yield path
+        return
+    path = Path(reference).resolve()
+    path.relative_to(CURRICULUM_DIR.resolve())
+    if not path.is_file() or path.is_symlink():
+        raise FileNotFoundError(reference)
+    yield path
 
 
 def find_libreoffice() -> Path | None:
@@ -75,15 +111,25 @@ def validate_course_material(kind: str, filename: str, content: bytes) -> dict:
     }
 
 
-def convert_slides_material(material_id: int) -> None:
+def convert_slides_material(
+    material_id: int,
+    organization_id: int | None = None,
+    organization_code: str = "",
+) -> None:
+    tenant_id = organization_id or current_organization_id()
+    tenant_code = organization_code or current_organization_code()
+    with organization_context(tenant_id, tenant_code):
+        _convert_slides_material(material_id)
+
+
+def _convert_slides_material(material_id: int) -> None:
     db = SessionLocal()
     try:
         material = db.get(CourseMaterial, material_id)
         if not material or material.kind != "slides":
             return
-        source = Path(material.source_path)
         executable = find_libreoffice()
-        if not source.is_file():
+        if not material.source_path:
             material.conversion_status = "failed"
             material.conversion_error = "PPTX 原件不存在。"
             db.commit()
@@ -96,36 +142,45 @@ def convert_slides_material(material_id: int) -> None:
         material.conversion_status = "processing"
         material.conversion_error = ""
         db.commit()
-        with tempfile.TemporaryDirectory(prefix="coderai-ppt-") as temp_dir:
-            kwargs: dict = {
-                "args": [str(executable), "--headless", "--convert-to", "pdf", "--outdir", temp_dir, str(source)],
-                "capture_output": True,
-                "text": True,
-                "timeout": int(os.environ.get("CODERAI_PPT_CONVERT_TIMEOUT_SECONDS", "120")),
-                "check": False,
-            }
-            if os.name == "nt":
-                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-            result = subprocess.run(**kwargs)
-            converted = Path(temp_dir) / f"{source.stem}.pdf"
-            if result.returncode != 0 or not converted.is_file():
-                detail = (result.stderr or result.stdout or "LibreOffice 未生成PDF预览。").strip()
-                raise RuntimeError(detail[-1000:])
-            content = converted.read_bytes()
-            if not content.startswith(b"%PDF"):
-                raise RuntimeError("LibreOffice 生成的预览文件不是有效PDF。")
-            preview = source.with_suffix(".pdf")
-            shutil.copy2(converted, preview)
-            material = db.get(CourseMaterial, material_id)
-            if not material:
-                return
-            old_preview = Path(material.preview_path) if material.preview_path else None
-            material.preview_path = str(preview)
-            material.conversion_status = "ready"
-            material.conversion_error = ""
-            db.commit()
-            if old_preview and old_preview != preview and old_preview.is_file():
-                old_preview.unlink(missing_ok=True)
+        with materialize_curriculum(material.source_path, suffix=".pptx") as source:
+            with tempfile.TemporaryDirectory(prefix="coderai-ppt-") as temp_dir:
+                kwargs: dict = {
+                    "args": [str(executable), "--headless", "--convert-to", "pdf", "--outdir", temp_dir, str(source)],
+                    "capture_output": True,
+                    "text": True,
+                    "encoding": "mbcs" if os.name == "nt" else "utf-8",
+                    "errors": "replace",
+                    "timeout": int(os.environ.get("CODERAI_PPT_CONVERT_TIMEOUT_SECONDS", "120")),
+                    "check": False,
+                }
+                if os.name == "nt":
+                    kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                result = subprocess.run(**kwargs)
+                converted = Path(temp_dir) / f"{source.stem}.pdf"
+                if result.returncode != 0 or not converted.is_file():
+                    detail = (result.stderr or result.stdout or "LibreOffice 未生成PDF预览。").strip()
+                    raise RuntimeError(detail[-1000:])
+                content = converted.read_bytes()
+                if not content.startswith(b"%PDF"):
+                    raise RuntimeError("LibreOffice 生成的预览文件不是有效PDF。")
+                preview_reference = put_file(
+                    f"curriculum/{material.course.package_id}/{material.course_id}",
+                    converted,
+                    filename="slides.pdf",
+                    content_type="application/pdf",
+                    stable_name="slides.pdf",
+                )
+                material = db.get(CourseMaterial, material_id)
+                if not material:
+                    delete_object(preview_reference)
+                    return
+                old_preview = material.preview_path
+                material.preview_path = preview_reference
+                material.conversion_status = "ready"
+                material.conversion_error = ""
+                db.commit()
+                if old_preview and old_preview != preview_reference:
+                    delete_object(old_preview)
     except Exception as exc:
         db.rollback()
         material = db.get(CourseMaterial, material_id)

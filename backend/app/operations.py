@@ -9,8 +9,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from backend.app.auth import require_admin
-from backend.app.db import DATA_DIR, DB_PATH, get_db
-from backend.app.models import Asset, Project
+from backend.app.db import CLOUD_MODE, DATA_DIR, DB_PATH, get_db
+from backend.app.models import Asset, Course, CourseMaterial, CoursePackage, ModerationLog, Project, SubmissionVersion, VideoTask
+from backend.app.storage import is_object_reference, list_organization_objects, object_exists, organization_storage_usage
 
 
 LOG_DIR = DATA_DIR / "logs"
@@ -45,7 +46,7 @@ def directory_stats(path: Path) -> tuple[int, int]:
 
 def local_path(raw_path: str) -> Path | None:
     value = raw_path.strip()
-    if not value or value.startswith(("http://", "https://")):
+    if not value or value.startswith(("http://", "https://")) or is_object_reference(value):
         return None
     return Path(value).resolve()
 
@@ -87,6 +88,19 @@ def resolve_records(records: Iterable[Project | Asset]) -> set[Path]:
 
 @router.get("/storage")
 def storage_statistics():
+    if CLOUD_MODE:
+        usage = organization_storage_usage()
+        local_files, local_bytes = directory_stats(DATA_DIR)
+        return {
+            "data_dir": "cloud-object-storage",
+            "storage_backend": usage["backend"],
+            "total_files": usage["object_count"],
+            "total_bytes": usage["total_bytes"],
+            "categories": [
+                {"key": "objects", "label": "机构对象文件", "file_count": usage["object_count"], "size_bytes": usage["total_bytes"]},
+                {"key": "runtime", "label": "服务运行文件", "file_count": local_files, "size_bytes": local_bytes},
+            ],
+        }
     categories = []
     configured = [
         ("database", "数据库", DB_PATH),
@@ -168,30 +182,57 @@ def consistency_result(db: Session) -> dict:
     missing_assets = []
     for project in projects:
         path = local_path(project.file_path)
-        if path and not path.is_file():
+        missing = bool(project.file_path and not project.file_path.startswith(("http://", "https://")) and not object_exists(project.file_path))
+        if missing:
             missing_projects.append({
-                "id": project.id, "title": project.title, "file_path": project.file_path, "managed": is_managed(path),
+                "id": project.id, "title": project.title, "file_path": project.file_path,
+                "managed": is_object_reference(project.file_path) or bool(path and is_managed(path)),
             })
     for asset in assets:
         path = local_path(asset.file_path)
-        if path and not path.is_file():
+        missing = bool(asset.file_path and not asset.file_path.startswith(("http://", "https://")) and not object_exists(asset.file_path))
+        if missing:
             missing_assets.append({
                 "id": asset.id, "title": asset.original_name or Path(asset.file_path).name,
-                "file_path": asset.file_path, "managed": is_managed(path),
+                "file_path": asset.file_path,
+                "managed": is_object_reference(asset.file_path) or bool(path and is_managed(path)),
             })
 
     referenced = resolve_records([*projects, *assets])
+    referenced_objects = {
+        record.file_path for record in [*projects, *assets] if is_object_reference(record.file_path)
+    }
+    for model, columns in (
+        (CoursePackage, ("cover_path",)),
+        (Course, ("cover_path",)),
+        (CourseMaterial, ("source_path", "preview_path")),
+        (SubmissionVersion, ("project_file_path",)),
+        (VideoTask, ("source_image_path", "file_path")),
+        (ModerationLog, ("resource_path",)),
+    ):
+        for record in db.query(model).all():
+            referenced_objects.update(
+                value for value in (str(getattr(record, column, "") or "") for column in columns) if is_object_reference(value)
+            )
     orphan_files = []
     orphan_count = 0
-    for root in CONTENT_SCAN_DIRS:
-        if not root.exists():
-            continue
-        for path in root.rglob("*"):
-            if not path.is_file() or path.resolve() in referenced:
+    if CLOUD_MODE:
+        for item in list_organization_objects():
+            if item["reference"] in referenced_objects:
                 continue
             orphan_count += 1
             if len(orphan_files) < 500:
-                orphan_files.append({"file_path": str(path.resolve()), "size_bytes": path.stat().st_size})
+                orphan_files.append({"file_path": item["reference"], "size_bytes": item["size_bytes"]})
+    else:
+        for root in CONTENT_SCAN_DIRS:
+            if not root.exists():
+                continue
+            for path in root.rglob("*"):
+                if not path.is_file() or path.resolve() in referenced:
+                    continue
+                orphan_count += 1
+                if len(orphan_files) < 500:
+                    orphan_files.append({"file_path": str(path.resolve()), "size_bytes": path.stat().st_size})
     return {
         "scanned_projects": len(projects),
         "scanned_assets": len(assets),
@@ -216,8 +257,7 @@ def repair_missing_files(payload: FileRepairRequest, db: Session = Depends(get_d
     if {item.id for item in projects} != set(project_ids) or {item.id for item in assets} != set(asset_ids):
         raise HTTPException(status_code=404, detail={"code": "FILE_RECORD_NOT_FOUND", "message": "部分待修复记录不存在，未执行任何修改。"})
     for record in [*projects, *assets]:
-        path = local_path(record.file_path)
-        if not path or path.is_file():
+        if not record.file_path or record.file_path.startswith(("http://", "https://")) or object_exists(record.file_path):
             raise HTTPException(status_code=409, detail={"code": "FILE_RECORD_NOT_MISSING", "message": "部分记录的文件并未缺失，未执行任何修改。"})
     for project in projects:
         project.file_path = ""

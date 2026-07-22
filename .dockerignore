@@ -1,0 +1,12 @@
+.git
+.github
+node_modules
+dist
+test-results
+playwright-report
+workspace_data
+migration-output
+*.db
+*.zip
+src-tauri/target
+CoderAI学堂-backups

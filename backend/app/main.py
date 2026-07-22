@@ -3,7 +3,7 @@ import hashlib
 import csv
 import io
 import mimetypes
-import secrets
+import os
 import shutil
 import tempfile
 import zipfile
@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, text
 from sqlalchemy.orm import Session
 from pydantic import ValidationError
 
@@ -53,10 +53,10 @@ from backend.app.auth import (
     validate_teacher_password,
     validate_username,
 )
-from backend.app.db import DATA_DIR, SessionLocal, get_db, init_db
+from backend.app.db import CLOUD_MODE, DATA_DIR, DATABASE_URL, SessionLocal, default_organization_code, get_db, init_db
 from backend.app.audit import record_teacher_audit, teacher_audit_payload
-from backend.app.models import AIProvider, Asset, Classroom, ClassroomTeacher, Course, CourseMaterial, CoursePackage, CoursePackageTeacher, CourseSchedule, CurriculumCourse, FeedbackTemplate, Lesson, ModerationLog, Project, SubmissionVersion, Task, TaskSubmission, TeacherAuditLog, TeacherSession, UsageLog, User, VideoTask, Workflow, WorkflowRun, now
-from backend.app.curriculum import CURRICULUM_DIR, MATERIAL_KINDS, convert_slides_material, curriculum_course_dir, libreoffice_status, validate_course_material
+from backend.app.models import AIProvider, Asset, Classroom, ClassroomTeacher, Course, CourseMaterial, CoursePackage, CoursePackageTeacher, CourseSchedule, CurriculumCourse, FeedbackTemplate, Lesson, ModerationLog, Organization, Project, SubmissionVersion, Task, TaskSubmission, TeacherAuditLog, TeacherSession, UsageLog, User, VideoTask, Workflow, WorkflowRun, now
+from backend.app.curriculum import CURRICULUM_DIR, MATERIAL_KINDS, convert_slides_material, libreoffice_status, materialize_curriculum, store_curriculum_bytes, validate_course_material
 from backend.app.operations import router as operations_router
 from backend.app.backup import router as backup_router
 from backend.app.privacy import ensure_student_ai_consent, router as privacy_router
@@ -70,11 +70,26 @@ from backend.app.school_stages import (
     school_stages_from_json,
     school_stages_label,
 )
+from backend.app.tenancy import current_organization_code, current_organization_id, without_tenant_filter
+from backend.app.storage import (
+    delete_object,
+    is_object_reference,
+    object_exists,
+    put_bytes as put_stored_bytes,
+    read_bytes as read_stored_bytes,
+    reference_in_category,
+    reference_name,
+    storage_response,
+    ensure_storage_ready,
+)
+from backend.app.task_queue import enqueue_slides_conversion, enqueue_video_poll, enqueue_workflow_run, queue_health
 from backend.app.package_security import MAX_COURSE_PACKAGE_BYTES, validate_course_package
 from backend.app.secrets import encrypt_secret
 from backend.app.licensing import ensure_student_seat_capacity, get_license_status, save_license_status
 from backend.app.plugins import router as plugins_router
 from backend.app.readiness import router as readiness_router
+from backend.app.retention import router as retention_router
+from backend.app.observability import configure_observability
 from backend.app.schemas import (
     ClassTaskRequest,
     ClassroomCreateRequest,
@@ -162,17 +177,30 @@ from backend.app.services import (
 )
 
 
-app = FastAPI(title="CoderAI 学堂 API", version="0.1.0")
+APP_VERSION = "0.2.0-beta.1"
+
+app = FastAPI(title="CoderAI 学堂 API", version=APP_VERSION)
 app.include_router(operations_router)
 app.include_router(backup_router)
 app.include_router(privacy_router)
 app.include_router(plugins_router)
 app.include_router(readiness_router)
+app.include_router(retention_router)
+configure_observability(app)
+
+_configured_origins = [
+    item.strip()
+    for item in os.environ.get("CODERAI_CORS_ORIGINS", "").split(",")
+    if item.strip()
+]
+_default_origins = ["tauri://localhost", "http://tauri.localhost", "https://tauri.localhost"]
+if not CLOUD_MODE:
+    _default_origins.extend(["http://127.0.0.1:5173", "http://localhost:5173"])
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://127.0.0.1:5173", "http://localhost:5173", "tauri://localhost"],
-    allow_origin_regex=r"http://(127\.0\.0\.1|localhost)(:\d+)?",
+    allow_origins=_configured_origins or _default_origins,
+    allow_origin_regex=None if CLOUD_MODE else r"http://(127\.0\.0\.1|localhost)(:\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -181,6 +209,15 @@ app.add_middleware(
 
 @app.middleware("http")
 async def limit_untrusted_package_bodies(request: Request, call_next):
+    if request.method not in {"GET", "HEAD", "OPTIONS"} and not CLOUD_MODE:
+        migration_lock = DATA_DIR / ".cloud-migration.lock"
+        migrated_readonly = DATA_DIR / ".cloud-migrated-readonly"
+        allow_rollback_writes = os.environ.get("CODERAI_ALLOW_POST_MIGRATION_WRITES", "false").lower() in {"1", "true", "yes"}
+        if migration_lock.exists() or (migrated_readonly.exists() and not allow_rollback_writes):
+            return JSONResponse(
+                status_code=423,
+                content={"detail": {"code": "LOCAL_DATA_FROZEN", "message": "本地数据已为云迁移冻结，当前版本仅允许只读访问。"}},
+            )
     limits = {
         "/api/courses/import": MAX_COURSE_PACKAGE_BYTES,
     }
@@ -214,6 +251,71 @@ def local_naive(value: datetime | None) -> datetime | None:
     if value.tzinfo is not None:
         return value.astimezone(BEIJING_TZ).replace(tzinfo=None)
     return value
+
+
+def local_managed_file(reference: str) -> Path:
+    path = Path(reference).resolve()
+    path.relative_to(DATA_DIR.resolve())
+    if not path.is_file() or path.is_symlink():
+        raise FileNotFoundError(reference)
+    return path
+
+
+def authenticated_storage_response(
+    reference: str,
+    *,
+    media_type: str,
+    filename: str = "",
+    inline: bool = True,
+):
+    if is_object_reference(reference):
+        return storage_response(
+            reference,
+            media_type=media_type,
+            filename=filename,
+            inline=inline,
+        )
+    path = local_managed_file(reference)
+    return FileResponse(
+        path,
+        media_type=media_type,
+        filename=None if inline else (filename or path.name),
+        headers={"X-Content-Type-Options": "nosniff"},
+    )
+
+
+def delete_managed_reference(reference: str) -> bool:
+    if not reference:
+        return False
+    if is_object_reference(reference):
+        return delete_object(reference)
+    try:
+        path = local_managed_file(reference)
+        path.unlink()
+        return True
+    except (FileNotFoundError, OSError, ValueError):
+        return False
+
+
+def curriculum_file_response(
+    reference: str,
+    *,
+    media_type: str,
+    filename: str = "",
+    inline: bool = True,
+):
+    if is_object_reference(reference):
+        return storage_response(reference, media_type=media_type, filename=filename, inline=inline)
+    path = Path(reference).resolve()
+    path.relative_to(CURRICULUM_DIR.resolve())
+    if not path.is_file() or path.is_symlink():
+        raise FileNotFoundError(reference)
+    return FileResponse(
+        path,
+        media_type=media_type,
+        filename=None if inline else (filename or path.name),
+        headers={"X-Content-Type-Options": "nosniff"},
+    )
 
 
 def attach_image_moderation(db: Session, project: Project, moderation_log_id: int | None) -> None:
@@ -931,7 +1033,8 @@ def inspect_asset(asset_type: str, file_path: str, content: bytes | None = None)
     if asset_type not in ASSET_EXTENSIONS:
         raise HTTPException(status_code=400, detail={"code": "ASSET_TYPE_INVALID", "message": "素材类型不受支持。"})
     remote = file_path.startswith(("http://", "https://"))
-    parsed_path = urlparse(file_path).path if remote else file_path
+    stored_object = is_object_reference(file_path)
+    parsed_path = urlparse(file_path).path if remote else reference_name(file_path) if stored_object else file_path
     extension = Path(parsed_path).suffix.lower()
     if extension not in ASSET_EXTENSIONS[asset_type]:
         raise HTTPException(status_code=400, detail={"code": "ASSET_EXTENSION_INVALID", "message": f"{asset_type} 素材不支持 {extension or '无后缀'} 文件。"})
@@ -940,12 +1043,20 @@ def inspect_asset(asset_type: str, file_path: str, content: bytes | None = None)
             raise HTTPException(status_code=400, detail={"code": "ASSET_URL_INSECURE", "message": "远程素材必须使用 HTTPS 链接。"})
         return {"size": 0, "extension": extension, "mime_type": mimetypes.guess_type(parsed_path)[0] or "application/octet-stream", "checksum": "", "safety_status": "remote_unverified"}
     if content is None:
-        path = Path(file_path)
-        if not path.is_file():
-            raise HTTPException(status_code=404, detail={"code": "ASSET_FILE_MISSING", "message": "素材文件不存在，请检查本地路径。"})
-        if path.stat().st_size > MAX_ASSET_BYTES:
-            raise HTTPException(status_code=413, detail={"code": "ASSET_FILE_TOO_LARGE", "message": "素材文件不能超过 50 MB。"})
-        content = path.read_bytes()
+        if stored_object:
+            try:
+                content = read_stored_bytes(file_path, maximum_bytes=MAX_ASSET_BYTES)
+            except (FileNotFoundError, OSError, ValueError):
+                raise HTTPException(status_code=404, detail={"code": "ASSET_FILE_MISSING", "message": "云端素材不存在或已损坏。"})
+        else:
+            if CLOUD_MODE:
+                raise HTTPException(status_code=400, detail={"code": "ASSET_UPLOAD_REQUIRED", "message": "云端版本必须通过上传接口登记素材。"})
+            path = Path(file_path)
+            if not path.is_file():
+                raise HTTPException(status_code=404, detail={"code": "ASSET_FILE_MISSING", "message": "素材文件不存在，请检查本地路径。"})
+            if path.stat().st_size > MAX_ASSET_BYTES:
+                raise HTTPException(status_code=413, detail={"code": "ASSET_FILE_TOO_LARGE", "message": "素材文件不能超过 50 MB。"})
+            content = path.read_bytes()
     if not content:
         raise HTTPException(status_code=400, detail={"code": "ASSET_FILE_EMPTY", "message": "上传文件为空。"})
     if len(content) > MAX_ASSET_BYTES:
@@ -997,7 +1108,11 @@ def owned_ai_input_path(identity: dict, raw_path: str | None) -> str | None:
         return raw_path
     if identity["role"] == "anonymous":
         raise HTTPException(status_code=403, detail={"code": "AUTH_REQUIRED", "message": "请先登录后上传和使用参考图片。"})
-    owner = f"student-{identity['student'].id}" if identity["role"] == "student" else "teacher"
+    owner = f"student-{identity['student'].id}" if identity["role"] == "student" else f"teacher-{identity['teacher'].id}"
+    if is_object_reference(raw_path):
+        if not reference_in_category(raw_path, f"ai_inputs/{owner}") or not object_exists(raw_path):
+            raise HTTPException(status_code=403, detail={"code": "AI_INPUT_FORBIDDEN", "message": "参考图片不存在或不属于当前账号。"})
+        return raw_path
     owner_dir = (AI_INPUT_DIR / owner).resolve()
     candidate = Path(raw_path).resolve()
     if not candidate.is_file() or owner_dir not in candidate.parents:
@@ -1021,7 +1136,73 @@ def on_startup():
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "service": "CoderAI 学堂 API"}
+    return {"status": "ok", "service": "CoderAI 学堂 API", "version": APP_VERSION}
+
+
+@app.get("/api/health/live")
+def health_live():
+    return {"status": "ok", "service": "CoderAI 学堂 API", "version": APP_VERSION}
+
+
+@app.get("/api/health/ready")
+def health_ready(request: Request, db: Session = Depends(get_db)):
+    checks: dict[str, Any] = {}
+    try:
+        db.execute(text("SELECT 1"))
+        checks["database"] = {"ready": True, "engine": "postgresql" if DATABASE_URL.startswith("postgresql") else "sqlite"}
+    except Exception as exc:
+        checks["database"] = {"ready": False, "error": str(exc)[:240]}
+    try:
+        checks["storage"] = ensure_storage_ready(create_bucket=False)
+    except Exception as exc:
+        checks["storage"] = {"ready": False, "error": str(exc)[:240]}
+    checks["queue"] = queue_health()
+    organization: Organization = request.state.organization
+    ready = all(bool(value.get("ready")) for value in checks.values())
+    payload = {
+        "status": "ready" if ready else "not_ready",
+        "checks": checks,
+        "organization": {"code": organization.code, "name": organization.name},
+        "version": APP_VERSION,
+    }
+    return payload if ready else JSONResponse(status_code=503, content=payload)
+
+
+@app.get("/api/version")
+def version():
+    return {
+        "version": APP_VERSION,
+        "minimum_client_version": os.environ.get("CODERAI_MINIMUM_CLIENT_VERSION", APP_VERSION),
+        "channel": os.environ.get("CODERAI_RELEASE_CHANNEL", "beta"),
+        "commit": os.environ.get("CODERAI_BUILD_COMMIT", "development"),
+        "deployment_mode": "cloud" if CLOUD_MODE else "local",
+    }
+
+
+def ensure_login_organization(payload_code: str, request: Request, db: Session) -> Organization:
+    organization: Organization | None = getattr(request.state, "organization", None)
+    if organization is None:
+        with without_tenant_filter():
+            organization = db.query(Organization).filter(Organization.code == default_organization_code()).first()
+            if not organization:
+                organization = Organization(
+                    id=1,
+                    code=default_organization_code(),
+                    name="CoderAI 试点机构",
+                    active=True,
+                    seat_limit=50,
+                )
+                db.add(organization)
+                db.commit()
+                db.refresh(organization)
+        request.state.organization = organization
+    requested = (payload_code or default_organization_code()).strip().lower()
+    if requested != organization.code:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "ORGANIZATION_MISMATCH", "message": "登录机构与客户端配置不一致。"},
+        )
+    return organization
 
 
 def ensure_tool_allowed_for_student(db: Session, identity: dict, tool: str):
@@ -1063,9 +1244,10 @@ def tool_label(tool: str) -> str:
 
 @app.post("/api/auth/teacher-login")
 def teacher_login(payload: TeacherLoginRequest, request: Request, db: Session = Depends(get_db)):
+    organization = ensure_login_organization(payload.organization_code, request, db)
     username = payload.username.strip().lower() or "admin"
     client_host = request.client.host if request.client else "local"
-    identifier = f"{username}:{client_host}"
+    identifier = f"{organization.code}:{username}:{client_host}"
     check_login_allowed(db, "teacher", identifier)
     try:
         user = login_teacher_by_credentials(db, username, payload.password)
@@ -1081,6 +1263,7 @@ def teacher_login(payload: TeacherLoginRequest, request: Request, db: Session = 
     clear_login_failures(db, "teacher", identifier)
     return {
         "role": "teacher",
+        "organization": {"id": organization.id, "code": organization.code, "name": organization.name},
         "password_change_required": teacher_password_change_required(db, user),
         "password_is_weak": user.role == "teacher" and teacher_password_is_weak(payload.password),
         **issue_teacher_session(db, user, payload.device_name),
@@ -1132,11 +1315,12 @@ def delete_teacher_session(
 
 @app.post("/api/auth/student-login")
 def student_login(payload: StudentLoginRequest, request: Request, db: Session = Depends(get_db)):
+    organization = ensure_login_organization(payload.organization_code, request, db)
     login_name = payload.username.strip().lower()
     if not login_name or not payload.password:
         raise HTTPException(status_code=400, detail={"code": "LOGIN_FIELDS_REQUIRED", "message": "请输入用户名和密码。"})
     client_host = request.client.host if request.client else "local"
-    identifier = f"{login_name}:{client_host}"
+    identifier = f"{organization.code}:{login_name}:{client_host}"
     check_login_allowed(db, "student", identifier)
     try:
         student = login_student_by_credentials(db, payload.username, payload.password)
@@ -1152,6 +1336,7 @@ def student_login(payload: StudentLoginRequest, request: Request, db: Session = 
     clear_login_failures(db, "student", identifier)
     return {
         "role": "student",
+        "organization": {"id": organization.id, "code": organization.code, "name": organization.name},
         "legacy_login": False,
         "registration_required": False,
         "student": to_user_dict(student),
@@ -1405,6 +1590,7 @@ async def image_generate(
 @app.post("/api/video/generate")
 async def video_generate(
     payload: VideoGenerateRequest,
+    background_tasks: BackgroundTasks,
     identity: dict = Depends(optional_teacher_or_student),
     db: Session = Depends(get_db),
 ):
@@ -1424,10 +1610,12 @@ async def video_generate(
         save_as_project=payload.save_project and identity["role"] != "anonymous",
         owner_teacher_id=owner_teacher_id,
     )
+    queue_backend = enqueue_video_poll(background_tasks, task.id)
     return {
         "message": "视频生成任务已提交，可稍后刷新任务状态。",
         "task": to_video_task_dict(task),
         "project": to_project_dict(project) if project else None,
+        "queue_backend": queue_backend,
     }
 
 
@@ -1445,11 +1633,14 @@ async def upload_ai_input(
     if not extension:
         raise HTTPException(status_code=400, detail={"code": "AI_INPUT_TYPE_INVALID", "message": "仅支持 PNG、JPEG 或 WebP 图片。"})
     owner = f"student-{identity['student'].id}" if identity["role"] == "student" else f"teacher-{identity['teacher'].id}"
-    owner_dir = AI_INPUT_DIR / owner
-    owner_dir.mkdir(parents=True, exist_ok=True)
-    target = owner_dir / f"{secrets.token_hex(16)}{extension}"
-    target.write_bytes(content)
-    return {"input": {"file_name": file.filename or target.name, "file_path": str(target), "size": len(content), "content_type": file.content_type or "image/*"}}
+    filename = Path(file.filename or f"input{extension}").name
+    reference = put_stored_bytes(
+        f"ai_inputs/{owner}",
+        filename,
+        content,
+        content_type=file.content_type or "image/*",
+    )
+    return {"input": {"file_name": filename, "file_path": reference, "size": len(content), "content_type": file.content_type or "image/*"}}
 
 
 @app.get("/api/video/tasks")
@@ -1860,11 +2051,26 @@ def workflow_cache_path(db: Session, workflow: Workflow | None, node: dict, sour
     return WORKFLOW_CACHE_DIR / f"{digest}.json"
 
 
-async def execute_workflow_run_background(run_id: int, retry_from_node: str | None = None, bind=None):
+async def execute_workflow_run_background(
+    run_id: int,
+    retry_from_node: str | None = None,
+    bind=None,
+    organization_id: int | None = None,
+    organization_code: str = "",
+):
+    tenant_id = organization_id or current_organization_id()
+    tenant_code = organization_code or current_organization_code()
+    from backend.app.tenancy import organization_context
+
+    with organization_context(tenant_id, tenant_code):
+        await _execute_workflow_run_background(run_id, retry_from_node, bind)
+
+
+async def _execute_workflow_run_background(run_id: int, retry_from_node: str | None = None, bind=None):
     db = Session(bind=bind) if bind is not None else SessionLocal()
     try:
         run = db.query(WorkflowRun).filter(WorkflowRun.id == run_id).first()
-        if not run or run.status == "canceled" and not retry_from_node:
+        if not run or (run.status in {"running", "success"} and not retry_from_node) or (run.status == "canceled" and not retry_from_node):
             return
         request = json.loads(run.input_json or "{}")
         prompt = str(request.get("prompt") or "").strip()
@@ -2053,7 +2259,7 @@ def run_workflow_async(
     db.add(run)
     db.commit()
     db.refresh(run)
-    background_tasks.add_task(execute_workflow_run_background, run.id, None, db.get_bind())
+    enqueue_workflow_run(background_tasks, execute_workflow_run_background, run.id, None, db.get_bind())
     return {"run": workflow_run_payload(run)}
 
 
@@ -2109,7 +2315,7 @@ def retry_workflow_node(
     run.error_message = ""
     db.commit()
     db.refresh(run)
-    background_tasks.add_task(execute_workflow_run_background, run.id, payload.node_id, db.get_bind())
+    enqueue_workflow_run(background_tasks, execute_workflow_run_background, run.id, payload.node_id, db.get_bind())
     return {"run": workflow_run_payload(run)}
 
 
@@ -2358,14 +2564,17 @@ def get_project_file(project_id: int, identity: dict = Depends(require_student_o
     ensure_student_can_access_moderated_project(project, identity)
     if not project.file_path.strip() or project.file_path.startswith(("http://", "https://")):
         raise HTTPException(status_code=404, detail={"code": "PROJECT_FILE_UNAVAILABLE", "message": "这个作品没有可预览的本地文件。"})
-    file_path = Path(project.file_path)
     try:
-        file_path.resolve().relative_to(DATA_DIR.resolve())
-    except (ValueError, OSError):
+        if not object_exists(project.file_path):
+            raise FileNotFoundError(project.file_path)
+        return authenticated_storage_response(
+            project.file_path,
+            media_type=mimetypes.guess_type(reference_name(project.file_path))[0] or "application/octet-stream",
+        )
+    except ValueError:
         raise HTTPException(status_code=403, detail={"code": "PROJECT_FILE_FORBIDDEN", "message": "作品文件不在受管工作区中，不能读取。"})
-    if not file_path.exists() or not file_path.is_file():
+    except (FileNotFoundError, OSError):
         raise HTTPException(status_code=404, detail={"code": "PROJECT_FILE_MISSING", "message": "作品记录存在，但本地文件已缺失。"})
-    return FileResponse(file_path)
 
 
 @app.put("/api/projects/{project_id}")
@@ -2460,18 +2669,11 @@ def permanently_delete_project(project_id: int, identity: dict = Depends(require
         raise HTTPException(status_code=409, detail={"code": "PROJECT_NOT_IN_TRASH", "message": "只有回收站中的作品可以永久删除。"})
     if db.query(TaskSubmission).filter(TaskSubmission.project_id == project_id).first():
         raise HTTPException(status_code=409, detail={"code": "PROJECT_HAS_SUBMISSION", "message": "作品已用于作业提交，不能永久删除。"})
-    file_path = Path(project.file_path) if project.file_path and not project.file_path.startswith(("http://", "https://")) else None
+    file_reference = project.file_path if project.file_path and not project.file_path.startswith(("http://", "https://")) else ""
     db.query(Asset).filter(Asset.project_id == project_id).update({Asset.project_id: None}, synchronize_session=False)
     db.delete(project)
     db.commit()
-    file_deleted = False
-    if file_path and file_path.is_file():
-        try:
-            file_path.resolve().relative_to(DATA_DIR.resolve())
-            file_path.unlink()
-            file_deleted = True
-        except (ValueError, OSError):
-            pass
+    file_deleted = delete_managed_reference(file_reference)
     return {"deleted": True, "project_id": project_id, "file_deleted": file_deleted}
 
 
@@ -2510,7 +2712,7 @@ def register_asset(payload: AssetRegisterRequest, teacher: TeacherSession = Depe
     if lesson:
         ensure_teaching_record_access(db, actor, lesson.owner_teacher_id, lesson.course.classroom_id if lesson.course else None, "课时")
     inspection = inspect_asset(payload.asset_type, payload.file_path)
-    original_name = Path(urlparse(payload.file_path).path if payload.file_path.startswith(("http://", "https://")) else payload.file_path).name
+    original_name = Path(urlparse(payload.file_path).path).name if payload.file_path.startswith(("http://", "https://")) else reference_name(payload.file_path)
     asset = Asset(
         owner_teacher_id=actor.id,
         project_id=payload.project_id,
@@ -2559,18 +2761,21 @@ async def upload_asset(
     if lesson:
         ensure_teaching_record_access(db, actor, lesson.owner_teacher_id, lesson.course.classroom_id if lesson.course else None, "课时")
     original_name = Path(file.filename or "asset").name
-    suffix = Path(original_name).suffix.lower()
-    target = ASSET_LIBRARY_DIR / f"{secrets.token_hex(8)}{suffix}"
     content = await file.read(MAX_ASSET_BYTES + 1)
     inspection = inspect_asset(asset_type, original_name, content)
-    target.write_bytes(content)
+    reference = put_stored_bytes(
+        "assets/library",
+        original_name,
+        content,
+        content_type=inspection["mime_type"],
+    )
     asset = Asset(
         owner_teacher_id=actor.id,
         project_id=project_id,
         classroom_id=classroom_id,
         lesson_id=lesson_id,
         asset_type=asset_type,
-        file_path=str(target),
+        file_path=reference,
         metadata_json=structured_asset_metadata(metadata_json, display_name, description, [tag.strip() for tag in tags.split(",")]),
         original_name=original_name,
         mime_type=inspection["mime_type"],
@@ -2600,10 +2805,11 @@ def get_asset_file(asset_id: int, identity: dict = Depends(require_student_or_te
         ensure_teaching_record_access(db, identity["teacher"], asset.owner_teacher_id, asset.classroom_id, "素材")
     if asset.file_path.startswith(("http://", "https://")):
         raise HTTPException(status_code=404, detail={"code": "ASSET_REMOTE_FILE", "message": "远程素材请直接打开原始链接。"})
-    file_path = Path(asset.file_path)
-    if not file_path.exists() or not file_path.is_file():
+    if not object_exists(asset.file_path):
         raise HTTPException(status_code=404, detail={"code": "ASSET_FILE_MISSING", "message": "素材记录存在，但本地文件已缺失。"})
-    return FileResponse(file_path)
+    if not is_object_reference(asset.file_path) and not CLOUD_MODE:
+        return FileResponse(Path(asset.file_path), media_type=asset.mime_type or "application/octet-stream")
+    return storage_response(asset.file_path, media_type=asset.mime_type or "application/octet-stream")
 
 
 @app.delete("/api/assets/{asset_id}")
@@ -2612,15 +2818,11 @@ def delete_asset(asset_id: int, teacher: TeacherSession = Depends(require_teache
     if not asset:
         raise HTTPException(status_code=404, detail={"code": "ASSET_NOT_FOUND", "message": "素材不存在。"})
     ensure_teaching_record_access(db, teacher_actor(db, teacher), asset.owner_teacher_id, asset.classroom_id, "素材")
-    file_path = Path(asset.file_path) if not asset.file_path.startswith(("http://", "https://")) else None
+    file_reference = asset.file_path if not asset.file_path.startswith(("http://", "https://")) else ""
     db.delete(asset)
     db.commit()
-    if file_path and file_path.is_file():
-        try:
-            file_path.resolve().relative_to(ASSET_LIBRARY_DIR.resolve())
-            file_path.unlink()
-        except (ValueError, OSError):
-            pass
+    if file_reference and reference_in_category(file_reference, "assets/library"):
+        delete_object(file_reference)
     return {"deleted": True, "asset_id": asset_id}
 
 
@@ -2909,27 +3111,11 @@ def curriculum_material_or_404(db: Session, course_id: int, kind: str) -> tuple[
     return course, material
 
 
-def managed_curriculum_path(raw_path: str, missing_code: str = "COURSE_MATERIAL_FILE_MISSING") -> Path:
-    path = Path(raw_path)
-    try:
-        resolved = path.resolve()
-        resolved.relative_to(CURRICULUM_DIR.resolve())
-    except (ValueError, OSError):
-        raise HTTPException(status_code=403, detail={"code": "COURSE_MATERIAL_FILE_FORBIDDEN", "message": "课程资料不在受管目录中。"})
-    if not resolved.is_file():
-        raise HTTPException(status_code=404, detail={"code": missing_code, "message": "课程资料记录存在，但文件已缺失。"})
-    return resolved
-
-
 def delete_curriculum_file(raw_path: str) -> None:
     if not raw_path:
         return
-    try:
-        path = Path(raw_path).resolve()
-        path.relative_to(CURRICULUM_DIR.resolve())
-        path.unlink(missing_ok=True)
-    except (ValueError, OSError):
-        return
+    if reference_in_category(raw_path, "curriculum"):
+        delete_object(raw_path)
 
 
 def apply_course_package_request(package: CoursePackage, payload: CoursePackageRequest, author: User) -> None:
@@ -3004,6 +3190,7 @@ async def import_curriculum_package(
     upload_path = Path(upload_handle.name)
     total = 0
     package_dir: Path | None = None
+    stored_references: list[str] = []
     conversion_ids: list[int] = []
     try:
         while chunk := await file.read(1024 * 1024):
@@ -3075,14 +3262,20 @@ async def import_curriculum_package(
                     metadata = validate_course_material(kind, str(item.get("original_name") or Path(member).name), content)
                     if item.get("sha256") and str(item["sha256"]) != metadata["checksum_sha256"]:
                         raise HTTPException(status_code=400, detail={"code": "CURRICULUM_MATERIAL_CHECKSUM_INVALID", "message": f"课程资料校验失败：{member}"})
-                    target_dir = curriculum_course_dir(package.id, course.id)
-                    target = target_dir / ("slides.pptx" if kind == "slides" else "starter.md" if kind == "starter_markdown" else "result.md")
-                    target.write_bytes(content)
+                    target_name = "slides.pptx" if kind == "slides" else "starter.md" if kind == "starter_markdown" else "result.md"
+                    reference = put_stored_bytes(
+                        f"curriculum/{package.id}/{course.id}",
+                        target_name,
+                        content,
+                        content_type=metadata["mime_type"],
+                        stable_name=target_name,
+                    )
+                    stored_references.append(reference)
                     material = CourseMaterial(
                         course_id=course.id,
                         kind=kind,
                         original_name=str(item.get("original_name") or Path(member).name)[:255],
-                        source_path=str(target),
+                        source_path=reference,
                         mime_type=metadata["mime_type"],
                         file_size=metadata["file_size"],
                         checksum_sha256=metadata["checksum_sha256"],
@@ -3095,18 +3288,22 @@ async def import_curriculum_package(
             db.commit()
             db.refresh(package)
             for material_id in conversion_ids:
-                background_tasks.add_task(convert_slides_material, material_id)
+                enqueue_slides_conversion(background_tasks, convert_slides_material, material_id)
             record_teacher_audit(db, teacher, "curriculum.package.imported", target_type="course_package", target_id=package.id, summary=f"导入课程包：{package.title}")
             return {"package": course_package_payload(db, package, {"role": "teacher", "teacher": actor, "student": None}), "conversion_jobs": len(conversion_ids)}
     except HTTPException:
         db.rollback()
         if package_dir and package_dir.exists():
             shutil.rmtree(package_dir, ignore_errors=True)
+        for reference in stored_references:
+            delete_object(reference)
         raise
     except Exception as exc:
         db.rollback()
         if package_dir and package_dir.exists():
             shutil.rmtree(package_dir, ignore_errors=True)
+        for reference in stored_references:
+            delete_object(reference)
         raise HTTPException(status_code=400, detail={"code": "CURRICULUM_PACKAGE_IMPORT_FAILED", "message": f"课程包导入失败：{exc}"})
     finally:
         upload_handle.close()
@@ -3291,9 +3488,10 @@ def export_curriculum_package(
                 "materials": {},
             }
             for material in course.materials:
-                source = managed_curriculum_path(material.source_path)
-                member = f"materials/{index:03d}-{course.id}/{material.kind}{source.suffix.lower()}"
-                archive.write(source, member)
+                suffix = Path(material.original_name or reference_name(material.source_path)).suffix.lower()
+                member = f"materials/{index:03d}-{course.id}/{material.kind}{suffix}"
+                with materialize_curriculum(material.source_path, suffix=suffix) as source:
+                    archive.write(source, member)
                 course_row["materials"][material.kind] = {
                     "path": member,
                     "original_name": material.original_name,
@@ -3401,19 +3599,22 @@ async def upload_curriculum_material(
         metadata = validate_course_material(kind, file.filename or "", content)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail={"code": "COURSE_MATERIAL_INVALID", "message": str(exc)})
-    target_dir = curriculum_course_dir(course.package_id, course.id)
-    target = target_dir / ("slides.pptx" if kind == "slides" else "starter.md" if kind == "starter_markdown" else "result.md")
-    temporary = target.with_name(f".{target.name}.{secrets.token_hex(6)}.upload")
-    temporary.write_bytes(content)
-    temporary.replace(target)
+    target_name = "slides.pptx" if kind == "slides" else "starter.md" if kind == "starter_markdown" else "result.md"
+    reference = store_curriculum_bytes(
+        course.package_id,
+        course.id,
+        target_name,
+        content,
+        metadata["mime_type"],
+    )
     material = db.query(CourseMaterial).filter_by(course_id=course.id, kind=kind).first()
     old_source = material.source_path if material else ""
     old_preview = material.preview_path if material else ""
     if not material:
         material = CourseMaterial(course_id=course.id, kind=kind)
         db.add(material)
-    material.original_name = (file.filename or target.name)[:255]
-    material.source_path = str(target)
+    material.original_name = (file.filename or target_name)[:255]
+    material.source_path = reference
     material.preview_path = "" if kind == "slides" else material.preview_path
     material.mime_type = metadata["mime_type"]
     material.file_size = metadata["file_size"]
@@ -3422,11 +3623,11 @@ async def upload_curriculum_material(
     material.conversion_error = ""
     db.commit()
     db.refresh(material)
-    if old_source and Path(old_source).resolve() != target.resolve():
+    if old_source and old_source != reference:
         delete_curriculum_file(old_source)
     if kind == "slides":
         delete_curriculum_file(old_preview)
-        background_tasks.add_task(convert_slides_material, material.id)
+        enqueue_slides_conversion(background_tasks, convert_slides_material, material.id)
     record_teacher_audit(db, teacher, "curriculum.material.updated", target_type="course_material", target_id=material.id, summary=f"更新{COURSE_MATERIAL_LABELS[kind]}：{course.title}")
     return {"material": curriculum_material_payload(db, course, kind, {"role": "teacher", "teacher": actor, "student": None})}
 
@@ -3460,7 +3661,7 @@ def retry_curriculum_slides_conversion(
     material.conversion_status = "pending"
     material.conversion_error = ""
     db.commit()
-    background_tasks.add_task(convert_slides_material, material.id)
+    enqueue_slides_conversion(background_tasks, convert_slides_material, material.id)
     return {"queued": True, "material_id": material.id}
 
 
@@ -3484,12 +3685,14 @@ def preview_curriculum_material(
     if kind == "slides":
         if material.conversion_status != "ready" or not material.preview_path:
             raise HTTPException(status_code=409, detail={"code": "COURSE_SLIDES_PREVIEW_UNAVAILABLE", "message": "PPT 预览暂不可用，管理员可检查转换状态并重试。"})
-        path = managed_curriculum_path(material.preview_path, "COURSE_SLIDES_PREVIEW_MISSING")
         # A neutral MIME type keeps browser download managers from hijacking the
         # authenticated XHR. The frontend restores application/pdf in memory.
-        return FileResponse(path, media_type="application/octet-stream", headers={"X-Content-Type-Options": "nosniff"})
-    path = managed_curriculum_path(material.source_path)
-    return FileResponse(path, media_type="text/markdown; charset=utf-8", headers={"Content-Disposition": "inline", "X-Content-Type-Options": "nosniff"})
+        if not object_exists(material.preview_path):
+            raise HTTPException(status_code=404, detail={"code": "COURSE_SLIDES_PREVIEW_MISSING", "message": "课程PPT预览文件已缺失。"})
+        return curriculum_file_response(material.preview_path, media_type="application/octet-stream")
+    if not object_exists(material.source_path):
+        raise HTTPException(status_code=404, detail={"code": "COURSE_MATERIAL_FILE_MISSING", "message": "课程资料记录存在，但文件已缺失。"})
+    return curriculum_file_response(material.source_path, media_type="text/markdown; charset=utf-8")
 
 
 @app.get("/api/curriculum-courses/{course_id}/materials/{kind}/download")
@@ -3504,8 +3707,14 @@ def download_curriculum_material(
     if not can_download:
         code = "COURSE_MATERIAL_DOWNLOAD_FORBIDDEN" if kind == "slides" else "COURSE_RESULT_LOCKED"
         raise HTTPException(status_code=403, detail={"code": code, "message": "当前账号不能下载这项课程资料。"})
-    path = managed_curriculum_path(material.source_path)
-    return FileResponse(path, media_type=material.mime_type or "application/octet-stream", filename=material.original_name or path.name)
+    if not object_exists(material.source_path):
+        raise HTTPException(status_code=404, detail={"code": "COURSE_MATERIAL_FILE_MISSING", "message": "课程资料记录存在，但文件已缺失。"})
+    return curriculum_file_response(
+        material.source_path,
+        media_type=material.mime_type or "application/octet-stream",
+        filename=material.original_name or reference_name(material.source_path),
+        inline=False,
+    )
 
 
 @app.post("/api/classrooms")
@@ -4725,14 +4934,17 @@ def get_image_moderation_file(log_id: int, teacher: TeacherSession = Depends(req
     ensure_archived_student_record_writable(actor, db.get(User, log.user_id) if log.user_id else None, "安全审核记录")
     if log.resource_path.startswith(("http://", "https://")):
         return {"remote_url": log.resource_path}
-    file_path = Path(log.resource_path)
     try:
-        file_path.resolve().relative_to(DATA_DIR.resolve())
-    except (ValueError, OSError):
+        if not object_exists(log.resource_path):
+            raise FileNotFoundError(log.resource_path)
+        return authenticated_storage_response(
+            log.resource_path,
+            media_type=mimetypes.guess_type(reference_name(log.resource_path))[0] or "image/png",
+        )
+    except ValueError:
         raise HTTPException(status_code=403, detail={"code": "IMAGE_REVIEW_FILE_FORBIDDEN", "message": "审核图片不在受管工作区中。"})
-    if not file_path.is_file():
+    except (FileNotFoundError, OSError):
         raise HTTPException(status_code=404, detail={"code": "IMAGE_REVIEW_FILE_MISSING", "message": "待审核图片文件已缺失。"})
-    return FileResponse(file_path)
 
 
 @app.post("/api/moderation/images/{log_id}/review")

@@ -22,7 +22,7 @@ const sectionCopy: Partial<Record<AdminSectionKey, { title: string; description:
   models: { title: "模型服务", description: "集中维护多厂商模型、密钥、能力路由和调用统计。" },
   privacy: { title: "隐私与数据政策", description: "维护全局隐私政策、监护人授权要求和数据处理规则。" },
   security: { title: "管理员账号安全", description: "查看当前管理员的登录设备和高风险操作记录。" },
-  operations: { title: "运维与备份", description: "检查存储、日志和文件一致性，并执行系统备份恢复。" },
+  operations: { title: "运维与备份", description: "检查机构存储和文件一致性，并导出本机构数据；云端恢复由平台运维执行。" },
   extensions: { title: "扩展与授权", description: "维护许可证、插件和系统扩展能力。" },
 };
 

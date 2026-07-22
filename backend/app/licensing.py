@@ -13,7 +13,9 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from backend.app.models import AppSetting, User
+from backend.app.db import CLOUD_MODE
+from backend.app.models import AppSetting, Organization, User, now
+from backend.app.tenancy import current_organization_id
 
 
 BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
@@ -257,6 +259,53 @@ def _community_status(db: Session) -> dict[str, Any]:
     }
 
 
+def _cloud_pilot_status(db: Session) -> dict[str, Any]:
+    organization = db.get(Organization, current_organization_id())
+    used = _active_student_count(db)
+    seats = max(1, int(organization.seat_limit if organization else 50))
+    expired = bool(organization and organization.beta_expires_at and organization.beta_expires_at <= now())
+    active = bool(organization and organization.active and not expired)
+    usable = active and used <= seats
+    if not organization:
+        status = "organization_missing"
+        message = "当前云端机构不存在。"
+    elif not organization.active:
+        status = "organization_disabled"
+        message = "当前云端机构已停用。"
+    elif expired:
+        status = "expired"
+        message = "当前云端内测授权已到期。"
+    elif used > seats:
+        status = "seat_limit_exceeded"
+        message = f"当前机构允许 {seats} 个在读席位，已有 {used} 个。"
+    else:
+        status = "cloud_pilot"
+        message = "当前为机构云端内测授权。"
+    return {
+        "license_key": "",
+        "schema_version": LICENSE_SCHEMA_VERSION,
+        "license_id": f"CLOUD-PILOT-{organization.code.upper()}" if organization else "",
+        "organization": organization.name if organization else "",
+        "plan": "cloud_pilot",
+        "valid": active,
+        "usable": usable,
+        "signature_verified": False,
+        "status": status,
+        "message": message,
+        "issued_at": organization.created_at.isoformat() if organization else "",
+        "not_before": "",
+        "expires_at": organization.beta_expires_at.isoformat() if organization and organization.beta_expires_at else "",
+        "seats": seats,
+        "seats_used": used,
+        "seats_remaining": max(seats - used, 0),
+        "features": list(DEFAULT_COMMERCIAL_FEATURES),
+        "device_id": "",
+        "device_bound": False,
+        "authorized_devices": ["cloud-managed"],
+        "issuer": "CoderAI Cloud Pilot",
+    }
+
+
 def _invalid_status(db: Session, token: str, error: LicenseTokenError) -> dict[str, Any]:
     used = _active_student_count(db)
     return {
@@ -344,6 +393,8 @@ def _stored_token(db: Session) -> str:
 
 
 def get_license_status(db: Session) -> dict[str, Any]:
+    if CLOUD_MODE:
+        return _cloud_pilot_status(db)
     token = _stored_token(db)
     if not token:
         return _community_status(db)
@@ -355,6 +406,14 @@ def get_license_status(db: Session) -> dict[str, Any]:
 
 
 def save_license_status(db: Session, payload: dict[str, Any]) -> dict[str, Any]:
+    if CLOUD_MODE:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "CLOUD_LICENSE_PLATFORM_MANAGED",
+                "message": "云端内测授权由平台运维管理，不接受设备绑定许可证。",
+            },
+        )
     token = str(payload.get("license_key") or "").strip()
     if not token:
         status = _community_status(db)
@@ -395,6 +454,11 @@ def ensure_student_seat_capacity(db: Session, additional: int = 1) -> dict[str, 
         return get_license_status(db)
     status = get_license_status(db)
     if not status["valid"]:
+        if CLOUD_MODE:
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "ORGANIZATION_NOT_ACTIVE", "message": status["message"]},
+            )
         raise HTTPException(
             status_code=403,
             detail={
@@ -404,6 +468,14 @@ def ensure_student_seat_capacity(db: Session, additional: int = 1) -> dict[str, 
         )
     requested = int(status["seats_used"]) + int(additional)
     if requested > int(status["seats"]):
+        if CLOUD_MODE:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ORGANIZATION_SEAT_LIMIT",
+                    "message": f"当前机构允许 {status['seats']} 个在读席位，已有 {status['seats_used']} 个，无法再启用 {additional} 个账号。",
+                },
+            )
         raise HTTPException(
             status_code=409,
             detail={

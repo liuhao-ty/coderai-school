@@ -28,6 +28,7 @@ import type { GuardianConsent, PrivacyPolicy, StudentDeletionPreflight, StudentP
 import { api } from "../../lib/api";
 import { explainError } from "../../lib/errors";
 import { formatBeijingTime, formatBytes } from "../../lib/format";
+import { RetentionGovernancePanel } from "./RetentionGovernancePanel";
 
 
 const { Paragraph, Text } = Typography;
@@ -383,6 +384,15 @@ export function PrivacyDataPanel({ onRefresh }: { onRefresh: () => Promise<void>
         </Col>
       </Row>
 
+      <Card>
+        <RetentionGovernancePanel
+          policyRetentionDays={settings?.current_policy.retention_days || 365}
+          onExecuted={async () => {
+            await Promise.all([loadOverview(), onRefresh()]);
+          }}
+        />
+      </Card>
+
       <Card title="授权历史">
         <Table<GuardianConsent>
           size="small"
@@ -424,7 +434,7 @@ export function PrivacyDataPanel({ onRefresh }: { onRefresh: () => Promise<void>
               </Form.Item>
             </Col>
           </Row>
-          <Form.Item name="guardian_contact" label="联系方式（使用本机系统加密保存）">
+          <Form.Item name="guardian_contact" label="联系方式（安全加密保存）">
             <Input />
           </Form.Item>
           <Form.Item name="consent_method" label="授权方式" rules={[{ required: true }]}>

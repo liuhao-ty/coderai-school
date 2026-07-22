@@ -31,7 +31,7 @@ from backend.app.models import (
     VideoTask,
     now,
 )
-from backend.app.provider_presets import get_provider_preset, list_provider_presets, provider_capabilities
+from backend.app.provider_presets import get_provider_preset, list_provider_presets
 from backend.app.schemas import (
     ClassroomAcceptanceRequest,
     ProviderAcceptanceScopeRequest,
@@ -48,6 +48,7 @@ from backend.app.services import (
     provider_status_payload,
     run_moderation,
 )
+from backend.app.storage import object_exists
 
 
 router = APIRouter(prefix="/api/readiness", tags=["readiness"])
@@ -514,7 +515,7 @@ def provider_run_payload(db: Session, run: ProviderAcceptanceRun) -> dict[str, A
     if run.capability == "video" and isinstance(task_id, int):
         task = db.get(VideoTask, task_id)
         if task:
-            local_ready = bool(task.file_path and Path(task.file_path).is_file())
+            local_ready = bool(task.file_path and object_exists(task.file_path))
             if task.status == "success" and local_ready:
                 status = "success"
                 message = "视频生成和本地保存已完成。"

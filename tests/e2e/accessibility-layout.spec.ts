@@ -392,7 +392,7 @@ test("隐私政策和管理员数据治理入口可访问", async ({ page, reque
   await setTeacherAuth(page, teacherAuth);
   await page.getByText("隐私政策", { exact: true }).click();
   await expect(page.getByText("隐私政策版本", { exact: true })).toBeVisible();
-  await page.getByRole("combobox").click();
+  await page.getByRole("combobox", { name: "选择学生" }).click();
   await page.locator(".ant-select-item-option").filter({ hasText: "默认学生" }).click();
   await expect(page.getByText("AI 数据处理权限有效", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "导出个人数据" })).toBeVisible();
@@ -420,6 +420,48 @@ test("签名授权页面显示社区席位和设备安装码", async ({ page, re
   await expectNoHorizontalOverflow(page);
   await expectNoSeriousAccessibilityViolations(page);
   await page.screenshot({ path: "test-results/layout-signed-license.png", fullPage: true });
+});
+
+test("云端内测授权隐藏设备许可证入口", async ({ page, request }) => {
+  const { teacherAuth } = await loginData(request);
+  await page.route("**/api/system/license", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        license: {
+          license_key: "",
+          organization: "CoderAI 试点机构",
+          plan: "cloud_pilot",
+          valid: true,
+          usable: true,
+          signature_verified: false,
+          status: "cloud_pilot",
+          message: "当前为机构云端内测授权。",
+          license_id: "CLOUD-PILOT-CODERAI-PILOT",
+          issued_at: "2026-07-22T00:00:00",
+          not_before: "",
+          expires_at: "",
+          seats: 50,
+          seats_used: 12,
+          seats_remaining: 38,
+          features: ["student_workspace", "teacher_console", "plugins"],
+          device_id: "",
+          device_bound: false,
+          authorized_devices: ["cloud-managed"],
+          issuer: "CoderAI Cloud Pilot",
+        },
+      }),
+    });
+  });
+  await setTeacherAuth(page, teacherAuth);
+  await page.getByText("扩展与授权", { exact: true }).click();
+  await expect(page.getByText("平台托管授权", { exact: true })).toBeVisible();
+  await expect(page.getByText("云端授权由平台管理", { exact: true })).toBeVisible();
+  await expect(page.getByLabel("签名许可证")).toHaveCount(0);
+  await expect(page.getByText("当前设备安装码：", { exact: true })).toHaveCount(0);
+  await expectNoHorizontalOverflow(page);
+  await expectNoSeriousAccessibilityViolations(page);
 });
 
 test("程序验收入口不出现在产品控制台", async ({ page, request }) => {

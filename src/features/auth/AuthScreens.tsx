@@ -2,7 +2,7 @@ import { Alert, App as AntApp, Button, Card, Col, Form, Input, Row, Space, Typog
 import { GraduationCap, Lock, ShieldCheck, UserRound } from "lucide-react";
 import { useState } from "react";
 
-import { api, loadTeacherProfile } from "../../lib/api";
+import { api, loadTeacherProfile, ORGANIZATION_CODE } from "../../lib/api";
 import { explainError } from "../../lib/errors";
 import type { StudentAuth, TeacherAuth } from "../../types";
 
@@ -65,7 +65,7 @@ export function StudentLoginScreen({
   const login = async (values: { username: string; password: string }) => {
     setLoading(true);
     try {
-      const res = await api.post("/api/auth/student-login", values);
+      const res = await api.post("/api/auth/student-login", { ...values, organization_code: ORGANIZATION_CODE });
       onSuccess(res.data as StudentAuth);
       message.success(`欢迎，${res.data.student.name}`);
     } catch (error) {
@@ -189,6 +189,7 @@ export function TeacherLoginScreen({ onBack, onSuccess }: { onBack: () => void; 
     try {
       const res = await api.post("/api/auth/teacher-login", {
         ...values,
+        organization_code: ORGANIZATION_CODE,
         device_name: navigator.platform || navigator.userAgent.slice(0, 80) || "Windows 设备"
       });
       const auth = res.data as TeacherAuth;

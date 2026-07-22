@@ -16,9 +16,12 @@ from fastapi.responses import FileResponse
 
 from backend.app.auth import PASSWORD_CHANGE_REQUIRED_KEY, PASSWORD_SETTING_KEY, SECRET_SETTING_KEY, require_admin
 from backend.app.audit import record_teacher_audit_to_sqlite
-from backend.app.db import DATA_DIR, DB_PATH, init_db
+from backend.app.db import CLOUD_MODE, DATA_DIR, DB_PATH, get_db, init_db
 from backend.app.licensing import LICENSE_SETTING_KEY
 from backend.app.models import TeacherSession
+from backend.app.audit import record_teacher_audit
+from backend.app.cloud_export import build_organization_export
+from sqlalchemy.orm import Session
 
 
 PACKAGE_VERSION = "1.0"
@@ -307,12 +310,13 @@ def preserve_local_secrets() -> tuple[dict[str, str], dict[str, str], list[tuple
         if "teacher_sessions" in tables:
             session_columns = {row[1] for row in connection.execute("PRAGMA table_info(teacher_sessions)").fetchall()}
             if "user_id" in session_columns:
+                organization_sql = "organization_id" if "organization_id" in session_columns else "1"
                 teacher_sessions = connection.execute(
-                    "SELECT id, user_id, token_hash, refresh_token_hash, device_name, created_at, last_seen_at, access_expires_at, expires_at, revoked_at FROM teacher_sessions"
+                    f"SELECT id, {organization_sql}, user_id, token_hash, refresh_token_hash, device_name, created_at, last_seen_at, access_expires_at, expires_at, revoked_at FROM teacher_sessions"
                 ).fetchall()
             else:
                 teacher_sessions = [
-                    (row[0], None, *row[1:])
+                    (row[0], 1, None, *row[1:])
                     for row in connection.execute(
                         "SELECT id, token_hash, refresh_token_hash, device_name, created_at, last_seen_at, access_expires_at, expires_at, revoked_at FROM teacher_sessions"
                     ).fetchall()
@@ -349,6 +353,7 @@ def restore_local_secrets(provider_keys: dict[str, str], settings: dict[str, str
             """
             CREATE TABLE IF NOT EXISTS teacher_sessions (
                 id INTEGER PRIMARY KEY,
+                organization_id INTEGER NOT NULL DEFAULT 1,
                 user_id INTEGER,
                 token_hash VARCHAR(64) UNIQUE NOT NULL,
                 refresh_token_hash VARCHAR(64) UNIQUE NOT NULL,
@@ -362,11 +367,13 @@ def restore_local_secrets(provider_keys: dict[str, str], settings: dict[str, str
             """
         )
         teacher_session_columns = {row[1] for row in connection.execute("PRAGMA table_info(teacher_sessions)").fetchall()}
+        if "organization_id" not in teacher_session_columns:
+            connection.execute("ALTER TABLE teacher_sessions ADD COLUMN organization_id INTEGER NOT NULL DEFAULT 1")
         if "user_id" not in teacher_session_columns:
             connection.execute("ALTER TABLE teacher_sessions ADD COLUMN user_id INTEGER")
         connection.execute("DELETE FROM teacher_sessions")
         connection.executemany(
-            "INSERT INTO teacher_sessions(id, user_id, token_hash, refresh_token_hash, device_name, created_at, last_seen_at, access_expires_at, expires_at, revoked_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO teacher_sessions(id, organization_id, user_id, token_hash, refresh_token_hash, device_name, created_at, last_seen_at, access_expires_at, expires_at, revoked_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             teacher_sessions,
         )
         if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='student_sessions'").fetchone():
@@ -433,19 +440,34 @@ def restore_package(package_path: Path, conflict_strategy: str) -> dict[str, Any
 
 
 @router.get("/export")
-def export_backup(background_tasks: BackgroundTasks):
+def export_backup(
+    background_tasks: BackgroundTasks,
+    teacher: TeacherSession = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
     if not BACKUP_LOCK.acquire(blocking=False):
         raise HTTPException(status_code=409, detail={"code": "BACKUP_BUSY", "message": "另一个备份或恢复任务正在执行。"})
     try:
-        package_path = build_backup_package()
+        package_path = build_organization_export(db) if CLOUD_MODE else build_backup_package()
     finally:
         BACKUP_LOCK.release()
+    if CLOUD_MODE:
+        record_teacher_audit(
+            db,
+            teacher,
+            "organization.data_exported",
+            target_type="organization_export",
+            summary="导出本机构数据（不含凭据）",
+            details={"restore_supported": False},
+        )
     background_tasks.add_task(package_path.unlink, missing_ok=True)
     return FileResponse(package_path, media_type="application/zip", filename=package_path.name)
 
 
 @router.post("/preflight")
 async def preflight_backup(file: UploadFile = File(...)):
+    if CLOUD_MODE:
+        raise HTTPException(status_code=403, detail={"code": "PLATFORM_RESTORE_REQUIRED", "message": "云端完整恢复仅允许平台运维执行。"})
     package_path = await save_upload(file)
     try:
         _, preview = inspect_package(package_path)
@@ -460,6 +482,8 @@ async def restore_backup(
     conflict_strategy: str = Form("replace"),
     teacher: TeacherSession = Depends(require_admin),
 ):
+    if CLOUD_MODE:
+        raise HTTPException(status_code=403, detail={"code": "PLATFORM_RESTORE_REQUIRED", "message": "机构管理员不能覆盖云端数据库，请联系平台运维执行恢复。"})
     if not BACKUP_LOCK.acquire(blocking=False):
         raise HTTPException(status_code=409, detail={"code": "BACKUP_BUSY", "message": "另一个备份或恢复任务正在执行。"})
     package_path = await save_upload(file)

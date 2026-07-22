@@ -1,0 +1,17 @@
+{
+  "organization_code": "coderai-pilot",
+  "accounts": [
+    {
+      "role": "student",
+      "username_pattern": "load.student{index:02d}",
+      "start": 1,
+      "count": 49,
+      "password": "replace-with-test-password"
+    },
+    {
+      "role": "teacher",
+      "username": "load.teacher01",
+      "password": "replace-with-test-password"
+    }
+  ]
+}

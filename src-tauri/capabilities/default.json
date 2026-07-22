@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "CoderAI 学堂主窗口的最小桌面权限",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "process:allow-restart",
+    "updater:default"
+  ]
+}

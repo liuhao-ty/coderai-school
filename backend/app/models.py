@@ -1,9 +1,10 @@
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.app.db import Base
+from backend.app.tenancy import TenantScopedMixin, current_organization_id
 
 
 BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
@@ -13,7 +14,20 @@ def now():
     return datetime.now(BEIJING_TZ).replace(tzinfo=None)
 
 
-class User(Base):
+class Organization(Base):
+    __tablename__ = "organizations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code: Mapped[str] = mapped_column(String(80), unique=True, nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(160), nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    seat_limit: Mapped[int] = mapped_column(Integer, default=50)
+    beta_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+
+class User(TenantScopedMixin, Base):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -36,7 +50,7 @@ class User(Base):
     classroom = relationship("Classroom")
 
 
-class Classroom(Base):
+class Classroom(TenantScopedMixin, Base):
     __tablename__ = "classrooms"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -46,7 +60,7 @@ class Classroom(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
 
-class ClassroomTeacher(Base):
+class ClassroomTeacher(TenantScopedMixin, Base):
     __tablename__ = "classroom_teachers"
 
     classroom_id: Mapped[int] = mapped_column(ForeignKey("classrooms.id"), primary_key=True)
@@ -58,13 +72,14 @@ class ClassroomTeacher(Base):
     teacher = relationship("User")
 
 
-class CoursePackage(Base):
+class CoursePackage(TenantScopedMixin, Base):
     __tablename__ = "course_packages"
+    __table_args__ = (UniqueConstraint("organization_id", "legacy_course_id", name="ux_course_packages_org_legacy"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     created_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
     author_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
-    legacy_course_id: Mapped[int | None] = mapped_column(Integer, nullable=True, unique=True)
+    legacy_course_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     title: Mapped[str] = mapped_column(String(160), nullable=False)
     description: Mapped[str] = mapped_column(Text, default="")
     package_version: Mapped[str] = mapped_column(String(40), default="1.0.0")
@@ -84,7 +99,7 @@ class CoursePackage(Base):
     teacher_assignments = relationship("CoursePackageTeacher", back_populates="package", cascade="all, delete-orphan")
 
 
-class CoursePackageTeacher(Base):
+class CoursePackageTeacher(TenantScopedMixin, Base):
     __tablename__ = "course_package_teachers"
 
     package_id: Mapped[int] = mapped_column(ForeignKey("course_packages.id"), primary_key=True)
@@ -96,12 +111,13 @@ class CoursePackageTeacher(Base):
     teacher = relationship("User", foreign_keys=[teacher_id])
 
 
-class CurriculumCourse(Base):
+class CurriculumCourse(TenantScopedMixin, Base):
     __tablename__ = "curriculum_courses"
+    __table_args__ = (UniqueConstraint("organization_id", "legacy_lesson_id", name="ux_curriculum_courses_org_legacy"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     package_id: Mapped[int] = mapped_column(ForeignKey("course_packages.id"), nullable=False, index=True)
-    legacy_lesson_id: Mapped[int | None] = mapped_column(Integer, nullable=True, unique=True)
+    legacy_lesson_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     title: Mapped[str] = mapped_column(String(160), nullable=False)
     description: Mapped[str] = mapped_column(Text, default="")
     order_index: Mapped[int] = mapped_column(Integer, default=0)
@@ -116,7 +132,7 @@ class CurriculumCourse(Base):
     schedules = relationship("CourseSchedule", back_populates="course")
 
 
-class CourseMaterial(Base):
+class CourseMaterial(TenantScopedMixin, Base):
     __tablename__ = "course_materials"
     __table_args__ = (UniqueConstraint("course_id", "kind", name="ux_course_material_kind"),)
 
@@ -137,7 +153,7 @@ class CourseMaterial(Base):
     course = relationship("CurriculumCourse", back_populates="materials")
 
 
-class CourseSchedule(Base):
+class CourseSchedule(TenantScopedMixin, Base):
     __tablename__ = "course_schedules"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -161,7 +177,7 @@ class CourseSchedule(Base):
     task = relationship("Task", back_populates="course_schedule", uselist=False)
 
 
-class Course(Base):
+class Course(TenantScopedMixin, Base):
     __tablename__ = "courses"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -183,7 +199,7 @@ class Course(Base):
     classroom = relationship("Classroom")
 
 
-class Lesson(Base):
+class Lesson(TenantScopedMixin, Base):
     __tablename__ = "lessons"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -196,7 +212,7 @@ class Lesson(Base):
     course = relationship("Course")
 
 
-class Task(Base):
+class Task(TenantScopedMixin, Base):
     __tablename__ = "tasks"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -219,7 +235,7 @@ class Task(Base):
     target_student = relationship("User", foreign_keys=[target_student_id])
 
 
-class Project(Base):
+class Project(TenantScopedMixin, Base):
     __tablename__ = "projects"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -243,7 +259,7 @@ class Project(Base):
     classroom = relationship("Classroom")
 
 
-class TaskSubmission(Base):
+class TaskSubmission(TenantScopedMixin, Base):
     __tablename__ = "task_submissions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -268,7 +284,7 @@ class TaskSubmission(Base):
     classroom = relationship("Classroom")
 
 
-class SubmissionVersion(Base):
+class SubmissionVersion(TenantScopedMixin, Base):
     __tablename__ = "submission_versions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -284,7 +300,7 @@ class SubmissionVersion(Base):
     project = relationship("Project")
 
 
-class FeedbackTemplate(Base):
+class FeedbackTemplate(TenantScopedMixin, Base):
     __tablename__ = "feedback_templates"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -294,7 +310,7 @@ class FeedbackTemplate(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
 
-class Asset(Base):
+class Asset(TenantScopedMixin, Base):
     __tablename__ = "assets"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -316,7 +332,7 @@ class Asset(Base):
     lesson = relationship("Lesson")
 
 
-class Workflow(Base):
+class Workflow(TenantScopedMixin, Base):
     __tablename__ = "workflows"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -334,7 +350,7 @@ class Workflow(Base):
     classroom = relationship("Classroom")
 
 
-class WorkflowRun(Base):
+class WorkflowRun(TenantScopedMixin, Base):
     __tablename__ = "workflow_runs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -352,7 +368,7 @@ class WorkflowRun(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
 
 
-class VideoTask(Base):
+class VideoTask(TenantScopedMixin, Base):
     __tablename__ = "video_tasks"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -383,7 +399,7 @@ class VideoTask(Base):
     classroom = relationship("Classroom")
 
 
-class AIProvider(Base):
+class AIProvider(TenantScopedMixin, Base):
     __tablename__ = "ai_providers"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -402,15 +418,17 @@ class AIProvider(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
 
 
-class AIProviderRoute(Base):
+class AIProviderRoute(TenantScopedMixin, Base):
     __tablename__ = "ai_provider_routes"
+    __table_args__ = (UniqueConstraint("organization_id", "capability", name="ux_ai_routes_org_capability"),)
 
-    capability: Mapped[str] = mapped_column(String(20), primary_key=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    capability: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
     provider_ids_json: Mapped[str] = mapped_column(Text, default="[]")
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
 
 
-class UsageLog(Base):
+class UsageLog(TenantScopedMixin, Base):
     __tablename__ = "usage_logs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -426,7 +444,7 @@ class UsageLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
 
-class ProviderAcceptanceRun(Base):
+class ProviderAcceptanceRun(TenantScopedMixin, Base):
     __tablename__ = "provider_acceptance_runs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -444,7 +462,7 @@ class ProviderAcceptanceRun(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
 
-class ModerationLog(Base):
+class ModerationLog(TenantScopedMixin, Base):
     __tablename__ = "moderation_logs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -464,19 +482,35 @@ class ModerationLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
 
-class AppSetting(Base):
+class AppSetting(TenantScopedMixin, Base):
     __tablename__ = "app_settings"
+    __table_args__ = (UniqueConstraint("organization_id", "key", name="ux_app_settings_org_key"),)
 
-    key: Mapped[str] = mapped_column(String(120), primary_key=True)
+    # Keep the default organization's legacy `Session.get(AppSetting, key)`
+    # contract while allowing the same setting key in additional organizations.
+    id: Mapped[str] = mapped_column(
+        String(220),
+        primary_key=True,
+        default=lambda context: (
+            str(context.get_current_parameters().get("key") or "")
+            if int(context.get_current_parameters().get("organization_id") or current_organization_id()) == 1
+            else (
+                f"{int(context.get_current_parameters().get('organization_id') or current_organization_id())}:"
+                f"{str(context.get_current_parameters().get('key') or '')}"
+            )
+        ),
+    )
+    key: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
     value: Mapped[str] = mapped_column(Text, default="")
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
 
 
-class PrivacyPolicy(Base):
+class PrivacyPolicy(TenantScopedMixin, Base):
     __tablename__ = "privacy_policies"
+    __table_args__ = (UniqueConstraint("organization_id", "version", name="ux_privacy_policies_org_version"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    version: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    version: Mapped[str] = mapped_column(String(40), index=True)
     title: Mapped[str] = mapped_column(String(160), nullable=False)
     content_markdown: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(20), default="published", index=True)
@@ -489,7 +523,7 @@ class PrivacyPolicy(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
 
 
-class GuardianConsent(Base):
+class GuardianConsent(TenantScopedMixin, Base):
     __tablename__ = "guardian_consents"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -511,7 +545,7 @@ class GuardianConsent(Base):
     policy = relationship("PrivacyPolicy")
 
 
-class TeacherAuditLog(Base):
+class TeacherAuditLog(TenantScopedMixin, Base):
     __tablename__ = "teacher_audit_logs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -527,7 +561,7 @@ class TeacherAuditLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now, index=True)
 
 
-class AuthLoginAttempt(Base):
+class AuthLoginAttempt(TenantScopedMixin, Base):
     __tablename__ = "auth_login_attempts"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -539,7 +573,7 @@ class AuthLoginAttempt(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
 
 
-class TeacherSession(Base):
+class TeacherSession(TenantScopedMixin, Base):
     __tablename__ = "teacher_sessions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -555,7 +589,7 @@ class TeacherSession(Base):
     user = relationship("User")
 
 
-class StudentSession(Base):
+class StudentSession(TenantScopedMixin, Base):
     __tablename__ = "student_sessions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -567,3 +601,45 @@ class StudentSession(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     user = relationship("User")
+
+
+class RetentionException(TenantScopedMixin, Base):
+    __tablename__ = "retention_exceptions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    target_type: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    target_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    reason: Mapped[str] = mapped_column(String(300), nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_by_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+
+class RetentionRequest(TenantScopedMixin, Base):
+    __tablename__ = "retention_requests"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    cutoff_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    preview_json: Mapped[str] = mapped_column(Text, default="{}")
+    preview_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    requested_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    approved_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    executed_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    approval_note: Mapped[str] = mapped_column(String(300), default="")
+    requested_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    executed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    canceled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+Index(
+    "ux_users_org_username_ci",
+    User.organization_id,
+    func.lower(User.username),
+    unique=True,
+    sqlite_where=User.username != "",
+    postgresql_where=User.username != "",
+)

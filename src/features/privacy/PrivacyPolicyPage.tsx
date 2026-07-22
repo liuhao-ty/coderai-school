@@ -5,7 +5,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import type { PrivacyPolicy, StudentPrivacyState } from "../../domain-types";
-import { api, STUDENT_TOKEN_KEY } from "../../lib/api";
+import { api, getAuthValue, STUDENT_TOKEN_KEY } from "../../lib/api";
 import { explainError } from "../../lib/errors";
 
 
@@ -24,7 +24,7 @@ export function PrivacyPolicyPage({ onBack }: { onBack: () => void }) {
       try {
         const policyResponse = await api.get("/api/privacy/policy");
         setPolicy(policyResponse.data.policy as PrivacyPolicy);
-        if (localStorage.getItem(STUDENT_TOKEN_KEY)) {
+        if (getAuthValue(STUDENT_TOKEN_KEY)) {
           try {
             const statusResponse = await api.get("/api/privacy/me");
             setStudentPrivacy(statusResponse.data as StudentPrivacyState);

@@ -5,13 +5,16 @@ import App from "./App";
 import { AppErrorBoundary } from "./components/AppErrorBoundary";
 import "./styles.css";
 import "reactflow/dist/style.css";
+import { hydrateSecureAuth } from "./lib/api";
 
-ReactDOM.createRoot(document.getElementById("root")!).render(
-  <React.StrictMode>
-    <AppErrorBoundary>
-      <HashRouter>
-        <App />
-      </HashRouter>
-    </AppErrorBoundary>
-  </React.StrictMode>
-);
+void hydrateSecureAuth().catch(() => undefined).finally(() => {
+  ReactDOM.createRoot(document.getElementById("root")!).render(
+    <React.StrictMode>
+      <AppErrorBoundary>
+        <HashRouter>
+          <App />
+        </HashRouter>
+      </AppErrorBoundary>
+    </React.StrictMode>
+  );
+});

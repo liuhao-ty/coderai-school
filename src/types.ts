@@ -22,6 +22,8 @@ export type StudentProfile = {
 
 export type AccountProfile = {
   id: number;
+  organization_id?: number;
+  organization_code?: string;
   name: string;
   username: string;
   role: "student" | "teacher" | "admin";
@@ -33,6 +35,7 @@ export type AccountProfile = {
 };
 
 export type StudentAuth = {
+  organization?: { id: number; code: string; name: string };
   token: string;
   session_id: number;
   expires_at: string;
@@ -42,6 +45,7 @@ export type StudentAuth = {
 };
 
 export type TeacherAuth = {
+  organization?: { id: number; code: string; name: string };
   token: string;
   refresh_token: string;
   session_id: number;

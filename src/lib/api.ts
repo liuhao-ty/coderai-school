@@ -2,8 +2,15 @@ import axios from "axios";
 
 import type { AccountProfile, StudentAuth, StudentProfile, TeacherAuth } from "../types";
 import { normalizeSchoolStage, schoolStageLabel } from "./schoolStages";
+import {
+  getSecureAuthValue,
+  hydrateSecureAuth,
+  removeSecureAuthValue,
+  setSecureAuthValue,
+} from "./secureAuthStorage";
 
 
+export const ORGANIZATION_CODE = (import.meta.env.VITE_ORGANIZATION_CODE || "coderai-pilot").trim().toLowerCase();
 export const TEACHER_TOKEN_KEY = "coderai_teacher_token";
 export const TEACHER_REFRESH_TOKEN_KEY = "coderai_teacher_refresh_token";
 export const TEACHER_ACCESS_EXPIRES_KEY = "coderai_teacher_access_expires_at";
@@ -14,27 +21,31 @@ export const STUDENT_TOKEN_KEY = "coderai_student_token";
 export const STUDENT_PROFILE_KEY = "coderai_student_profile";
 export const STUDENT_PASSWORD_CHANGE_REQUIRED_KEY = "coderai_student_password_change_required";
 
-export const api = axios.create({ baseURL: import.meta.env.VITE_API_URL || "" });
+export const api = axios.create({
+  baseURL: import.meta.env.VITE_API_URL || "",
+  headers: { "X-CoderAI-Organization-Code": ORGANIZATION_CODE },
+});
 
-api.interceptors.request.use((config) => {
-  const teacherToken = localStorage.getItem(TEACHER_TOKEN_KEY);
-  const studentToken = localStorage.getItem(STUDENT_TOKEN_KEY);
+api.interceptors.request.use(async (config) => {
+  await hydrateSecureAuth();
+  const teacherToken = getSecureAuthValue(TEACHER_TOKEN_KEY);
+  const studentToken = getSecureAuthValue(STUDENT_TOKEN_KEY);
   if (teacherToken) config.headers.set("X-CoderAI-Teacher-Token", teacherToken);
   if (studentToken) config.headers.set("X-CoderAI-Student-Token", studentToken);
   return config;
 });
 
 export function storeTeacherAuth(auth: TeacherAuth) {
-  localStorage.setItem(TEACHER_TOKEN_KEY, auth.token);
-  localStorage.setItem(TEACHER_REFRESH_TOKEN_KEY, auth.refresh_token);
+  setSecureAuthValue(TEACHER_TOKEN_KEY, auth.token);
+  setSecureAuthValue(TEACHER_REFRESH_TOKEN_KEY, auth.refresh_token);
   localStorage.setItem(TEACHER_ACCESS_EXPIRES_KEY, auth.access_expires_at);
   localStorage.setItem(TEACHER_PASSWORD_CHANGE_REQUIRED_KEY, auth.password_change_required ? "true" : "false");
   if (auth.user) localStorage.setItem(TEACHER_PROFILE_KEY, JSON.stringify(auth.user));
 }
 
 export function clearTeacherAuth() {
-  localStorage.removeItem(TEACHER_TOKEN_KEY);
-  localStorage.removeItem(TEACHER_REFRESH_TOKEN_KEY);
+  removeSecureAuthValue(TEACHER_TOKEN_KEY);
+  removeSecureAuthValue(TEACHER_REFRESH_TOKEN_KEY);
   localStorage.removeItem(TEACHER_ACCESS_EXPIRES_KEY);
   localStorage.removeItem(TEACHER_PASSWORD_CHANGE_REQUIRED_KEY);
   localStorage.removeItem(TEACHER_PROFILE_KEY);
@@ -42,7 +53,7 @@ export function clearTeacherAuth() {
 }
 
 export function storeStudentAuth(auth: StudentAuth) {
-  localStorage.setItem(STUDENT_TOKEN_KEY, auth.token);
+  setSecureAuthValue(STUDENT_TOKEN_KEY, auth.token);
   localStorage.setItem(STUDENT_PROFILE_KEY, JSON.stringify(auth.student));
   localStorage.setItem(STUDENT_PASSWORD_CHANGE_REQUIRED_KEY, auth.password_change_required ? "true" : "false");
 }
@@ -68,7 +79,7 @@ export function loadStudentProfile(): StudentProfile | null {
 }
 
 export function clearStudentAuth() {
-  localStorage.removeItem(STUDENT_TOKEN_KEY);
+  removeSecureAuthValue(STUDENT_TOKEN_KEY);
   localStorage.removeItem(STUDENT_PROFILE_KEY);
   localStorage.removeItem(STUDENT_PASSWORD_CHANGE_REQUIRED_KEY);
 }
@@ -81,3 +92,14 @@ export function loadTeacherProfile(): AccountProfile | null {
     return null;
   }
 }
+
+
+export function getAuthValue(key: string) {
+  if (key === TEACHER_TOKEN_KEY || key === TEACHER_REFRESH_TOKEN_KEY || key === STUDENT_TOKEN_KEY) {
+    return getSecureAuthValue(key);
+  }
+  return localStorage.getItem(key);
+}
+
+
+export { hydrateSecureAuth };

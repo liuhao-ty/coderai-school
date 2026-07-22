@@ -1,7 +1,7 @@
 import { Alert, App as AntApp, Button, Card, Input, Popconfirm, Select, Space, Tabs, Tag, Typography } from "antd";
 import dayjs from "dayjs";
 import { FileDown, FileUp, Save } from "lucide-react";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { IconTitle } from "../../components/IconTitle";
 import { api } from "../../lib/api";
@@ -31,7 +31,14 @@ export function SystemBackupPanel({ onRefresh }: { onRefresh: () => Promise<void
   const [packageFile, setPackageFile] = useState<File | null>(null);
   const [packagePreview, setPackagePreview] = useState<BackupPackagePreview | null>(null);
   const [conflictStrategy, setConflictStrategy] = useState<"replace" | "keep_existing">("replace");
+  const [cloudMode, setCloudMode] = useState<boolean | null>(null);
   const packageInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    api.get("/api/version")
+      .then((res) => setCloudMode(res.data.deployment_mode === "cloud"))
+      .catch(() => setCloudMode(false));
+  }, []);
 
   const downloadPackage = async () => {
     setLoading("download");
@@ -40,10 +47,10 @@ export function SystemBackupPanel({ onRefresh }: { onRefresh: () => Promise<void
       const url = URL.createObjectURL(res.data);
       const anchor = document.createElement("a");
       anchor.href = url;
-      anchor.download = `coderai-backup-${dayjs().format("YYYYMMDD-HHmmss")}.zip`;
+      anchor.download = `${cloudMode ? "coderai-organization-export" : "coderai-backup"}-${dayjs().format("YYYYMMDD-HHmmss")}.zip`;
       anchor.click();
       URL.revokeObjectURL(url);
-      message.success("完整压缩备份已生成并下载");
+      message.success(cloudMode ? "本机构数据导出已生成并下载" : "完整压缩备份已生成并下载");
     } catch (error) {
       message.error(explainError(error));
     } finally {
@@ -118,6 +125,28 @@ export function SystemBackupPanel({ onRefresh }: { onRefresh: () => Promise<void
       setLoading("");
     }
   };
+
+  if (cloudMode === null) {
+    return <Card title={<IconTitle icon={<Save size={18} />} text="机构数据导出" />} loading />;
+  }
+
+  if (cloudMode) {
+    return (
+      <Card title={<IconTitle icon={<Save size={18} />} text="机构数据导出" />}>
+        <Space direction="vertical" size={12} className="fullWidth">
+          <Alert
+            type="info"
+            showIcon
+            message="机构管理员只能导出本机构数据"
+            description="导出包包含本机构业务记录和对象文件，并移除密码、会话、AI 密钥与监护人联系方式。云端数据库和对象存储的恢复由平台运维按恢复流程执行，机构管理员不能覆盖整个平台数据。"
+          />
+          <Button icon={<FileDown size={15} />} type="primary" loading={loading === "download"} onClick={() => void downloadPackage()}>
+            导出本机构数据
+          </Button>
+        </Space>
+      </Card>
+    );
+  }
 
   return (
     <Card title={<IconTitle icon={<Save size={18} />} text="数据备份" />}>
@@ -223,4 +252,3 @@ export function SystemBackupPanel({ onRefresh }: { onRefresh: () => Promise<void
     </Card>
   );
 }
-

@@ -12,6 +12,7 @@ const { Text } = Typography;
 
 const licensePlanLabels: Record<string, string> = {
   community: "社区版",
+  cloud_pilot: "云端内测版",
   school: "学校版",
   enterprise: "机构版",
   commercial: "商业版"
@@ -19,6 +20,9 @@ const licensePlanLabels: Record<string, string> = {
 
 const licenseStatusLabels: Record<string, string> = {
   community: "社区授权",
+  cloud_pilot: "云端内测授权",
+  organization_missing: "机构不存在",
+  organization_disabled: "机构已停用",
   active: "授权有效",
   expired: "已到期",
   not_yet_valid: "尚未生效",
@@ -55,6 +59,7 @@ export function ExtensionLicensePanel() {
   const [licenseForm] = Form.useForm<{ license_key: string }>();
   const [license, setLicense] = useState<LicenseStatus | null>(null);
   const [loading, setLoading] = useState(false);
+  const cloudManaged = license?.plan === "cloud_pilot";
 
   const loadExtensions = async () => {
     setLoading(true);
@@ -111,7 +116,15 @@ export function ExtensionLicensePanel() {
           <Col xs={24} xl={13}>
             <Space direction="vertical" size={12} className="fullWidth">
               <Alert
-                type={license?.usable ? (license.status === "community" ? "info" : "success") : license?.valid ? "warning" : "error"}
+                type={
+                  license?.usable
+                    ? cloudManaged || license.status === "community"
+                      ? "info"
+                      : "success"
+                    : license?.valid
+                      ? "warning"
+                      : "error"
+                }
                 showIcon
                 message={license ? license.message : "正在读取授权状态"}
                 description={
@@ -119,7 +132,7 @@ export function ExtensionLicensePanel() {
                     <Space direction="vertical" size={8}>
                       <Space wrap>
                         <Tag color={license.signature_verified ? "green" : "default"}>
-                          {license.signature_verified ? "Ed25519 签名已验证" : "内置社区模式"}
+                          {license.signature_verified ? "Ed25519 签名已验证" : cloudManaged ? "平台托管授权" : "内置社区模式"}
                         </Tag>
                         <Tag color={license.usable ? "blue" : "red"}>
                           {licenseStatusLabels[license.status] || license.status}
@@ -138,10 +151,12 @@ export function ExtensionLicensePanel() {
                         {license.issued_at && <Descriptions.Item label="签发日期">{license.issued_at}</Descriptions.Item>}
                         {license.expires_at && <Descriptions.Item label="到期日期">{license.expires_at}</Descriptions.Item>}
                       </Descriptions>
-                      <div className="licenseDeviceCode">
-                        <Text strong>当前设备安装码：</Text>
-                        <Text code copyable={{ text: license.device_id }}>{license.device_id}</Text>
-                      </div>
+                      {license.device_id && (
+                        <div className="licenseDeviceCode">
+                          <Text strong>当前设备安装码：</Text>
+                          <Text code copyable={{ text: license.device_id }}>{license.device_id}</Text>
+                        </div>
+                      )}
                       <Space wrap>
                         {license.features.map((feature) => (
                           <Tag key={feature} color="blue">
@@ -154,41 +169,52 @@ export function ExtensionLicensePanel() {
                 }
               />
               <Text type="secondary">
-                机构签发许可证时需要当前设备安装码。续期或解绑设备时重新签发并导入新许可证，私钥只保留在机构授权环境中。
+                {cloudManaged
+                  ? "云端内测授权按机构统一管理，不绑定当前 Windows 设备。"
+                  : "机构签发许可证时需要当前设备安装码。续期或解绑设备时重新签发并导入新许可证，私钥只保留在机构授权环境中。"}
               </Text>
             </Space>
           </Col>
           <Col xs={24} xl={11}>
-            <Form
-              form={licenseForm}
-              layout="vertical"
-              onFinish={saveLicense}
-              initialValues={{ license_key: "" }}
-            >
-              <Form.Item
-                name="license_key"
-                label="签名许可证"
-                extra={<span className="licenseFormHelp">许可证以 CODERAI-LIC1 开头，机构、席位、设备和有效期均由数字签名保护。</span>}
+            {cloudManaged ? (
+              <Alert
+                type="info"
+                showIcon
+                message="云端授权由平台管理"
+                description="席位、有效期和扩展权限由平台运维配置，本页面不接受设备绑定许可证。"
+              />
+            ) : (
+              <Form
+                form={licenseForm}
+                layout="vertical"
+                onFinish={saveLicense}
+                initialValues={{ license_key: "" }}
               >
-                <Input.TextArea rows={7} placeholder="CODERAI-LIC1.载荷.签名" spellCheck={false} />
-              </Form.Item>
-              <Space wrap>
-                <Button type="primary" htmlType="submit" loading={loading}>
-                  导入并验证
-                </Button>
-                {license?.plan !== "community" && (
-                  <Popconfirm
-                    title="切换为社区授权？"
-                    description="已保存的商业许可证会从本机移除，社区版最多允许 30 个在读学生账号。"
-                    okText="确认切换"
-                    cancelText="取消"
-                    onConfirm={useCommunityLicense}
-                  >
-                    <Button danger loading={loading}>清除许可证</Button>
-                  </Popconfirm>
-                )}
-              </Space>
-            </Form>
+                <Form.Item
+                  name="license_key"
+                  label="签名许可证"
+                  extra={<span className="licenseFormHelp">许可证以 CODERAI-LIC1 开头，机构、席位、设备和有效期均由数字签名保护。</span>}
+                >
+                  <Input.TextArea rows={7} placeholder="CODERAI-LIC1.载荷.签名" spellCheck={false} />
+                </Form.Item>
+                <Space wrap>
+                  <Button type="primary" htmlType="submit" loading={loading}>
+                    导入并验证
+                  </Button>
+                  {license?.plan !== "community" && (
+                    <Popconfirm
+                      title="切换为社区授权？"
+                      description="已保存的商业许可证会从本机移除，社区版最多允许 30 个在读学生账号。"
+                      okText="确认切换"
+                      cancelText="取消"
+                      onConfirm={useCommunityLicense}
+                    >
+                      <Button danger loading={loading}>清除许可证</Button>
+                    </Popconfirm>
+                  )}
+                </Space>
+              </Form>
+            )}
           </Col>
         </Row>
       </Card>
