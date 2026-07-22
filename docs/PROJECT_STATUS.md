@@ -8,9 +8,21 @@
 
 云端内测所需的主体代码已经完成：机构租户、PostgreSQL/Alembic、S3 对象存储、Redis/Celery、服务器密钥保护、Tauri 桌面工程、CI、监控、备份、迁移、隐私保留和灰度更新均已落入仓库。
 
-项目当前仍是“代码与本机验证阶段”，不是“已经上线”。部署入口已切换为固定公网 IPv4 + Let's Encrypt 短期 IP 证书，不再依赖域名；封闭内测可显式禁用独立备份并保留持续告警，但在配置异机备份前不具备生产级灾备能力。正式发布仍依赖 Windows 代码签名证书、机构真实 AI 密钥和合规确认。
+阿里云单机构技术内测环境已经部署并可由 Windows 客户端访问，但这不等于完成 50 人上线验收。当前主机低于计划规格，且独立备份、Windows 代码签名、机构真实 AI 密钥、50 人压测和合规确认尚未完成；在这些问题解决前不得将该环境描述为生产安全环境。
 
 正式 `workspace_data` 和 SQLite 未执行云迁移，继续保持原样。迁移前备份位于 `E:\CoderAI学堂-backups\pre-cloud-20260720-192149`，云改造前 Git 基线为 `1a3848a`。
+
+## 当前试点部署
+
+- 公网入口：`https://39.108.109.94`，机构代码 `coderai-pilot`，机构名称 `CoderAI`
+- 数据方式：全新初始化；PostgreSQL、Redis、MinIO、FastAPI、Celery、Caddy 和监控容器均已运行
+- 服务端发布：`0.2.0-beta.1`，发布提交 `d7b64132e3d859723dffbafbe32156fb29b2fa0f`
+- HTTPS：Let's Encrypt IP SAN 证书已签发，12 小时续期定时器启用；Windows 无 SNI TLS、健康检查和管理员登录已验证
+- 桌面端：正式 API、机构代码和更新地址已注入；NSIS 安装、启动、单实例、版本检查及更新清单读取已验证
+- 更新服务：安装包、`.sig` 和 `latest.json` 已由 `/desktop-updates/` 提供，公开安装包 SHA-256 为 `e55f16f10cce14d3911b6e540fd1eb62a5638ed0f29bfdf9c815c3b244aa943c`
+- 资源限制：当前 ECS 为 2 核、约 1.6 GB 内存、40 GB 系统盘和 4 GB Swap，不满足 4 核、8 GB、100 GB 的 50 人目标规格
+- 灾备限制：`CODERAI_BACKUP_ENABLED=false`，暂无独立 OSS/S3 备份；监控持续上报 `coderai_backup_enabled 0`
+- 发布限制：安装包没有 Authenticode 签名，仅限知情的内部技术测试
 
 ## 已完成
 
@@ -39,7 +51,7 @@
 - Docker Compose：Caddy、FastAPI、Worker、Beat、PostgreSQL、Redis、MinIO
 - Prometheus、PostgreSQL/Redis/Node exporter 和告警规则
 - 可选 HTTPS Webhook 告警，未配置时不发送到失效占位地址
-- PostgreSQL 与对象文件独立备份、30 个日备份、12 个月备份
+- PostgreSQL 与对象文件独立备份能力、30 个日备份、12 个月备份策略（当前试点尚未配置独立备份目标）
 - 隔离数据库恢复演练和逐文件 SHA-256 校验
 - `/api/health/live`、`/api/health/ready`、`/api/version` 和内部 `/metrics`
 - JSON 结构化日志、请求错误率、队列、磁盘、数据库、AI 和备份监控指标
@@ -91,16 +103,18 @@
 
 ## 验证状态
 
-2026-07-22 本机最终回归结果：
+2026-07-22 本机及阿里云试点回归结果：
 
-- Ruff 通过；80 项后端测试完成，其中 79 项通过，1 项云容器集成测试因本机没有 Docker/WSL 跳过
+- Ruff 通过；85 项后端测试完成，其中 84 项通过，1 项云容器集成测试因本机没有 Docker/WSL 跳过
 - 前端生产构建通过；Playwright 19 项桌面 E2E 全部通过
 - Rust 格式检查、Clippy `-D warnings` 和 1 项 Tauri 单元测试通过
 - `pip-audit` 未发现已知漏洞，`npm audit --audit-level=high` 为 0 个漏洞
 - LibreOffice 真实 PPTX 转 PDF、教师 PDF 预览和原件下载阻断测试通过
-- 未签名 Windows 可执行文件和 NSIS 安装包构建成功；静默安装、启动 8 秒及卸载清理闭环通过
+- 未签名 Windows 可执行文件和 NSIS 安装包构建成功；静默安装、启动、单实例和真实云端版本/更新检查通过
+- PostgreSQL、Redis、MinIO 和 Celery 真实服务就绪检查通过，所有运行容器重启次数为 0
+- 公网 HTTPS、无 SNI Windows Schannel、管理员真实登录、更新文件签名匹配及公开下载哈希通过
 
-本机未执行正式签名、SmartScreen、真实自动更新、50 账号压测和机构真实 AI 调用。云容器集成测试由远端 CI 或后续 Linux 测试环境执行。
+尚未执行 Authenticode、SmartScreen、跨版本自动安装与回滚、50 账号压测、机构真实 AI 调用和独立备份恢复演练。本机单元测试中的云容器集成项仍由 CI 执行，阿里云试点已完成运行依赖的真实就绪检查。
 
 本机可执行的门禁：
 
@@ -121,12 +135,13 @@ npm.cmd audit --audit-level=high
 ## 上线前外部阻塞
 
 - [ ] 创建私有 Git 远端并保护 `main`、`release/**` 和正式标签
-- [ ] 准备境内 Linux x64 主机、100 GB 独立数据盘和安全组
-- [ ] 提供固定公网 IPv4、运维邮箱，并确认 80/443 安全组
-- [ ] 在真实 ECS 验证 Let's Encrypt IP 证书首次签发、12 小时续期和 Caddy 重载
+- [x] 已准备境内 Linux x64 主机和安全组；当前仅 2 核、约 1.6 GB、40 GB，仍需扩容到目标规格
+- [x] 已提供固定公网 IPv4、运维邮箱，并确认 80/443 安全组
+- [x] 已在真实 ECS 验证 Let's Encrypt IP 证书首次签发、12 小时续期和 Caddy 重载
 - [ ] 准备与生产数据盘独立的对象备份存储
 - [ ] 采购 Windows Authenticode 代码签名证书
-- [ ] 配置公网 IP 下的签名更新产物存储
+- [x] 已配置公网 IP 下的 Tauri 签名更新产物存储
+- [ ] 配置 Alertmanager 邮件或 Webhook 告警接收端
 - [ ] 提供机构真实 AI 服务商密钥并确认数据流向
 - [ ] 完成监护人授权文本、隐私政策、AI 标识和备案责任确认
 - [ ] 提供 50 个隔离压测账号与可写测试课程/提交数据
