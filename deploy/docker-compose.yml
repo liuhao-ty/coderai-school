@@ -96,6 +96,8 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
+      args:
+        CODERAI_APT_MIRROR: ${CODERAI_APT_MIRROR:-}
     image: coderai-api:0.2.0-beta.1
     restart: "no"
     command: ["migrate"]

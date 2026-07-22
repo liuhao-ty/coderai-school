@@ -23,6 +23,13 @@ class PublicIpDeploymentConfigTests(unittest.TestCase):
         self.assertNotIn('"5432:5432"', compose)
         self.assertNotIn('"6379:6379"', compose)
 
+    def test_api_build_supports_an_optional_debian_mirror(self):
+        dockerfile = (ROOT / "deploy" / "Dockerfile").read_text(encoding="utf-8")
+        compose = (ROOT / "deploy" / "docker-compose.yml").read_text(encoding="utf-8")
+        self.assertIn("ARG CODERAI_APT_MIRROR=", dockerfile)
+        self.assertIn("$CODERAI_APT_MIRROR", dockerfile)
+        self.assertIn("CODERAI_APT_MIRROR: ${CODERAI_APT_MIRROR:-}", compose)
+
     def test_ip_certificate_scripts_use_shortlived_profile_and_webroot_renewal(self):
         bootstrap = (ROOT / "deploy" / "bootstrap-ip-certificate.sh").read_text(encoding="utf-8")
         renewal = (ROOT / "deploy" / "renew-ip-certificate.sh").read_text(encoding="utf-8")

@@ -55,6 +55,7 @@ python -m backend.app.cli generate-secret-key
 - `CODERAI_CORS_ORIGINS` 不含 `*`
 - `CODERAI_ALERT_WEBHOOK_URL` 使用 HTTPS；留空时不会向外发送告警
 - `CODERAI_BUILD_COMMIT` 填写发布提交 SHA
+- `CODERAI_APT_MIRROR` 仅用于服务器构建时替换 Debian 镜像主机；网络正常时留空，阿里云境内构建可设为 `https://mirrors.aliyun.com`
 
 检查 Compose 展开结果，确认没有空变量或占位值：
 

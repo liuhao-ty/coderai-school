@@ -1,11 +1,19 @@
 FROM python:3.12.10-slim-bookworm
 
+ARG CODERAI_APT_MIRROR=
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     CODERAI_LIBREOFFICE_PATH=/usr/bin/libreoffice
 
-RUN apt-get update \
+RUN if [ -n "$CODERAI_APT_MIRROR" ]; then \
+        sed -i \
+            -e "s|http://deb.debian.org|$CODERAI_APT_MIRROR|g" \
+            -e "s|https://deb.debian.org|$CODERAI_APT_MIRROR|g" \
+            /etc/apt/sources.list.d/debian.sources; \
+    fi \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
