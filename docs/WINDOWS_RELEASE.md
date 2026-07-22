@@ -19,7 +19,7 @@
 - WebView2 构建依赖
 - 有效的 Windows Authenticode PFX 及时间戳服务
 - Tauri updater 私钥和密码
-- HTTPS API、更新查询地址和更新文件地址
+- 固定公网 IPv4 的可信 HTTPS API、更新查询地址和更新文件地址
 - 私有 Git 远端、受保护发布分支和已审核标签
 
 当前仓库已包含 Tauri 更新公钥。加密私钥材料保存在仓库外：
@@ -86,6 +86,7 @@ Secrets：
 要求：
 
 - API、Updater 和 Asset Base URL 全部使用 HTTPS
+- 无域名部署时分别使用 `https://<公网IP>`、`https://<公网IP>/desktop-updates/latest.json` 和 `https://<公网IP>/desktop-updates`
 - PFX 只授权给受保护的 `pilot-production` 环境
 - Environment 启用人工审批
 - 发布日志不得输出证书、私钥和密码
@@ -136,7 +137,7 @@ Get-AuthenticodeSignature .\CoderAI*.exe | Format-List Status,StatusMessage,Sign
 - 卸载后 Credential Manager 不残留三类 CoderAI 令牌
 - SmartScreen 和常用杀毒软件检查
 
-正式验收必须使用真实域名和签名安装包，不能用浏览器或 `example.invalid` 产物代替。
+正式验收必须使用真实公网 IP 的受信任 HTTPS 和签名安装包，不能用浏览器或 `example.invalid` 产物代替。
 
 ## 灰度更新
 
@@ -164,8 +165,8 @@ Tauri 更新不应通过降低版本号回滚。若 `0.2.0-beta.1` 客户端有�
 ## 当前阻塞
 
 - 尚无真实 Authenticode PFX
-- 尚无正式 API 和更新域名
-- 尚无更新文件 HTTPS 托管位置
+- 尚未在真实公网 IP 上完成短期 IP 证书签发和续期验证
+- 尚未上传真实签名更新文件到 `/desktop-updates/`
 - 尚无私有 Git 远端及 Environment Secrets
 
 因此当前只能验证未签名本地构建和 GitHub 工作流定义，不能宣称已完成正式签名、SmartScreen 或真实自动更新验收。

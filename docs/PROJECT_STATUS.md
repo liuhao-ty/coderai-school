@@ -8,7 +8,7 @@
 
 云端内测所需的主体代码已经完成：机构租户、PostgreSQL/Alembic、S3 对象存储、Redis/Celery、服务器密钥保护、Tauri 桌面工程、CI、监控、备份、迁移、隐私保留和灰度更新均已落入仓库。
 
-项目当前仍是“代码与本机验证阶段”，不是“已经上线”。正式发布依赖云主机、域名备案与 HTTPS、私有 Git 远端、独立备份位置、Windows 代码签名证书、机构真实 AI 密钥和合规确认；这些外部资源目前尚未提供。
+项目当前仍是“代码与本机验证阶段”，不是“已经上线”。部署入口已切换为固定公网 IPv4 + Let's Encrypt 短期 IP 证书，不再依赖域名；正式发布仍依赖服务器连接信息、独立备份位置、Windows 代码签名证书、机构真实 AI 密钥和合规确认。
 
 正式 `workspace_data` 和 SQLite 未执行云迁移，继续保持原样。迁移前备份位于 `E:\CoderAI学堂-backups\pre-cloud-20260720-192149`，云改造前 Git 基线为 `1a3848a`。
 
@@ -43,6 +43,8 @@
 - 隔离数据库恢复演练和逐文件 SHA-256 校验
 - `/api/health/live`、`/api/health/ready`、`/api/version` 和内部 `/metrics`
 - JSON 结构化日志、请求错误率、队列、磁盘、数据库、AI 和备份监控指标
+- 固定公网 IPv4 HTTPS、Certbot 5.4 IP 证书、12 小时续期及 48 小时到期告警
+- 同一 HTTPS IP 下的 `/desktop-updates/` 签名更新文件托管
 
 ### 数据迁移与治理
 
@@ -91,7 +93,7 @@
 
 2026-07-22 本机最终回归结果：
 
-- Ruff 通过；76 项后端测试完成，其中 75 项通过，1 项云容器集成测试因本机没有 Docker/WSL 跳过
+- Ruff 通过；80 项后端测试完成，其中 79 项通过，1 项云容器集成测试因本机没有 Docker/WSL 跳过
 - 前端生产构建通过；Playwright 19 项桌面 E2E 全部通过
 - Rust 格式检查、Clippy `-D warnings` 和 1 项 Tauri 单元测试通过
 - `pip-audit` 未发现已知漏洞，`npm audit --audit-level=high` 为 0 个漏洞
@@ -120,10 +122,11 @@ npm.cmd audit --audit-level=high
 
 - [ ] 创建私有 Git 远端并保护 `main`、`release/**` 和正式标签
 - [ ] 准备境内 Linux x64 主机、100 GB 独立数据盘和安全组
-- [ ] 准备正式域名、实名认证、ICP 备案和 HTTPS DNS
+- [ ] 提供固定公网 IPv4、运维邮箱，并确认 80/443 安全组
+- [ ] 在真实 ECS 验证 Let's Encrypt IP 证书首次签发、12 小时续期和 Caddy 重载
 - [ ] 准备与生产数据盘独立的对象备份存储
 - [ ] 采购 Windows Authenticode 代码签名证书
-- [ ] 配置正式更新域名和签名产物存储
+- [ ] 配置公网 IP 下的签名更新产物存储
 - [ ] 提供机构真实 AI 服务商密钥并确认数据流向
 - [ ] 完成监护人授权文本、隐私政策、AI 标识和备案责任确认
 - [ ] 提供 50 个隔离压测账号与可写测试课程/提交数据

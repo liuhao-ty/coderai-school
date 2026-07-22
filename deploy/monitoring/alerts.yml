@@ -31,6 +31,12 @@ groups:
         labels: { severity: critical }
         annotations:
           summary: "CoderAI independent backup is older than 36 hours"
+      - alert: CoderAITlsCertificateRenewalRequired
+        expr: absent(coderai_tls_certificate_valid_beyond_48h) OR coderai_tls_certificate_valid_beyond_48h == 0
+        for: 15m
+        labels: { severity: critical }
+        annotations:
+          summary: "CoderAI public IP certificate expires within 48 hours"
       - alert: CoderAIAiFailureBurst
         expr: sum(delta(coderai_ai_calls_total{status=~"failed|blocked"}[15m])) > 20
         for: 15m

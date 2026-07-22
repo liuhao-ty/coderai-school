@@ -1,0 +1,14 @@
+[Unit]
+Description=Renew the CoderAI public IP TLS certificate
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/srv/coderai/app/deploy/renew-ip-certificate.sh /srv/coderai/config/deploy.env
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

@@ -1,4 +1,4 @@
-# 单机构云端部署手册
+# 单机构公网 IP 云端部署手册
 
 适用版本：`0.2.0-beta.1`
 目标：境内 Linux x64、单机构、最多 50 人同时在线
@@ -7,11 +7,19 @@
 
 - 4 核、8 GB 内存、100 GB 独立数据盘的 Linux 主机
 - Docker Engine 和 Docker Compose v2
-- 已解析到主机的正式域名，80/443 端口可用
+- 固定公网 IPv4（建议绑定 EIP），80/443 端口可用
 - 与生产主机/MinIO 独立的 S3 兼容备份位置
 - 私有 Git 仓库和固定的发布提交
 - 正式机构代码，建议只使用小写字母、数字和连字符
-- 已完成或已确认域名实名认证、ICP备案及其他适用备案责任
+- 可接收证书通知的运维邮箱
+- 已向云厂商或合规顾问确认公网 IP 直连模式下仍适用的网络服务、未成年人和生成式 AI 责任
+
+本方案不使用域名。公网入口使用 Let's Encrypt `shortlived` IP 地址证书，证书有效期约 160 小时，由 systemd 每 12 小时检查和续期。80 端口必须持续可从公网访问，以完成 HTTP-01 验证。
+
+参考：
+
+- <https://letsencrypt.org/2026/01/15/6day-and-ip-general-availability/>
+- <https://letsencrypt.org/2026/03/11/shorter-certs-certbot/>
 
 生产主机建议目录：
 
@@ -27,14 +35,17 @@
 cd /srv/coderai/app
 cp deploy/.env.example /srv/coderai/config/deploy.env
 chmod 600 /srv/coderai/config/deploy.env
+install -d -m 0755 /srv/coderai/acme /srv/coderai/updates
+install -d -o 10001 -g 10001 -m 0750 /srv/coderai/metrics
 python -m backend.app.cli generate-secret-key
 ```
 
-将生成值写入 `CODERAI_SECRET_KEY`，并逐项替换 `deploy.env` 中所有 `replace-*` 和 `example.*` 值。
+将生成值写入 `CODERAI_SECRET_KEY`，并逐项替换 `deploy.env` 中所有 `replace-*`、`example.*` 和示例 IP 值。
 
 必须检查：
 
-- `CODERAI_DOMAIN` 是正式 API 域名，不含协议前缀
+- `CODERAI_PUBLIC_IP` 是 ECS 固定公网 IPv4，不含协议或端口
+- `CODERAI_CERTBOT_EMAIL` 是有效运维邮箱
 - PostgreSQL、MinIO 和备份密码均为独立随机强密码
 - `CODERAI_DATABASE_URL` 中的密码与 `POSTGRES_PASSWORD` 一致并正确 URL 编码
 - `CODERAI_S3_*` 指向生产 MinIO
@@ -48,10 +59,24 @@ python -m backend.app.cli generate-secret-key
 
 ```bash
 docker compose --env-file /srv/coderai/config/deploy.env -f deploy/docker-compose.yml config > /tmp/coderai-compose.yml
-grep -E 'replace-|example\.|<[^>]+>' /tmp/coderai-compose.yml && exit 1 || true
+grep -E 'replace-|example\.|203\.0\.113\.10|<[^>]+>' /tmp/coderai-compose.yml && exit 1 || true
 ```
 
-## 3. 构建基础服务
+## 3. 首次签发公网 IP 证书
+
+证书签发前确保 Caddy 尚未启动且 80 端口没有其他进程监听：
+
+```bash
+cd /srv/coderai/app
+chmod +x deploy/bootstrap-ip-certificate.sh deploy/renew-ip-certificate.sh deploy/install-ip-certificate-timer.sh
+./deploy/bootstrap-ip-certificate.sh /srv/coderai/config/deploy.env
+test -s /etc/letsencrypt/live/coderai-ip/fullchain.pem
+test -s /etc/letsencrypt/live/coderai-ip/privkey.pem
+```
+
+脚本固定使用支持 IP 证书的 Certbot `5.4.0`，请求 `shortlived` profile。签发失败时不要改用 HTTP 或关闭客户端证书验证，应先检查安全组、80 端口和公网 IP 是否一致。
+
+## 4. 构建基础服务
 
 ```bash
 docker compose --env-file /srv/coderai/config/deploy.env -f deploy/docker-compose.yml build migrate
@@ -62,7 +87,7 @@ docker compose --env-file /srv/coderai/config/deploy.env -f deploy/docker-compos
 
 此时只初始化 PostgreSQL、Redis、MinIO 和 Alembic 结构，不启动对外 API。
 
-## 4. 数据初始化
+## 5. 数据初始化
 
 ### 全新机构
 
@@ -86,20 +111,27 @@ unset CODERAI_BOOTSTRAP_PASSWORD
 
 先按 [迁移与回滚手册](CLOUD_MIGRATION.md) 创建可写迁移副本，再运行迁移命令。迁移完成后，在 API 启动前使用 `bootstrap-admin --replace-password` 将旧管理员密码替换为新的强密码。
 
-## 5. 启动
+## 6. 启动
 
 ```bash
 docker compose --env-file /srv/coderai/config/deploy.env -f deploy/docker-compose.yml up -d
 docker compose --env-file /srv/coderai/config/deploy.env -f deploy/docker-compose.yml ps
+./deploy/install-ip-certificate-timer.sh
+systemctl start coderai-cert-renew.service
+systemctl status coderai-cert-renew.timer --no-pager
 ```
 
 检查内部和外部健康状态：
 
 ```bash
+set -a
+. /srv/coderai/config/deploy.env
+set +a
 docker compose --env-file /srv/coderai/config/deploy.env -f deploy/docker-compose.yml exec api \
   curl -fsS http://127.0.0.1:8000/api/health/live
-curl -fsS -H 'X-CoderAI-Organization-Code: coderai-pilot' https://api.example.cn/api/health/ready
-curl -fsS https://api.example.cn/api/version
+curl -fsS -H 'X-CoderAI-Organization-Code: coderai-pilot' "https://$CODERAI_PUBLIC_IP/api/health/ready"
+curl -fsS "https://$CODERAI_PUBLIC_IP/api/version"
+curl -fsS "https://$CODERAI_PUBLIC_IP/desktop-updates/latest.json" || true
 ```
 
 验收要求：
@@ -107,10 +139,12 @@ curl -fsS https://api.example.cn/api/version
 - `live` 返回 `ok`
 - `ready` 返回 HTTP 200 且数据库、队列和对象存储全部 `ready`
 - `version` 为 `0.2.0-beta.1`，`deployment_mode` 为 `cloud`
-- 公网访问 `https://api.example.cn/metrics` 返回 404
-- Caddy 自动取得有效证书且没有循环重定向
+- 公网访问 `https://<公网IP>/metrics` 返回 404
+- TLS 证书 SAN 包含当前公网 IP，系统和 WebView 均能建立受信任连接
+- `coderai-cert-renew.timer` 已启用，且 `coderai_tls_certificate_valid_beyond_48h` 为 `1`
+- `/desktop-updates/` 只提供签名更新文件，不暴露目录外内容
 
-## 6. 首次管理员操作
+## 7. 首次管理员操作
 
 1. 登录管理员账号并确认机构名称。
 2. 在“模型服务”重新录入机构 AI Key；不要尝试导入 DPAPI 密文。
@@ -120,7 +154,7 @@ curl -fsS https://api.example.cn/api/version
 6. 检查课程包教师白名单、班级授权和学生状态。
 7. 导出一次机构数据，确认包中不含密码、会话和 API Key。
 
-## 7. 监控与告警
+## 8. 监控与告警
 
 Prometheus 和 Alertmanager 默认只在 Compose 内部网络，不映射公网端口。通过 SSH 隧道或受控内网查看，不要直接暴露。
 
@@ -131,11 +165,12 @@ Prometheus 和 Alertmanager 默认只在 Compose 内部网络，不映射公网�
 - 领域任务积压
 - 数据盘剩余空间低于 15%
 - 独立备份超过 36 小时未成功
+- 公网 IP 证书剩余有效期不足 48 小时
 - AI 失败/拦截短时突增
 
 如果 `CODERAI_ALERT_WEBHOOK_URL` 为空，Alertmanager 会保留告警但不发送到外部。扩大灰度前必须配置并触发一次测试告警。
 
-## 8. 压测
+## 9. 压测
 
 在测试机构创建 50 个专用账号，实际账号文件保存为 `tools/pilot-load-accounts.json`，不得提交 Git。
 
@@ -143,7 +178,7 @@ Prometheus 和 Alertmanager 默认只在 Compose 内部网络，不映射公网�
 
 ```powershell
 npm.cmd run test:load -- `
-  --base-url https://api.example.cn `
+  --base-url https://203.0.113.10 `
   --accounts tools/pilot-load-accounts.json `
   --concurrency 50 `
   --rounds 3 `
@@ -154,7 +189,7 @@ npm.cmd run test:load -- `
 
 ```powershell
 npm.cmd run test:load -- `
-  --base-url https://api.example.cn `
+  --base-url https://203.0.113.10 `
   --accounts tools/pilot-load-accounts.json `
   --concurrency 50 `
   --write-actions `
@@ -163,7 +198,19 @@ npm.cmd run test:load -- `
 
 门槛：非 AI 请求错误率低于 1%，总体 P95 低于 1000 ms。压测作品和批改必须使用测试课程，并在验收后按审批流程清理。
 
-## 9. 发布顺序
+## 10. 桌面更新文件
+
+生产客户端使用以下地址：
+
+```text
+API URL:          https://<公网IP>
+Updater endpoint: https://<公网IP>/desktop-updates/latest.json
+Asset base URL:   https://<公网IP>/desktop-updates
+```
+
+将签名后的 `latest.json`、`.nsis.zip` 和 `.sig` 上传到 `/srv/coderai/updates`。Caddy 会移除 `/desktop-updates/` 前缀后读取该目录，`latest.json` 禁止缓存。
+
+## 11. 发布顺序
 
 1. 测试环境迁移和内部管理员验收。
 2. 5 至 10 人灰度，稳定 3 个教学日。
@@ -172,7 +219,7 @@ npm.cmd run test:load -- `
 
 出现跨机构数据风险、数据库损坏、备份无法恢复或桌面更新失败时，立即停止扩容并执行 [回滚流程](CLOUD_MIGRATION.md#回滚)。
 
-## 10. 日常命令
+## 12. 日常命令
 
 ```bash
 # 状态
@@ -180,6 +227,10 @@ docker compose --env-file /srv/coderai/config/deploy.env -f deploy/docker-compos
 
 # 日志
 docker compose --env-file /srv/coderai/config/deploy.env -f deploy/docker-compose.yml logs --since 30m api worker caddy
+
+# IP 证书续期状态
+systemctl status coderai-cert-renew.timer --no-pager
+journalctl -u coderai-cert-renew.service --since '2 days ago' --no-pager
 
 # 应用更新（先备份并在测试环境验证）
 git fetch --tags

@@ -13,7 +13,7 @@ CoderAI 学堂是面向少儿 AI 课程学习的 Windows 桌面应用。当前�
 
 云端生产客户端不会启动本地 FastAPI，也不会在学生电脑保存业务 SQLite。SQLite 和本地文件模式仅用于开发、自动化测试及一次性历史迁移。
 
-当前代码已具备云端内测所需的主体能力，但尚未部署到正式云主机，也没有正式域名、代码签名证书、私有 Git 远端或机构真实 AI 密钥。详见 [项目状态](docs/PROJECT_STATUS.md) 与 [云端部署手册](docs/CLOUD_DEPLOYMENT.md)。
+当前代码已具备云端内测所需的主体能力，并支持固定公网 IPv4 + Let's Encrypt 短期 IP 证书，不强制购买域名。尚未完成真实服务器部署、代码签名、独立备份、私有 Git 远端或机构真实 AI 密钥配置。详见 [项目状态](docs/PROJECT_STATUS.md) 与 [云端部署手册](docs/CLOUD_DEPLOYMENT.md)。
 
 ## 产品能力
 
@@ -123,7 +123,7 @@ npm.cmd audit --audit-level=high
 50 账号非 AI 接口压测工具：
 
 ```powershell
-npm.cmd run test:load -- --base-url https://api.example.cn --accounts tools/pilot-load-accounts.json --report test-results/pilot-load.json
+npm.cmd run test:load -- --base-url https://203.0.113.10 --accounts tools/pilot-load-accounts.json --report test-results/pilot-load.json
 ```
 
 账号文件不得提交到 Git。示例见 `tools/pilot-load-accounts.example.json`，详细流程见 [云端部署手册](docs/CLOUD_DEPLOYMENT.md)。

@@ -38,6 +38,7 @@ jobs:
       - name: Static analysis and dependency audit
         run: |
           python -m ruff check backend tests deploy tools/pilot-load-test.py
+          shellcheck deploy/*.sh
           pip-audit --requirement requirements.lock
           npm audit --audit-level=high
       - name: Backend and frontend tests

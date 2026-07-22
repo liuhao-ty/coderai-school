@@ -133,6 +133,8 @@ Operations: Prometheus + Alertmanager + independent backup storage
 - `/api/version` 返回版本、最低客户端版本、渠道、提交和部署模式
 - `/metrics` 只在内部网络由 Prometheus 抓取，Caddy 对公网返回 404
 - Alertmanager 可通过 `CODERAI_ALERT_WEBHOOK_URL` 接入 HTTPS Webhook
+- 无域名部署使用固定公网 IPv4 和 Let's Encrypt `shortlived` IP 证书；systemd 每 12 小时续期并让 Caddy 重载
+- Caddy 在同一 HTTPS IP 的 `/desktop-updates/` 提供 Tauri 签名更新文件
 
 ## 10. 发布与回滚
 

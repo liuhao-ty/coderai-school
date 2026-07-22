@@ -1,0 +1,12 @@
+[Unit]
+Description=Check the CoderAI public IP TLS certificate every 12 hours
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=12h
+RandomizedDelaySec=30min
+Persistent=true
+Unit=coderai-cert-renew.service
+
+[Install]
+WantedBy=timers.target

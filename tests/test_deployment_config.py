@@ -1,0 +1,48 @@
+from pathlib import Path
+import unittest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class PublicIpDeploymentConfigTests(unittest.TestCase):
+    def test_caddy_uses_public_ip_tls_and_hosts_updates(self):
+        caddyfile = (ROOT / "deploy" / "Caddyfile").read_text(encoding="utf-8")
+        self.assertIn("http://{$CODERAI_PUBLIC_IP}", caddyfile)
+        self.assertIn("https://{$CODERAI_PUBLIC_IP}", caddyfile)
+        self.assertIn("/etc/letsencrypt/live/coderai-ip/fullchain.pem", caddyfile)
+        self.assertIn("handle_path /desktop-updates/*", caddyfile)
+        self.assertNotIn("CODERAI_DOMAIN", caddyfile)
+
+    def test_compose_mounts_certificate_webroot_and_update_files(self):
+        compose = (ROOT / "deploy" / "docker-compose.yml").read_text(encoding="utf-8")
+        self.assertIn("CODERAI_PUBLIC_IP: ${CODERAI_PUBLIC_IP}", compose)
+        self.assertIn(":/etc/letsencrypt:ro", compose)
+        self.assertIn(":/var/www/certbot:ro", compose)
+        self.assertIn(":/srv/coderai/updates:ro", compose)
+        self.assertNotIn('"5432:5432"', compose)
+        self.assertNotIn('"6379:6379"', compose)
+
+    def test_ip_certificate_scripts_use_shortlived_profile_and_webroot_renewal(self):
+        bootstrap = (ROOT / "deploy" / "bootstrap-ip-certificate.sh").read_text(encoding="utf-8")
+        renewal = (ROOT / "deploy" / "renew-ip-certificate.sh").read_text(encoding="utf-8")
+        timer = (ROOT / "deploy" / "systemd" / "coderai-cert-renew.timer").read_text(encoding="utf-8")
+        self.assertIn("certbot/certbot:v5.4.0@sha256:", bootstrap)
+        self.assertIn("--preferred-profile shortlived", bootstrap)
+        self.assertIn('--ip-address "$CODERAI_PUBLIC_IP"', bootstrap)
+        self.assertIn("--webroot-path /var/www/certbot", renewal)
+        self.assertIn("coderai_tls_certificate_valid_beyond_48h", renewal)
+        self.assertIn("OnUnitActiveSec=12h", timer)
+        alerts = (ROOT / "deploy" / "monitoring" / "alerts.yml").read_text(encoding="utf-8")
+        self.assertIn("CoderAITlsCertificateRenewalRequired", alerts)
+
+    def test_environment_template_requires_ip_instead_of_domain(self):
+        environment = (ROOT / "deploy" / ".env.example").read_text(encoding="utf-8")
+        self.assertIn("CODERAI_PUBLIC_IP=", environment)
+        self.assertIn("CODERAI_CERTBOT_EMAIL=", environment)
+        self.assertIn("CODERAI_UPDATE_DIR=", environment)
+        self.assertNotIn("CODERAI_DOMAIN=", environment)
+
+
+if __name__ == "__main__":
+    unittest.main()

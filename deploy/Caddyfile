@@ -1,24 +1,46 @@
-{$CODERAI_DOMAIN} {
-    encode zstd gzip
+http://{$CODERAI_PUBLIC_IP} {
+	route {
+		handle_path /.well-known/acme-challenge/* {
+			root * /var/www/certbot
+			file_server
+		}
 
-    @internal_metrics path /metrics
-    respond @internal_metrics 404
+		redir https://{$CODERAI_PUBLIC_IP}{uri} permanent
+	}
+}
 
-    header {
-        Strict-Transport-Security "max-age=31536000; includeSubDomains"
-        X-Content-Type-Options "nosniff"
-        Referrer-Policy "no-referrer"
-        -Server
-    }
+https://{$CODERAI_PUBLIC_IP} {
+	tls /etc/letsencrypt/live/coderai-ip/fullchain.pem /etc/letsencrypt/live/coderai-ip/privkey.pem
+	encode zstd gzip
 
-    reverse_proxy api:8000 {
-        health_uri /api/health/live
-        health_interval 15s
-        health_timeout 3s
-    }
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
 
-    log {
-        output stdout
-        format json
-    }
+	route {
+		@internal_metrics path /metrics
+		respond @internal_metrics 404
+
+		@update_manifest path /desktop-updates/latest.json
+		header @update_manifest Cache-Control "no-store"
+
+		handle_path /desktop-updates/* {
+			root * /srv/coderai/updates
+			file_server
+		}
+
+		reverse_proxy api:8000 {
+			health_uri /api/health/live
+			health_interval 15s
+			health_timeout 3s
+		}
+	}
+
+	log {
+		output stdout
+		format json
+	}
 }

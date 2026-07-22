@@ -160,12 +160,15 @@ services:
     image: caddy:2.10.0-alpine
     restart: unless-stopped
     environment:
-      CODERAI_DOMAIN: ${CODERAI_DOMAIN}
+      CODERAI_PUBLIC_IP: ${CODERAI_PUBLIC_IP}
     ports:
       - "80:80"
       - "443:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${CODERAI_LETSENCRYPT_DIR:-/etc/letsencrypt}:/etc/letsencrypt:ro
+      - ${CODERAI_CERTBOT_WEBROOT:-/srv/coderai/acme}:/var/www/certbot:ro
+      - ${CODERAI_UPDATE_DIR:-/srv/coderai/updates}:/srv/coderai/updates:ro
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
@@ -189,7 +192,7 @@ services:
       CODERAI_BACKUP_METRICS_FILE: /metrics/coderai_backup.prom
     volumes:
       - backup_work:/app/runtime/backups
-      - monitoring_metrics:/metrics
+      - ${CODERAI_MONITORING_METRICS_DIR:-/srv/coderai/metrics}:/metrics
     depends_on:
       api:
         condition: service_healthy
@@ -241,7 +244,7 @@ services:
     command: ["--path.rootfs=/host", "--collector.textfile.directory=/metrics"]
     volumes:
       - /:/host:ro,rslave
-      - monitoring_metrics:/metrics:ro
+      - ${CODERAI_MONITORING_METRICS_DIR:-/srv/coderai/metrics}:/metrics:ro
 
 volumes:
   postgres_data:
@@ -252,4 +255,3 @@ volumes:
   caddy_data:
   caddy_config:
   prometheus_data:
-  monitoring_metrics:
