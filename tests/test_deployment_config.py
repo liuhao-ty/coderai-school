@@ -29,6 +29,9 @@ class PublicIpDeploymentConfigTests(unittest.TestCase):
         self.assertIn("ARG CODERAI_APT_MIRROR=", dockerfile)
         self.assertIn("$CODERAI_APT_MIRROR", dockerfile)
         self.assertIn("CODERAI_APT_MIRROR: ${CODERAI_APT_MIRROR:-}", compose)
+        self.assertIn("ARG CODERAI_PIP_INDEX_URL=", dockerfile)
+        self.assertIn("--index-url \"$CODERAI_PIP_INDEX_URL\"", dockerfile)
+        self.assertIn("CODERAI_PIP_INDEX_URL: ${CODERAI_PIP_INDEX_URL:-}", compose)
 
     def test_ip_certificate_scripts_use_shortlived_profile_and_webroot_renewal(self):
         bootstrap = (ROOT / "deploy" / "bootstrap-ip-certificate.sh").read_text(encoding="utf-8")

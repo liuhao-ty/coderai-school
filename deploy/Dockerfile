@@ -24,7 +24,12 @@ RUN if [ -n "$CODERAI_APT_MIRROR" ]; then \
 
 WORKDIR /app
 COPY requirements.lock ./requirements.lock
-RUN python -m pip install --requirement requirements.lock
+ARG CODERAI_PIP_INDEX_URL=
+RUN if [ -n "$CODERAI_PIP_INDEX_URL" ]; then \
+        python -m pip install --index-url "$CODERAI_PIP_INDEX_URL" --requirement requirements.lock; \
+    else \
+        python -m pip install --requirement requirements.lock; \
+    fi
 
 COPY alembic.ini ./alembic.ini
 COPY backend ./backend

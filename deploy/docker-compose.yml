@@ -98,6 +98,7 @@ services:
       dockerfile: deploy/Dockerfile
       args:
         CODERAI_APT_MIRROR: ${CODERAI_APT_MIRROR:-}
+        CODERAI_PIP_INDEX_URL: ${CODERAI_PIP_INDEX_URL:-}
     image: coderai-api:0.2.0-beta.1
     restart: "no"
     command: ["migrate"]
