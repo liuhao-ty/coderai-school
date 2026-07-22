@@ -213,7 +213,7 @@ Updater endpoint: https://<公网IP>/desktop-updates/latest.json
 Asset base URL:   https://<公网IP>/desktop-updates
 ```
 
-将签名后的 `latest.json`、`.nsis.zip` 和 `.sig` 上传到 `/srv/coderai/updates`。Caddy 会移除 `/desktop-updates/` 前缀后读取该目录，`latest.json` 禁止缓存。
+将签名后的 `latest.json`、NSIS 更新安装包（当前 Tauri 2 为 `-setup.exe`，兼容旧版 `.nsis.zip`）和 `.sig` 上传到 `/srv/coderai/updates`。Caddy 会移除 `/desktop-updates/` 前缀后读取该目录，`latest.json` 禁止缓存。
 
 ## 11. 发布顺序
 

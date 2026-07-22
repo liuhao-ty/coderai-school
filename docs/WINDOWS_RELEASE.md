@@ -5,7 +5,7 @@
 ## 发布产物
 
 - Windows x86_64 NSIS 安装包
-- Tauri 更新压缩包与 `.sig`
+- Tauri NSIS 更新安装包与 `.sig`
 - `latest.json` 更新清单
 - 发布说明和 SHA-256
 

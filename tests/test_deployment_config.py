@@ -69,6 +69,12 @@ class PublicIpDeploymentConfigTests(unittest.TestCase):
         build_script = (ROOT / "tools" / "build-tauri.ps1").read_text(encoding="utf-8")
         self.assertIn("(Get-Content -LiteralPath $passwordPath -Raw).Trim() | ConvertTo-SecureString", build_script)
 
+    def test_update_manifest_accepts_current_tauri_nsis_installers(self):
+        manifest_script = (ROOT / "tools" / "generate-update-manifest.ps1").read_text(encoding="utf-8")
+        self.assertIn('Name.EndsWith("-setup.exe")', manifest_script)
+        self.assertIn('Name.EndsWith(".nsis.zip")', manifest_script)
+        self.assertIn("[Text.UTF8Encoding]::new($false)", manifest_script)
+
 
 if __name__ == "__main__":
     unittest.main()
