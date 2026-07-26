@@ -1,12 +1,12 @@
 # CoderAI 学堂项目状态
 
-更新时间：2026-07-22（北京时间）
-目标版本：`0.2.0-beta.1`
+更新时间：2026-07-26（北京时间）
+目标版本：`0.2.0-beta.1` release candidate
 发布范围：单机构、免费封闭内测、最多 50 人同时在线、Windows、必须联网
 
 ## 结论
 
-云端内测所需的主体代码已经完成：机构租户、PostgreSQL/Alembic、S3 对象存储、Redis/Celery、服务器密钥保护、Tauri 桌面工程、CI、监控、备份、迁移、隐私保留和灰度更新均已落入仓库。
+云端内测所需的主体代码已经完成，并已进入 release candidate 状态：机构租户、PostgreSQL/Alembic、S3 对象存储、Redis/Celery、服务器密钥保护、Tauri 桌面工程、CI、监控、备份、迁移、隐私保留和灰度更新均已落入仓库；2026-07-26 本机回归覆盖后端、前端、Tauri、E2E、PPT 转换和 Python 依赖审计。
 
 阿里云单机构技术内测环境已经部署并可由 Windows 客户端访问，但这不等于完成 50 人上线验收。当前主机低于计划规格，且独立备份、Windows 代码签名、机构真实 AI 密钥、50 人压测和合规确认尚未完成；在这些问题解决前不得将该环境描述为生产安全环境。
 
@@ -103,18 +103,19 @@
 
 ## 验证状态
 
-2026-07-22 本机及阿里云试点回归结果：
+2026-07-26 本机 release-candidate 回归结果：
 
-- Ruff 通过；85 项后端测试完成，其中 84 项通过，1 项云容器集成测试因本机没有 Docker/WSL 跳过
-- 前端生产构建通过；Playwright 19 项桌面 E2E 全部通过
-- Rust 格式检查、Clippy `-D warnings` 和 1 项 Tauri 单元测试通过
-- `pip-audit` 未发现已知漏洞，`npm audit --audit-level=high` 为 0 个漏洞
-- LibreOffice 真实 PPTX 转 PDF、教师 PDF 预览和原件下载阻断测试通过
-- 未签名 Windows 可执行文件和 NSIS 安装包构建成功；静默安装、启动、单实例和真实云端版本/更新检查通过
-- PostgreSQL、Redis、MinIO 和 Celery 真实服务就绪检查通过，所有运行容器重启次数为 0
-- 公网 HTTPS、无 SNI Windows Schannel、管理员真实登录、更新文件签名匹配及公开下载哈希通过
+- 已检查 `main..HEAD` 云迁移 diff：150 个文件变更，覆盖后端租户/存储/任务队列、部署脚本、Tauri 桌面工程、前端云端运行时和云迁移测试；`git diff --check main..HEAD` 通过。
+- Ruff 通过；85 项后端测试完成，其中 84 项通过，1 项云容器集成测试因本机未启用云集成服务跳过。
+- 前端生产构建通过；`react-router-dom` 已从 `7.18.1` 调整到 `7.11.0`，`postcss` 已从 `8.5.16` 调整到 `8.5.23`，用于消除本机 `npm audit` 首次报告的高危 advisories。
+- Playwright 19 项桌面 E2E 全部通过；测试完成后的 Windows Uvicorn 管道断开日志不影响退出码。
+- Rust 格式检查、Clippy `-D warnings` 和 1 项 Tauri 单元测试通过。
+- Tauri 直接构建已生成 release EXE 和 NSIS 安装包，但因缺少 `TAURI_SIGNING_PRIVATE_KEY` 在更新产物签名阶段退出失败；这是正式发布签名材料缺失，不是代码编译失败。`tools/build-tauri.ps1 -UnsignedUpdater` 可生成未签名本地安装包并返回 0，但 Tauri CLI 仍会打印缺少更新私钥的非致命提示。
+- LibreOffice 真实 PPTX 转 PDF、教师 PDF 预览和原件下载阻断测试通过。
+- `python -m pip_audit --requirement requirements.lock` 未发现已知漏洞；当前机器已按 `requirements-dev.in` 安装 `pip-audit==2.9.0` 才能执行该门禁。
+- `npm audit --audit-level=high` 首次发现 `postcss` 和 `react-router` 高危 advisories，依赖已修复；修复后 npm 11.12.1 对 `https://registry.npmjs.org/-/npm/v1/security/advisories/bulk` 的响应解析失败，报 `invalid json response body`，`registry.npmmirror.com` 不实现 audit API，因此本机无法取得最终 npm audit 通过输出。`npm ls react-router react-router-dom postcss --depth=1` 已确认当前树为 `react-router-dom@7.11.0`、`react-router@7.11.0`、`postcss@8.5.23`。
 
-尚未执行 Authenticode、SmartScreen、跨版本自动安装与回滚、50 账号压测、机构真实 AI 调用和独立备份恢复演练。本机单元测试中的云容器集成项仍由 CI 执行，阿里云试点已完成运行依赖的真实就绪检查。
+尚未执行 Authenticode、SmartScreen、跨版本自动安装与回滚、50 账号压测、机构真实 AI 调用、独立备份恢复演练和正式云部署。本机单元测试中的云容器集成项仍需由 CI 或具备 PostgreSQL/Redis/MinIO 的 Linux 测试环境执行。
 
 本机可执行的门禁：
 
@@ -126,11 +127,11 @@ npm.cmd run test:tauri
 npm.cmd run test:e2e
 npm.cmd run test:ppt-conversion
 npm.cmd run check:full
-python -m pip_audit --requirement requirements.lock
 npm.cmd audit --audit-level=high
+python -m pip_audit --requirement requirements.lock
 ```
 
-本机限制：没有 Docker 或 WSL，因此 PostgreSQL/Redis/MinIO 集成测试只能由 GitHub Actions 或 Linux 测试环境执行。没有正式 PFX，因此只能完成未签名 Tauri/NSIS 冒烟，不能验证 Authenticode、SmartScreen 和正式更新。
+本机限制：没有 Docker 或 WSL，因此 PostgreSQL/Redis/MinIO 集成测试只能由 GitHub Actions 或 Linux 测试环境执行。没有正式 PFX、Authenticode 证书或 Tauri updater 私钥，因此只能完成未签名 Tauri/NSIS 构建冒烟，不能验证 Authenticode、SmartScreen 和正式更新。2026-07-26 npm audit 还受 npmjs audit endpoint 解析失败影响，需要在 CI 或网络恢复后复核最终 audit 输出。
 
 ## 上线前外部阻塞
 
@@ -140,6 +141,7 @@ npm.cmd audit --audit-level=high
 - [x] 已在真实 ECS 验证 Let's Encrypt IP 证书首次签发、12 小时续期和 Caddy 重载
 - [ ] 准备与生产数据盘独立的对象备份存储
 - [ ] 采购 Windows Authenticode 代码签名证书
+- [ ] 提供 Tauri updater 私钥和密码，或在受保护 CI secret 中配置 `TAURI_SIGNING_PRIVATE_KEY` 与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
 - [x] 已配置公网 IP 下的 Tauri 签名更新产物存储
 - [ ] 配置 Alertmanager 邮件或 Webhook 告警接收端
 - [ ] 提供机构真实 AI 服务商密钥并确认数据流向
