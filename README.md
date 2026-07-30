@@ -1,6 +1,6 @@
 # CoderAI 学堂
 
-CoderAI 学堂是面向少儿 AI 课程学习的 Windows 桌面应用。当前 Windows 客户端版本为 `0.2.0-beta.4`：中国大陆单机构、免费封闭内测、最多 50 人同时在线、必须联网。
+CoderAI 学堂是面向少儿 AI 课程学习的 Windows 桌面应用。当前 Windows 客户端版本为 `0.2.0-beta.5`：中国大陆单机构、免费封闭内测、最多 50 人同时在线、必须联网。
 
 ## 当前状态
 
@@ -9,12 +9,12 @@ CoderAI 学堂是面向少儿 AI 课程学习的 Windows 桌面应用。当前 W
 - 云端 API：FastAPI、PostgreSQL、Alembic、Redis、Celery
 - 文件：S3 兼容对象存储，客户端只通过鉴权接口访问
 - 部署：Docker Compose、Caddy、Prometheus、Alertmanager、独立备份任务
-- Windows 客户端：`0.2.0-beta.4`
+- Windows 客户端：`0.2.0-beta.5`
 - 云端 API：`0.2.0-beta.3`
 
 云端生产客户端不会启动本地 FastAPI，也不会在学生电脑保存业务 SQLite。SQLite 和本地文件模式仅用于开发、自动化测试及一次性历史迁移。
 
-当前阿里云单机构技术内测环境已通过固定公网 IPv4 + Let's Encrypt 短期 IP 证书运行，不强制购买域名；`0.2.0-beta.3` API 与 `0.2.0-beta.4` Windows 客户端已部署，补充工作流 DAG 分支、即梦图片能力路由、工程包问卷式 Markdown 填写、排课记录筛选分页和云端连接池保护。该环境仍未完成服务器扩容、Windows Authenticode、独立备份、私有 Git 远端、机构真实 AI 密钥和 50 人压测，不得作为生产安全环境或直接按 50 人规模开放。详见 [项目状态](docs/PROJECT_STATUS.md) 与 [云端部署手册](docs/CLOUD_DEPLOYMENT.md)。
+当前阿里云单机构技术内测环境已通过固定公网 IPv4 + Let's Encrypt 短期 IP 证书运行，不强制购买域名；`0.2.0-beta.3` API 与 `0.2.0-beta.5` Windows 客户端已部署，补充课程简介折叠预览、学员作品提交时间筛选、学生工作台二级导航和课程搜索分页。发布分支已同步至 GitHub。该环境仍未完成服务器扩容、Windows Authenticode、独立备份、机构真实 AI 密钥和 50 人压测，不得作为生产安全环境或直接按 50 人规模开放。详见 [项目状态](docs/PROJECT_STATUS.md) 与 [云端部署手册](docs/CLOUD_DEPLOYMENT.md)。
 
 ## 产品能力
 

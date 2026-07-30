@@ -1,6 +1,6 @@
 # Windows 桌面签名发布
 
-适用版本：`0.2.0-beta.4`
+适用版本：`0.2.0-beta.5`
 
 ## 发布产物
 
@@ -99,8 +99,8 @@ Secrets：
 3. 从审核后的发布提交创建标签：
 
 ```powershell
-git tag -s v0.2.0-beta.4 -m "CoderAI 学堂 0.2.0-beta.4"
-git push origin v0.2.0-beta.4
+git tag -s v0.2.0-beta.5 -m "CoderAI 学堂 0.2.0-beta.5"
+git push origin v0.2.0-beta.5
 ```
 
 4. `release-windows.yml` 导入 PFX，构建签名 NSIS 和 Tauri 更新产物。
@@ -152,7 +152,7 @@ Get-AuthenticodeSignature .\CoderAI*.exe | Format-List Status,StatusMessage,Sign
 
 ## 客户端回滚
 
-Tauri 更新不应通过降低版本号回滚。若 `0.2.0-beta.4` 客户端有严重问题：
+Tauri 更新不应通过降低版本号回滚。若 `0.2.0-beta.5` 客户端有严重问题：
 
 1. 立即停止更新清单下发。
 2. 从已知良好的回滚提交修复或还原代码。
@@ -166,7 +166,7 @@ Tauri 更新不应通过降低版本号回滚。若 `0.2.0-beta.4` 客户端有�
 
 - 尚无真实 Authenticode PFX
 - 已在真实公网 IP 上完成短期 IP 证书签发及真实续期验证
-- `0.2.0-beta.4` Tauri 签名更新文件需上传到 `/desktop-updates/`
+- `0.2.0-beta.5` Tauri 签名更新文件需上传到 `/desktop-updates/`
 - 尚无私有 Git 远端及 Environment Secrets
 
 因此当前已完成 Tauri updater 签名与公网分发，但仍不能宣称已完成 Authenticode、SmartScreen 或跨版本自动安装验收。
