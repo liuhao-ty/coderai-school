@@ -6,6 +6,7 @@ export type Project = {
   title: string;
   project_type: string;
   user_id?: number | null;
+  curriculum_course_id?: number | null;
   student_archived?: boolean;
   classroom_id?: number | null;
   owner_name: string;
@@ -455,6 +456,21 @@ export type WorkflowRunResponse = {
       moderation_reason?: string;
       moderation_message?: string;
     };
+    images?: Array<{
+      url?: string;
+      file_path?: string;
+      moderation_status?: "approved" | "pending" | "rejected";
+      moderation_reason?: string;
+      moderation_message?: string;
+    }>;
+    terminal_outputs?: Array<{
+      node_id: string;
+      label: string;
+      type: string;
+      status: string;
+      output?: unknown;
+      error?: string;
+    }>;
   };
   project?: Project | null;
 };

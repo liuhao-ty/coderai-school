@@ -1,6 +1,6 @@
 http://{$CODERAI_PUBLIC_IP} {
 	route {
-		handle_path /.well-known/acme-challenge/* {
+		handle /.well-known/acme-challenge/* {
 			root * /var/www/certbot
 			file_server
 		}
@@ -34,8 +34,8 @@ http://{$CODERAI_PUBLIC_IP} {
 
 		reverse_proxy api:8000 {
 			health_uri /api/health/live
-			health_interval 15s
-			health_timeout 3s
+			health_interval 2s
+			health_timeout 2s
 		}
 	}
 

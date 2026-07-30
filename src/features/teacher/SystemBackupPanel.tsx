@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { IconTitle } from "../../components/IconTitle";
 import { api } from "../../lib/api";
+import { saveBlobFile } from "../../lib/downloads";
 import { explainError } from "../../lib/errors";
 import { formatBeijingTime, formatBytes } from "../../lib/format";
 
@@ -44,13 +45,10 @@ export function SystemBackupPanel({ onRefresh }: { onRefresh: () => Promise<void
     setLoading("download");
     try {
       const res = await api.get("/api/system/backups/export", { responseType: "blob" });
-      const url = URL.createObjectURL(res.data);
-      const anchor = document.createElement("a");
-      anchor.href = url;
-      anchor.download = `${cloudMode ? "coderai-organization-export" : "coderai-backup"}-${dayjs().format("YYYYMMDD-HHmmss")}.zip`;
-      anchor.click();
-      URL.revokeObjectURL(url);
-      message.success(cloudMode ? "本机构数据导出已生成并下载" : "完整压缩备份已生成并下载");
+      const filename = `${cloudMode ? "coderai-organization-export" : "coderai-backup"}-${dayjs().format("YYYYMMDD-HHmmss")}.zip`;
+      if (await saveBlobFile(res.data, filename)) {
+        message.success(cloudMode ? "本机构数据导出已保存" : "完整压缩备份已保存");
+      }
     } catch (error) {
       message.error(explainError(error));
     } finally {

@@ -11,13 +11,15 @@ import {
   Segmented,
   Select,
   Space,
+  Switch,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from "antd";
 import dayjs, { type Dayjs } from "dayjs";
-import { CalendarClock, Clock3, RefreshCcw, RotateCcw, Send, UsersRound } from "lucide-react";
-import { useMemo, useState } from "react";
+import { CalendarClock, Clock3, RefreshCcw, RotateCcw, Search, Send, UsersRound } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import type { Classroom, CoursePackageItem, CourseScheduleItem } from "../../domain-types";
 import { api } from "../../lib/api";
@@ -47,6 +49,7 @@ function scheduleState(status: CourseScheduleItem["status"]) {
 }
 
 export function ScheduleManager({
+  view,
   audience,
   packages,
   schedules,
@@ -54,6 +57,7 @@ export function ScheduleManager({
   classrooms,
   onRefresh,
 }: {
+  view: "create" | "records";
   audience: "admin" | "teacher";
   packages: CoursePackageItem[];
   schedules: CourseScheduleItem[];
@@ -67,8 +71,19 @@ export function ScheduleManager({
   const [updateForm] = Form.useForm<UpdateFormValues>();
   const [editing, setEditing] = useState<CourseScheduleItem | null>(null);
   const [busy, setBusy] = useState("");
-  const [statusFilter, setStatusFilter] = useState<string>("current");
-  const [targetFilter, setTargetFilter] = useState<number | undefined>();
+  const [recordSchedules, setRecordSchedules] = useState<CourseScheduleItem[]>(schedules);
+  const [recordTotal, setRecordTotal] = useState(schedules.length);
+  const [recordPage, setRecordPage] = useState(1);
+  const [recordsLoading, setRecordsLoading] = useState(false);
+  const [keywordDraft, setKeywordDraft] = useState("");
+  const [keyword, setKeyword] = useState("");
+  const [statusFilter, setStatusFilter] = useState<string>("");
+  const [targetTypeFilter, setTargetTypeFilter] = useState<string>("");
+  const [classroomFilter, setClassroomFilter] = useState<number | undefined>();
+  const [studentFilter, setStudentFilter] = useState<number | undefined>();
+  const [packageFilter, setPackageFilter] = useState<number | undefined>();
+  const [courseFilter, setCourseFilter] = useState<number | undefined>();
+  const [includeCanceled, setIncludeCanceled] = useState(false);
 
   const publishedPackages = useMemo(() => packages.filter((item) => item.status === "published"), [packages]);
   const activeStudents = useMemo(() => students.filter((item) => item.active && item.account_status !== "archived"), [students]);
@@ -81,16 +96,61 @@ export function ScheduleManager({
     ...item.courses.map((course) => ({ label: `${item.title} · ${course.title} · ${item.school_stages.map(schoolStageLabel).join("、")}`, value: `course:${course.id}` })),
   ]), [publishedPackages]);
 
-  const visibleSchedules = useMemo(() => schedules.filter((item) => {
-    if (statusFilter === "current" && item.status === "canceled") return false;
-    if (statusFilter !== "current" && statusFilter !== "all" && item.status !== statusFilter) return false;
-    if (targetFilter && item.target_id !== targetFilter) return false;
-    return true;
-  }), [schedules, statusFilter, targetFilter]);
-
   const targetOptions = mode === "student"
     ? activeStudents.map((student) => ({ value: student.id, label: `${student.name} · ${student.username}${student.classroom_name ? ` · ${student.classroom_name}` : ""}` }))
     : availableClassrooms.map((classroom) => ({ value: classroom.id, label: classroom.name }));
+  const recordCourseOptions = useMemo(
+    () => packages
+      .filter((item) => packageFilter == null || item.id === packageFilter)
+      .flatMap((item) => item.courses.map((course) => ({
+        value: course.id,
+        label: `${item.title} · ${course.title}`,
+      }))),
+    [packageFilter, packages],
+  );
+
+  const loadRecords = useCallback(async () => {
+    if (view !== "records") return;
+    setRecordsLoading(true);
+    try {
+      const response = await api.get("/api/course-schedules", {
+        params: {
+          q: keyword || undefined,
+          status: statusFilter || undefined,
+          target_type: targetTypeFilter || undefined,
+          classroom_id: classroomFilter,
+          student_id: studentFilter,
+          package_id: packageFilter,
+          course_id: courseFilter,
+          include_canceled: includeCanceled,
+          page: recordPage,
+          page_size: 20,
+        },
+      });
+      setRecordSchedules(response.data.schedules || []);
+      setRecordTotal(Number(response.data.total || 0));
+    } catch (error) {
+      message.error(explainError(error));
+    } finally {
+      setRecordsLoading(false);
+    }
+  }, [
+    classroomFilter,
+    courseFilter,
+    includeCanceled,
+    keyword,
+    message,
+    packageFilter,
+    recordPage,
+    statusFilter,
+    studentFilter,
+    targetTypeFilter,
+    view,
+  ]);
+
+  useEffect(() => {
+    void loadRecords();
+  }, [loadRecords]);
 
   const createSchedules = async (values: ScheduleFormValues) => {
     const [scope, rawId] = values.curriculum.split(":");
@@ -151,7 +211,7 @@ export function ScheduleManager({
       });
       setEditing(null);
       message.success("排课时间已更新");
-      await onRefresh();
+      await Promise.all([onRefresh(), loadRecords()]);
       if ((response.data.conflicts || []).length) message.warning("调整后的时间与其他排课重叠，请再次检查");
     } catch (error) {
       message.error(explainError(error));
@@ -165,7 +225,7 @@ export function ScheduleManager({
     try {
       await api.post(`/api/course-schedules/${schedule.id}/cancel`, { reason: "由教学人员在排课管理中取消" });
       message.success("排课已取消，历史提交仍会保留");
-      await onRefresh();
+      await Promise.all([onRefresh(), loadRecords()]);
     } catch (error) {
       message.error(explainError(error));
     } finally {
@@ -181,9 +241,22 @@ export function ScheduleManager({
     });
   };
 
+  const resetRecordFilters = () => {
+    setKeywordDraft("");
+    setKeyword("");
+    setStatusFilter("");
+    setTargetTypeFilter("");
+    setClassroomFilter(undefined);
+    setStudentFilter(undefined);
+    setPackageFilter(undefined);
+    setCourseFilter(undefined);
+    setIncludeCanceled(false);
+    setRecordPage(1);
+  };
+
   return (
     <Space direction="vertical" size={16} className="fullWidth scheduleWorkspace">
-      <section className="scheduleComposer">
+      {view === "create" && <section className="scheduleComposer">
         <div className="scheduleComposerHeader">
           <div><Title level={4}>创建排课</Title><Text type="secondary">可选择单门课程或按课程包顺序批量排课</Text></div>
           <Segmented
@@ -226,39 +299,115 @@ export function ScheduleManager({
             <Button type="primary" htmlType="submit" icon={<Send size={15} />} loading={busy === "create"}>确认排课</Button>
           </Form>
         )}
-      </section>
+      </section>}
 
-      <section className="scheduleListSection">
+      {view === "records" && <section className="scheduleListSection">
         <div className="scheduleListHeader">
           <div><Title level={4}>排课记录</Title><Text type="secondary">截止后仍允许提交，系统会自动标记逾期</Text></div>
-          <Space wrap>
-            <Select
-              allowClear
-              placeholder="筛选目标"
-              value={targetFilter}
-              onChange={setTargetFilter}
-              options={[...activeStudents.map((item) => ({ value: item.id, label: item.name })), ...availableClassrooms.map((item) => ({ value: item.id, label: item.name }))]}
-              style={{ width: 160 }}
-            />
-            <Select
-              value={statusFilter}
-              onChange={setStatusFilter}
-              options={[
-                { value: "current", label: "当前排课" },
-                { value: "scheduled", label: "未开始" },
-                { value: "active", label: "学习中" },
-                { value: "overdue", label: "已逾期" },
-                { value: "all", label: "全部状态" },
-              ]}
-              style={{ width: 130 }}
-            />
-            <Button icon={<RefreshCcw size={15} />} onClick={() => void onRefresh()}>刷新</Button>
+          <Space>
+            <Button onClick={resetRecordFilters}>重置筛选</Button>
+            <Tooltip title="刷新排课记录">
+              <Button aria-label="刷新排课记录" icon={<RefreshCcw size={15} />} loading={recordsLoading} onClick={() => void loadRecords()} />
+            </Tooltip>
           </Space>
+        </div>
+        <div className="scheduleFilterGrid">
+          <Input
+            allowClear
+            value={keywordDraft}
+            prefix={<Search size={14} />}
+            placeholder="搜索班级、学员、课程或排课人"
+            onChange={(event) => setKeywordDraft(event.target.value)}
+            onPressEnter={() => { setKeyword(keywordDraft.trim()); setRecordPage(1); }}
+          />
+          <Select
+            allowClear
+            placeholder="目标类型"
+            value={targetTypeFilter || undefined}
+            onChange={(value) => { setTargetTypeFilter(value || ""); setRecordPage(1); }}
+            options={[{ value: "student", label: "按学员" }, { value: "classroom", label: "按班级" }]}
+          />
+          <Select
+            allowClear
+            showSearch
+            optionFilterProp="label"
+            placeholder="班级"
+            value={classroomFilter}
+            onChange={(value) => { setClassroomFilter(value); setRecordPage(1); }}
+            options={classrooms.map((item) => ({ value: item.id, label: item.name }))}
+          />
+          <Select
+            allowClear
+            showSearch
+            optionFilterProp="label"
+            placeholder="学员"
+            value={studentFilter}
+            onChange={(value) => { setStudentFilter(value); setRecordPage(1); }}
+            options={activeStudents.map((item) => ({ value: item.id, label: `${item.name} · ${item.username}` }))}
+          />
+          <Select
+            allowClear
+            showSearch
+            optionFilterProp="label"
+            placeholder="课程包"
+            value={packageFilter}
+            onChange={(value) => {
+              setPackageFilter(value);
+              if (value && !packages.find((item) => item.id === value)?.courses.some((course) => course.id === courseFilter)) {
+                setCourseFilter(undefined);
+              }
+              setRecordPage(1);
+            }}
+            options={packages.map((item) => ({ value: item.id, label: item.title }))}
+          />
+          <Select
+            allowClear
+            showSearch
+            optionFilterProp="label"
+            placeholder="课程"
+            value={courseFilter}
+            onChange={(value) => { setCourseFilter(value); setRecordPage(1); }}
+            options={recordCourseOptions}
+          />
+          <Select
+            allowClear
+            placeholder="排课状态"
+            value={statusFilter || undefined}
+            onChange={(value) => { setStatusFilter(value || ""); setRecordPage(1); }}
+            options={[
+              { value: "scheduled", label: "未开始" },
+              { value: "active", label: "学习中" },
+              { value: "overdue", label: "已逾期" },
+              { value: "canceled", label: "已取消" },
+            ]}
+          />
+          <label className="scheduleCanceledToggle">
+            <Switch
+              checked={includeCanceled}
+              onChange={(checked) => { setIncludeCanceled(checked); setRecordPage(1); }}
+            />
+            <Text>包含已取消</Text>
+          </label>
+          <Button
+            type="primary"
+            icon={<Search size={15} />}
+            onClick={() => { setKeyword(keywordDraft.trim()); setRecordPage(1); }}
+          >
+            查询
+          </Button>
         </div>
         <Table<CourseScheduleItem>
           rowKey="id"
-          dataSource={visibleSchedules}
-          pagination={{ pageSize: 12, showSizeChanger: false }}
+          dataSource={recordSchedules}
+          loading={recordsLoading}
+          pagination={{
+            current: recordPage,
+            pageSize: 20,
+            total: recordTotal,
+            showSizeChanger: false,
+            showTotal: (total) => `共 ${total} 条`,
+            onChange: setRecordPage,
+          }}
           scroll={{ x: 980 }}
           locale={{ emptyText: "暂无排课记录" }}
           columns={[
@@ -309,7 +458,7 @@ export function ScheduleManager({
             },
           ]}
         />
-      </section>
+      </section>}
 
       <Modal title={editing ? `调整排课：${editing.course_title}` : "调整排课"} open={Boolean(editing)} onCancel={() => setEditing(null)} footer={null} destroyOnClose>
         <Form form={updateForm} layout="vertical" onFinish={saveTime}>

@@ -220,6 +220,11 @@ class CurriculumCourseOrderRequest(BaseModel):
     course_ids: list[int] = Field(min_length=1, max_length=500)
 
 
+class StudentCourseWorkspaceSaveRequest(BaseModel):
+    content_markdown: str = Field(default="", max_length=500_000)
+    answers: dict[str, str | list[str]] | None = None
+
+
 class CourseScheduleItemRequest(BaseModel):
     course_id: int = Field(ge=1)
     target_type: Literal["student", "classroom"]

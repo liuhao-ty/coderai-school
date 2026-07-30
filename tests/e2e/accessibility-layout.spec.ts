@@ -104,6 +104,18 @@ async function seedResponsiveCurriculum(request: APIRequestContext) {
   });
   expect(uploadResponse.ok()).toBeTruthy();
 
+  const starterUploadResponse = await request.put(`${API_URL}/api/curriculum-courses/${courseId}/materials/starter_markdown`, {
+    headers,
+    multipart: {
+      file: {
+        name: "课堂工程包.md",
+        mimeType: "text/markdown",
+        buffer: Buffer.from("# 课堂工程\n\n在这里完成课堂项目。", "utf8"),
+      },
+    },
+  });
+  expect(starterUploadResponse.ok()).toBeTruthy();
+
   let conversionStatus = "pending";
   for (let attempt = 0; attempt < 60; attempt += 1) {
     const state = await request.get(`${API_URL}/api/course-packages/${packageId}`, { headers });
@@ -168,6 +180,8 @@ async function expectNoHorizontalOverflow(page: Page) {
 }
 
 async function expectNoSeriousAccessibilityViolations(page: Page) {
+  await page.keyboard.press("Escape");
+  await expect(page.locator(".ant-select-dropdown:not(.ant-select-dropdown-hidden)")).toHaveCount(0);
   const results = await new AxeBuilder({ page }).analyze();
   const violations = results.violations.filter((item) => item.impact === "critical" || item.impact === "serious");
   expect(violations, violations.map((item) => `${item.id}: ${item.help}`).join("\n")).toEqual([]);
@@ -513,6 +527,11 @@ test("管理员账号管理集中开户与密码修改，账号安全只保留�
   await page.getByRole("tab", { name: "学生开户" }).click();
   await expect(page.getByRole("button", { name: "创建学生账号" })).toBeVisible();
   await expect(page.getByRole("button", { name: "选择 CSV 批量开户" })).toBeVisible();
+  const templateDownloadPromise = page.waitForEvent("download");
+  await page.getByRole("button", { name: "下载模板" }).click();
+  const templateDownload = await templateDownloadPromise;
+  expect(templateDownload.suggestedFilename()).toBe("学生账号导入模板.csv");
+  expect((await templateDownload.createReadStream())?.readable).toBeTruthy();
   await page.getByRole("tab", { name: "修改登录密码" }).click();
   const passwordPanel = page.getByRole("tabpanel", { name: "修改登录密码" });
   await expect(passwordPanel.getByLabel("当前密码")).toBeVisible();
@@ -529,6 +548,36 @@ test("管理员账号管理集中开户与密码修改，账号安全只保留�
   await sessionsTab.press("ArrowRight");
   await expect(auditTab).toHaveAttribute("aria-selected", "true");
   await expect(page.getByText("全部高风险操作", { exact: true })).toBeVisible();
+});
+
+test("云端短暂 503 后只读请求会自动恢复", async ({ page, request }) => {
+  const { teacherAuth } = await loginData(request);
+  let studentRequestAttempts = 0;
+  await page.route("**/api/students", async (route) => {
+    if (route.request().method() !== "GET") {
+      await route.continue();
+      return;
+    }
+    studentRequestAttempts += 1;
+    if (studentRequestAttempts === 1) {
+      await route.fulfill({
+        status: 503,
+        headers: {
+          "access-control-allow-origin": "http://127.0.0.1:15173",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ detail: { code: "E2E_TRANSIENT_503", message: "模拟云端服务启动中" } }),
+      });
+      return;
+    }
+    await route.continue();
+  });
+
+  await setTeacherAuth(page, teacherAuth);
+  await expect.poll(() => studentRequestAttempts).toBe(2);
+  await expect(page.getByText("Network Error", { exact: true })).toHaveCount(0);
+  await page.getByRole("menuitem", { name: "学员管理" }).click();
+  await expect(page.getByRole("heading", { name: "学员管理" })).toBeVisible();
 });
 
 test("工作台只滚动右侧内容并去除顶部重复状态", async ({ page, request }) => {
@@ -805,7 +854,7 @@ test("工作流节点可以行内选择模型并灰显未配置模型", async ({
 
   await setTeacherAuth(page, teacherAuth);
   await page.getByRole("menuitem", { name: "工作流" }).click();
-  await page.getByRole("button", { name: "添加文字节点" }).click();
+  await page.getByRole("button", { name: "添加文字分支" }).click();
   const modelSelect = page.getByRole("combobox", { name: "文字生成使用模型" });
   await expect(modelSelect).toBeVisible();
   await page.locator(".workflowNodeModelSelect").click();
@@ -889,7 +938,7 @@ test("学生端和管理员端适配目标 Windows 分辨率及高 DPI", async (
   }
 });
 
-test("课程目录、排课表和 PDF 抽屉适配目标 Windows 分辨率及高 DPI", async ({ browser, request }) => {
+test("课程目录、排课表和管理员 PDF 抽屉适配目标 Windows 分辨率及高 DPI", async ({ browser, request }) => {
   test.setTimeout(180_000);
   const { studentAuth, teacherAuth, packageTitle, courseTitle } = await seedResponsiveCurriculum(request);
 
@@ -915,17 +964,8 @@ test("课程目录、排课表和 PDF 抽屉适配目标 Windows 分辨率及高
       await expectNoHorizontalOverflow(page);
       await page.screenshot({ path: `test-results/layout-curriculum-${viewport.name}.png`, fullPage: true });
 
-      await page.getByRole("menuitem", { name: "排课管理" }).click();
-      await expect(page.locator(".ant-table-row").filter({ hasText: courseTitle })).toBeVisible();
-      await expectNoHorizontalOverflow(page);
-      await page.screenshot({ path: `test-results/layout-schedules-${viewport.name}.png`, fullPage: true });
-
-      await page.evaluate(() => localStorage.clear());
-      await setStudentAuth(page, studentAuth);
-      await page.getByRole("menuitem", { name: "课程学习" }).click();
-      await page.locator(".studentScheduleItem").filter({ hasText: courseTitle }).click();
-      await expectNoHorizontalOverflow(page);
-      await page.getByRole("button", { name: "预览", exact: true }).click();
+      const slidesSlot = page.locator(".materialSlot").filter({ hasText: "课堂PPT" });
+      await slidesSlot.getByRole("button", { name: "预览", exact: true }).click();
       const drawer = page.locator(".ant-drawer-content-wrapper").last();
       const pdfFrame = drawer.locator("iframe.coursePdfPreview");
       await expect(pdfFrame).toBeVisible();
@@ -939,6 +979,35 @@ test("课程目录、排课表和 PDF 抽屉适配目标 Windows 分辨率及高
       expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(viewport.width + 1);
       expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(viewport.height + 1);
       await page.screenshot({ path: `test-results/layout-course-pdf-${viewport.name}.png`, fullPage: true });
+      await page.locator(".ant-drawer-close").last().click();
+
+      await page.getByRole("menuitem", { name: "排课记录" }).click();
+      await expect(page.locator(".ant-table-row").filter({ hasText: courseTitle })).toBeVisible();
+      await expectNoHorizontalOverflow(page);
+      await page.screenshot({ path: `test-results/layout-schedules-${viewport.name}.png`, fullPage: true });
+
+      await page.evaluate(() => localStorage.clear());
+      await setStudentAuth(page, studentAuth);
+      await page.getByRole("menuitem", { name: "课程学习" }).click();
+      await page.locator(".studentScheduleItem").filter({ hasText: courseTitle }).click();
+      await expectNoHorizontalOverflow(page);
+      await expect(page.locator(".studentMaterial")).toHaveCount(1);
+      await expect(page.locator(".studentMaterial").filter({ hasText: "课堂PPT" })).toHaveCount(0);
+      await expect(page.locator(".studentMaterial").filter({ hasText: "成果包" })).toHaveCount(0);
+      await expect(page.locator("iframe.coursePdfPreview")).toHaveCount(0);
+      const starterCard = page.locator(".studentMaterial").filter({ hasText: "工程包" });
+      await expect(starterCard.getByRole("button", { name: "查看", exact: true })).toBeVisible();
+      await starterCard.getByRole("button", { name: "在线填写与编辑", exact: true }).click();
+      const workspaceDrawer = page.locator(".ant-drawer-content-wrapper").last();
+      const workspaceEditor = workspaceDrawer.getByLabel("工程包 Markdown 编辑器");
+      await expect(workspaceEditor).toBeVisible();
+      const workspaceContent = `# 我的课堂工程\n\n${viewport.name} 已完成在线编辑。`;
+      await workspaceEditor.fill(workspaceContent);
+      await workspaceDrawer.getByRole("button", { name: "保存", exact: true }).click();
+      await expect(workspaceDrawer.getByText(/保存于/)).toBeVisible();
+      await workspaceDrawer.locator(".ant-segmented-item").filter({ hasText: "预览" }).click();
+      await expect(workspaceDrawer.getByRole("heading", { name: "我的课堂工程" })).toBeVisible();
+      await page.screenshot({ path: `test-results/layout-student-course-${viewport.name}.png`, fullPage: true });
       await context.close();
     });
   }

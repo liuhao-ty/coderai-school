@@ -1,3 +1,4 @@
+import axios from "axios";
 import { create } from "zustand";
 
 import type { AssetItem, ClassTask, Classroom, Course, CoursePackageItem, CourseScheduleItem, Lesson, Project, ProviderState, TaskSubmission, VideoTask } from "../domain-types";
@@ -35,6 +36,8 @@ type AppStore = {
 };
 
 let refreshSequence = 0;
+const refreshControllers = new Map<WorkspaceRole, AbortController>();
+const inFlightRefreshes = new Map<WorkspaceRole, Promise<void>>();
 
 const emptyWorkspace = {
   projects: [],
@@ -64,97 +67,92 @@ export const useAppStore = create<AppStore>((set) => ({
 
   clearWorkspace: () => {
     refreshSequence += 1;
+    refreshControllers.forEach((controller) => controller.abort());
+    refreshControllers.clear();
+    inFlightRefreshes.clear();
     set({ ...emptyWorkspace, studentProfile: null, loading: false, hydrated: false, error: "", activeRole: null });
   },
 
-  refresh: async (role) => {
+  refresh: (role) => {
+    const existing = inFlightRefreshes.get(role);
+    if (existing) return existing;
+    refreshControllers.forEach((controller, activeRole) => {
+      if (activeRole !== role) controller.abort();
+    });
+    const controller = new AbortController();
+    refreshControllers.set(role, controller);
     const sequence = ++refreshSequence;
     set((state) => ({
+      ...(state.activeRole === role ? {} : emptyWorkspace),
       loading: true,
       error: "",
       hydrated: state.activeRole === role ? state.hydrated : false,
       activeRole: role,
     }));
-    try {
-      if (role === "admin") {
-        const [projectRes, providerRes, usageRes, courseRes, lessonRes, taskRes, assetRes, submissionRes, videoTaskRes, classroomRes, studentRes, packageRes, scheduleRes] = await Promise.all([
-          api.get("/api/projects"),
-          api.get("/api/settings/provider"),
-          api.get("/api/usage"),
-          api.get("/api/courses"),
-          api.get("/api/lessons"),
-          api.get("/api/classes/tasks"),
-          api.get("/api/assets"),
-          api.get("/api/submissions"),
-          api.get("/api/video/tasks"),
-          api.get("/api/classrooms"),
-          api.get("/api/students"),
-          api.get("/api/course-packages"),
-          api.get("/api/course-schedules"),
-        ]);
-        if (sequence !== refreshSequence) return;
-        set({
-          projects: projectRes.data.projects || [],
-          classrooms: classroomRes.data.classrooms || [],
-          students: studentRes.data.students || [],
-          courses: courseRes.data.courses || [],
-          lessons: lessonRes.data.lessons || [],
-          classTasks: taskRes.data.tasks || [],
-          coursePackages: packageRes.data.packages || [],
-          courseSchedules: scheduleRes.data.schedules || [],
-          assets: assetRes.data.assets || [],
-          submissions: submissionRes.data.submissions || [],
-          videoTasks: videoTaskRes.data.tasks || [],
-          provider: providerRes.data.provider || { configured: false },
-          usage: usageRes.data.usage || [],
-          loading: false,
-          hydrated: true,
-          error: "",
-          activeRole: role,
-        });
-        return;
-      }
-      const [projectRes, providerStatusRes, courseRes, lessonRes, taskRes, assetRes, submissionRes, videoTaskRes, packageRes, scheduleRes] = await Promise.all([
-        api.get("/api/projects"),
-        api.get("/api/settings/provider-status"),
-        api.get("/api/courses"),
-        api.get("/api/lessons"),
-        api.get("/api/classes/tasks"),
-        api.get("/api/assets"),
-        api.get("/api/submissions"),
-        api.get("/api/video/tasks"),
-        api.get("/api/course-packages"),
-        api.get("/api/course-schedules"),
-      ]);
-      const teacherData = role === "teacher"
-        ? await Promise.all([
-            api.get("/api/classrooms"),
-            api.get("/api/students"),
-          ])
-        : null;
-      if (sequence !== refreshSequence) return;
-      set({
-        projects: projectRes.data.projects || [],
-        provider: providerStatusRes.data.provider,
-        courses: courseRes.data.courses || [],
-        lessons: lessonRes.data.lessons || [],
-        classTasks: taskRes.data.tasks || [],
-        coursePackages: packageRes.data.packages || [],
-        courseSchedules: scheduleRes.data.schedules || [],
-        assets: assetRes.data.assets || [],
-        submissions: submissionRes.data.submissions || [],
-        videoTasks: videoTaskRes.data.tasks || [],
-        usage: [],
-        classrooms: teacherData ? teacherData[0].data.classrooms || [] : [],
-        students: teacherData ? teacherData[1].data.students || [] : [],
+    const refreshPromise = (async () => {
+      const endpoints = [
+        { key: "projects", label: "作品", url: "/api/projects", responseKey: "projects" },
+        { key: "provider", label: "模型状态", url: "/api/settings/provider-status", responseKey: "provider" },
+        { key: "courses", label: "历史课程", url: "/api/courses", responseKey: "courses" },
+        { key: "lessons", label: "历史课时", url: "/api/lessons", responseKey: "lessons" },
+        { key: "classTasks", label: "历史任务", url: "/api/classes/tasks", responseKey: "tasks" },
+        { key: "assets", label: "素材", url: "/api/assets", responseKey: "assets" },
+        { key: "submissions", label: "提交", url: "/api/submissions", responseKey: "submissions" },
+        { key: "videoTasks", label: "视频任务", url: "/api/video/tasks", responseKey: "tasks" },
+        { key: "coursePackages", label: "课程包", url: "/api/course-packages", responseKey: "packages" },
+        { key: "courseSchedules", label: "排课", url: "/api/course-schedules", responseKey: "schedules" },
+        ...(role === "teacher" || role === "admin"
+          ? [
+              { key: "classrooms", label: "班级", url: "/api/classrooms", responseKey: "classrooms" },
+              { key: "students", label: "学员", url: "/api/students", responseKey: "students" },
+            ]
+          : []),
+        ...(role === "admin"
+          ? [{ key: "usage", label: "用量", url: "/api/usage", responseKey: "usage" }]
+          : []),
+      ];
+      const results = await Promise.allSettled(
+        endpoints.map((endpoint) => api.get(endpoint.url, { signal: controller.signal })),
+      );
+      if (sequence !== refreshSequence || controller.signal.aborted) return;
+
+      const nextState: Record<string, unknown> = {
         loading: false,
         hydrated: true,
-        error: "",
+        activeRole: role,
+      };
+      const failedLabels: string[] = [];
+      let firstFailure: unknown = null;
+      let successfulRequests = 0;
+      results.forEach((result, index) => {
+        const endpoint = endpoints[index];
+        if (result.status === "fulfilled") {
+          successfulRequests += 1;
+          const value = result.value.data?.[endpoint.responseKey];
+          nextState[endpoint.key] = endpoint.key === "provider"
+            ? value || { configured: false }
+            : value || [];
+          return;
+        }
+        if (!axios.isCancel(result.reason)) {
+          failedLabels.push(endpoint.label);
+          firstFailure ||= result.reason;
+        }
       });
-    } catch (error) {
-      if (sequence !== refreshSequence) return;
-      set({ loading: false, error: explainError(error) });
-      throw error;
-    }
+      if (!successfulRequests && firstFailure) {
+        const detail = explainError(firstFailure);
+        set({ loading: false, error: detail });
+        throw firstFailure;
+      }
+      nextState.error = failedLabels.length
+        ? `部分数据暂未更新：${failedLabels.join("、")}。已保留上次成功加载的内容。`
+        : "";
+      set(nextState as Partial<AppStore>);
+    })().finally(() => {
+      if (refreshControllers.get(role) === controller) refreshControllers.delete(role);
+      if (inFlightRefreshes.get(role) === refreshPromise) inFlightRefreshes.delete(role);
+    });
+    inFlightRefreshes.set(role, refreshPromise);
+    return refreshPromise;
   },
 }));

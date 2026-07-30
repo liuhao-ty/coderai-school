@@ -24,6 +24,7 @@ import { useMemo, useState } from "react";
 import { IconTitle } from "../../components/IconTitle";
 import type { Classroom, SchoolStage } from "../../domain-types";
 import { api } from "../../lib/api";
+import { saveBlobFile } from "../../lib/downloads";
 import { explainError } from "../../lib/errors";
 import { formatBeijingTime } from "../../lib/format";
 import { SCHOOL_STAGE_OPTIONS, schoolStageLabel } from "../../lib/schoolStages";
@@ -161,13 +162,9 @@ export function StudentAccountManager({
   const exportStudents = async () => {
     try {
       const response = await api.get("/api/students/export", { responseType: "blob" });
-      const url = URL.createObjectURL(response.data);
-      const anchor = document.createElement("a");
-      anchor.href = url;
-      anchor.download = "coderai-students.csv";
-      anchor.click();
-      URL.revokeObjectURL(url);
-      message.success("学生账号 CSV 已导出");
+      if (await saveBlobFile(response.data, "coderai-students.csv")) {
+        message.success("学生账号 CSV 已导出");
+      }
     } catch (error) {
       message.error(explainError(error));
     }

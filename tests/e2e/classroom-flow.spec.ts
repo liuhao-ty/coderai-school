@@ -204,11 +204,13 @@ test("管理员建课、教师双模式排课、学生提交和教师批改形�
   await expect(page.getByRole("button", { name: "添加课程" })).toHaveCount(0);
   await expect(page.getByText("管理员暂未补充", { exact: true })).toHaveCount(6);
 
-  await page.getByRole("menuitem", { name: "排课管理" }).click();
+  await page.getByRole("menuitem", { name: "新建排课" }).click();
   await expect(page.getByRole("heading", { name: "排课管理" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "创建排课" })).toBeVisible();
   await createSchedule(page, PERSONAL_COURSE_TITLE, "学员", STUDENT_NAME);
   await page.locator(".ant-segmented").getByText("按班级", { exact: true }).click();
   await createSchedule(page, CLASS_COURSE_TITLE, "班级", CLASSROOM_NAME);
+  await page.getByRole("menuitem", { name: "排课记录" }).click();
   await expect(page.locator(".ant-table-row").filter({ hasText: PERSONAL_COURSE_TITLE })).toBeVisible();
   await expect(page.locator(".ant-table-row").filter({ hasText: CLASS_COURSE_TITLE })).toBeVisible();
 
@@ -218,7 +220,11 @@ test("管理员建课、教师双模式排课、学生提交和教师批改形�
   await expect(page.locator(".studentScheduleItem").filter({ hasText: PERSONAL_COURSE_TITLE })).toBeVisible();
   await expect(page.locator(".studentScheduleItem").filter({ hasText: CLASS_COURSE_TITLE })).toBeVisible();
   await page.locator(".studentScheduleItem").filter({ hasText: PERSONAL_COURSE_TITLE }).click();
-  await expect(page.getByText("管理员暂未补充", { exact: true })).toHaveCount(3);
+  await expect(page.locator(".studentMaterial")).toHaveCount(1);
+  await expect(page.locator(".studentMaterial")).toContainText("工程包");
+  await expect(page.getByText("管理员暂未补充", { exact: true })).toHaveCount(1);
+  await expect(page.getByText("课堂PPT", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("成果包", { exact: true })).toHaveCount(0);
   await page.locator(".studentSubmitBar").getByRole("combobox").click();
   await page.locator(".ant-select-item-option").filter({ hasText: PROJECT_TITLE }).last().click();
   await page.getByRole("button", { name: "提交作品" }).click();

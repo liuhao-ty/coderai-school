@@ -1,6 +1,6 @@
 # Windows 桌面签名发布
 
-适用版本：`0.2.0-beta.1`
+适用版本：`0.2.0-beta.4`
 
 ## 发布产物
 
@@ -99,8 +99,8 @@ Secrets：
 3. 从审核后的发布提交创建标签：
 
 ```powershell
-git tag -s v0.2.0-beta.1 -m "CoderAI 学堂 0.2.0-beta.1"
-git push origin v0.2.0-beta.1
+git tag -s v0.2.0-beta.4 -m "CoderAI 学堂 0.2.0-beta.4"
+git push origin v0.2.0-beta.4
 ```
 
 4. `release-windows.yml` 导入 PFX，构建签名 NSIS 和 Tauri 更新产物。
@@ -152,11 +152,11 @@ Get-AuthenticodeSignature .\CoderAI*.exe | Format-List Status,StatusMessage,Sign
 
 ## 客户端回滚
 
-Tauri 更新不应通过降低版本号回滚。若 `0.2.0-beta.1` 客户端有严重问题：
+Tauri 更新不应通过降低版本号回滚。若 `0.2.0-beta.4` 客户端有严重问题：
 
 1. 立即停止更新清单下发。
 2. 从已知良好的回滚提交修复或还原代码。
-3. 使用更高版本号（例如 `0.2.0-beta.2`）重新签名发布。
+3. 使用更高版本号（例如 `0.2.0-beta.5`）重新签名发布。
 4. 必要时向灰度用户提供上一稳定安装包的人工卸载重装流程。
 5. 数据库/接口不兼容时先执行服务端回滚评估，不能只替换客户端。
 
@@ -165,8 +165,8 @@ Tauri 更新不应通过降低版本号回滚。若 `0.2.0-beta.1` 客户端有�
 ## 当前阻塞
 
 - 尚无真实 Authenticode PFX
-- 尚未在真实公网 IP 上完成短期 IP 证书签发和续期验证
-- 尚未上传真实签名更新文件到 `/desktop-updates/`
+- 已在真实公网 IP 上完成短期 IP 证书签发及真实续期验证
+- `0.2.0-beta.4` Tauri 签名更新文件需上传到 `/desktop-updates/`
 - 尚无私有 Git 远端及 Environment Secrets
 
-因此当前只能验证未签名本地构建和 GitHub 工作流定义，不能宣称已完成正式签名、SmartScreen 或真实自动更新验收。
+因此当前已完成 Tauri updater 签名与公网分发，但仍不能宣称已完成 Authenticode、SmartScreen 或跨版本自动安装验收。

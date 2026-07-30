@@ -3557,6 +3557,119 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stale.json()["detail"]["code"], "WORKFLOW_MODEL_CHANGED")
         stale_mock.assert_not_awaited()
 
+    async def test_workflow_uses_deepseek_text_and_jimeng_image_routes(self):
+        deepseek = await self.client.post(
+            "/api/settings/providers",
+            headers=self.teacher_headers,
+            json={
+                "name": "DeepSeek 课堂文字",
+                "provider_type": "deepseek",
+                "base_url": "https://api.deepseek.com",
+                "api_key": "deepseek-workflow-secret",
+                "text_model": "deepseek-chat",
+                "image_model": "",
+                "video_model": "",
+                "enabled": True,
+            },
+        )
+        jimeng = await self.client.post(
+            "/api/settings/providers",
+            headers=self.teacher_headers,
+            json={
+                "name": "即梦课堂图片",
+                "provider_type": "volcengine_jimeng",
+                "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+                "api_key": "jimeng-workflow-secret",
+                "text_model": "",
+                "image_model": "doubao-seedream-4-0-250828",
+                "video_model": "",
+                "enabled": True,
+            },
+        )
+        self.assertEqual(deepseek.status_code, 200, deepseek.text)
+        self.assertEqual(jimeng.status_code, 200, jimeng.text)
+        deepseek_id = deepseek.json()["provider"]["id"]
+        jimeng_id = jimeng.json()["provider"]["id"]
+        routes = await self.client.put(
+            "/api/settings/provider-routes",
+            headers=self.teacher_headers,
+            json={"routes": {"text": [deepseek_id], "image": [jimeng_id], "video": []}},
+        )
+        self.assertEqual(routes.status_code, 200, routes.text)
+        catalog = (await self.client.get("/api/models/catalog", headers=self.student_a_headers)).json()["models"]
+        self.assertTrue(any(
+            item["provider_id"] == deepseek_id
+            and item["capability"] == "text"
+            and item["available"]
+            for item in catalog
+        ))
+        self.assertTrue(any(
+            item["provider_id"] == jimeng_id
+            and item["capability"] == "image"
+            and item["model"] == "doubao-seedream-4-0-250828"
+            and item["available"]
+            for item in catalog
+        ))
+        definition = {
+            "nodes": [
+                {"id": "input", "type": "input", "label": "Input"},
+                {
+                    "id": "text",
+                    "type": "text.generate",
+                    "label": "DeepSeek",
+                    "params": {
+                        "mode": "prompt_refine",
+                        "provider_id": deepseek_id,
+                        "provider_type": "deepseek",
+                        "model": "deepseek-chat",
+                    },
+                },
+                {
+                    "id": "image",
+                    "type": "image.generate",
+                    "label": "即梦",
+                    "params": {
+                        "provider_id": jimeng_id,
+                        "provider_type": "volcengine_jimeng",
+                        "model": "doubao-seedream-4-0-250828",
+                    },
+                },
+            ],
+            "edges": [
+                {"id": "input-text", "source": "input", "target": "text"},
+                {"id": "text-image", "source": "text", "target": "image"},
+            ],
+        }
+        workflow = await self.client.post(
+            "/api/workflows",
+            headers=self.teacher_headers,
+            json={"name": "DeepSeek to JiMeng", "status": "published", "definition": definition},
+        )
+        self.assertEqual(workflow.status_code, 200, workflow.text)
+        with (
+            patch("backend.app.main.generate_text", AsyncMock(return_value="refined prompt")) as text_mock,
+            patch(
+                "backend.app.main.generate_image",
+                AsyncMock(return_value={
+                    "url": "https://example.com/jimeng-workflow.png",
+                    "moderation_status": "approved",
+                }),
+            ) as image_mock,
+        ):
+            run = await self.client.post(
+                "/api/workflows/run",
+                headers=self.student_a_headers,
+                json={
+                    "workflow_id": workflow.json()["workflow"]["id"],
+                    "template_id": "custom",
+                    "prompt": "画一间 AI 教室",
+                },
+            )
+        self.assertEqual(run.status_code, 200, run.text)
+        self.assertEqual(text_mock.await_args.kwargs["provider_id"], deepseek_id)
+        self.assertEqual(image_mock.await_args.kwargs["provider_id"], jimeng_id)
+        self.assertEqual(run.json()["output"]["image"]["url"], "https://example.com/jimeng-workflow.png")
+
     async def test_student_csv_import_export_and_formula_safety(self):
         csv_content = "\ufeff姓名,用户名,班级,学生阶段,账号状态,原班级,归档时间\n=演示学生,csv-new,Class A,高阶创作,active,,\n归档学生,csv-archived,Class B,低龄引导,已归档,旧班级,2026-07-13T09:30:00+08:00\n"
         imported = await self.client.post(
@@ -4012,6 +4125,150 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(canceled.status_code, 200)
         self.assertEqual(canceled.json()["run"]["status"], "canceled")
         self.assertEqual(canceled.json()["run"]["node_states"]["input"]["status"], "canceled")
+
+    async def test_workflow_dag_merge_preserves_edge_order_and_terminal_outputs(self):
+        cache_dir = Path(self.temp_dir.name) / "workflow-merge-cache"
+        cache_dir.mkdir()
+        definition = {
+            "nodes": [
+                {"id": "input", "type": "input", "label": "Input"},
+                {"id": "left", "type": "text.generate", "label": "Left", "params": {"mode": "left"}},
+                {"id": "right", "type": "text.generate", "label": "Right", "params": {"mode": "right"}},
+                {"id": "merge", "type": "text.generate", "label": "Merge", "params": {"mode": "merge"}},
+                {"id": "image", "type": "image.generate", "label": "Image"},
+            ],
+            "edges": [
+                {"id": "input-left", "source": "input", "target": "left"},
+                {"id": "input-right", "source": "input", "target": "right"},
+                {"id": "right-merge", "source": "right", "target": "merge"},
+                {"id": "left-merge", "source": "left", "target": "merge"},
+                {"id": "input-image", "source": "input", "target": "image"},
+            ],
+        }
+        created = await self.client.post(
+            "/api/workflows",
+            headers=self.teacher_headers,
+            json={"name": "Branch and merge", "status": "published", "definition": definition},
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        workflow_id = created.json()["workflow"]["id"]
+        merged_inputs: list[str] = []
+
+        async def generate_text_side_effect(_db, prompt, mode, *_args, **_kwargs):
+            if mode == "left":
+                return "LEFT"
+            if mode == "right":
+                return "RIGHT"
+            merged_inputs.append(prompt)
+            return f"MERGED:{prompt}"
+
+        with (
+            patch("backend.app.main.WORKFLOW_CACHE_DIR", cache_dir),
+            patch("backend.app.main.generate_text", AsyncMock(side_effect=generate_text_side_effect)),
+            patch(
+                "backend.app.main.generate_image",
+                AsyncMock(return_value={
+                    "url": "https://example.com/workflow-image.png",
+                    "moderation_status": "approved",
+                }),
+            ),
+        ):
+            started = await self.client.post(
+                "/api/workflows/run-async",
+                headers=self.student_a_headers,
+                json={"template_id": "custom", "workflow_id": workflow_id, "prompt": "IDEA"},
+            )
+        detail = await self.client.get(
+            f"/api/workflows/runs/{started.json()['run']['id']}",
+            headers=self.student_a_headers,
+        )
+        run = detail.json()["run"]
+        self.assertEqual(run["status"], "success")
+        self.assertEqual(merged_inputs, ["RIGHT\n\nLEFT"])
+        output = json.loads(run["output_json"])
+        self.assertEqual(
+            {(item["node_id"], item["status"]) for item in output["terminal_outputs"]},
+            {("merge", "success"), ("image", "success")},
+        )
+        self.assertEqual(len(output["images"]), 1)
+        self.assertEqual(output["image"]["url"], "https://example.com/workflow-image.png")
+        db = self.Session()
+        try:
+            project_id = output["project"]["id"]
+            assets = db.query(Asset).filter(Asset.project_id == project_id).all()
+            self.assertEqual(len(assets), 1)
+            self.assertEqual(assets[0].asset_type, "image")
+        finally:
+            db.close()
+
+    async def test_workflow_partial_failure_blocks_descendants_and_retry_is_scoped(self):
+        cache_dir = Path(self.temp_dir.name) / "workflow-partial-cache"
+        cache_dir.mkdir()
+        definition = {
+            "nodes": [
+                {"id": "input", "type": "input", "label": "Input"},
+                {"id": "failing", "type": "text.generate", "label": "Failing", "params": {"mode": "failing"}},
+                {"id": "healthy", "type": "text.generate", "label": "Healthy", "params": {"mode": "healthy"}},
+                {"id": "descendant", "type": "text.generate", "label": "Descendant", "params": {"mode": "descendant"}},
+            ],
+            "edges": [
+                {"id": "input-failing", "source": "input", "target": "failing"},
+                {"id": "failing-descendant", "source": "failing", "target": "descendant"},
+                {"id": "input-healthy", "source": "input", "target": "healthy"},
+            ],
+        }
+        created = await self.client.post(
+            "/api/workflows",
+            headers=self.teacher_headers,
+            json={"name": "Partial retry", "status": "published", "definition": definition},
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        workflow_id = created.json()["workflow"]["id"]
+        mode_calls: list[str] = []
+        failure_enabled = True
+
+        async def generate_text_side_effect(_db, prompt, mode, *_args, **_kwargs):
+            nonlocal failure_enabled
+            mode_calls.append(mode)
+            if mode == "failing" and failure_enabled:
+                raise HTTPException(status_code=502, detail={"code": "TEST_FAILURE", "message": "branch failed"})
+            return f"{mode}:{prompt}"
+
+        with (
+            patch("backend.app.main.WORKFLOW_CACHE_DIR", cache_dir),
+            patch("backend.app.main.generate_text", AsyncMock(side_effect=generate_text_side_effect)),
+        ):
+            started = await self.client.post(
+                "/api/workflows/run-async",
+                headers=self.student_a_headers,
+                json={"template_id": "custom", "workflow_id": workflow_id, "prompt": "IDEA"},
+            )
+            run_id = started.json()["run"]["id"]
+            failed = (await self.client.get(
+                f"/api/workflows/runs/{run_id}",
+                headers=self.student_a_headers,
+            )).json()["run"]
+            self.assertEqual(failed["status"], "partial_failed")
+            self.assertEqual(failed["node_states"]["failing"]["status"], "failed")
+            self.assertEqual(failed["node_states"]["descendant"]["status"], "blocked")
+            self.assertEqual(failed["node_states"]["healthy"]["status"], "success")
+            failure_enabled = False
+            retried = await self.client.post(
+                f"/api/workflows/runs/{run_id}/retry-node",
+                headers=self.student_a_headers,
+                json={"node_id": "failing"},
+            )
+            self.assertEqual(retried.status_code, 200, retried.text)
+            recovered = (await self.client.get(
+                f"/api/workflows/runs/{run_id}",
+                headers=self.student_a_headers,
+            )).json()["run"]
+        self.assertEqual(recovered["status"], "success")
+        self.assertEqual(recovered["node_states"]["failing"]["status"], "success")
+        self.assertEqual(recovered["node_states"]["descendant"]["status"], "success")
+        self.assertEqual(mode_calls.count("healthy"), 1)
+        self.assertEqual(mode_calls.count("failing"), 2)
+        self.assertEqual(mode_calls.count("descendant"), 1)
 
     async def test_privacy_policy_guardian_consent_enforcement_and_audit(self):
         public_policy = await self.client.get("/api/privacy/policy")
@@ -4525,6 +4782,174 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
         all_schedules = (await self.client.get("/api/course-schedules?include_canceled=true", headers=self.teacher_headers)).json()["schedules"]
         self.assertEqual(next(item for item in all_schedules if item["id"] == future_personal["id"])["status"], "canceled")
 
+    async def test_course_schedule_combined_filters_search_and_pagination(self):
+        classrooms = (await self.client.get("/api/classrooms", headers=self.teacher_headers)).json()["classrooms"]
+        class_a_id = next(item["id"] for item in classrooms if item["name"] == "Class A")
+        class_b_id = next(item["id"] for item in classrooms if item["name"] == "Class B")
+
+        first_package = await self.client.post(
+            "/api/course-packages",
+            headers=self.teacher_headers,
+            json={"title": "筛选课程包 Alpha", "author_user_id": self.admin_user_id},
+        )
+        second_package = await self.client.post(
+            "/api/course-packages",
+            headers=self.teacher_headers,
+            json={"title": "筛选课程包 Beta", "author_user_id": self.admin_user_id},
+        )
+        self.assertEqual(first_package.status_code, 200, first_package.text)
+        self.assertEqual(second_package.status_code, 200, second_package.text)
+        first_package_id = first_package.json()["package"]["id"]
+        second_package_id = second_package.json()["package"]["id"]
+
+        first_course = await self.client.post(
+            f"/api/course-packages/{first_package_id}/courses",
+            headers=self.teacher_headers,
+            json={"title": "Alpha 图像课"},
+        )
+        second_course = await self.client.post(
+            f"/api/course-packages/{first_package_id}/courses",
+            headers=self.teacher_headers,
+            json={"title": "Alpha 文字课"},
+        )
+        third_course = await self.client.post(
+            f"/api/course-packages/{second_package_id}/courses",
+            headers=self.teacher_headers,
+            json={"title": "Beta 工作流课"},
+        )
+        for response in (first_course, second_course, third_course):
+            self.assertEqual(response.status_code, 200, response.text)
+        first_course_id = first_course.json()["course"]["id"]
+        second_course_id = second_course.json()["course"]["id"]
+        third_course_id = third_course.json()["course"]["id"]
+        self.assertEqual(
+            (await self.client.post(
+                f"/api/course-packages/{first_package_id}/publish",
+                headers=self.teacher_headers,
+            )).status_code,
+            200,
+        )
+        self.assertEqual(
+            (await self.client.post(
+                f"/api/course-packages/{second_package_id}/publish",
+                headers=self.teacher_headers,
+            )).status_code,
+            200,
+        )
+
+        current = now()
+        created = await self.client.post(
+            "/api/course-schedules/batch",
+            headers=self.teacher_headers,
+            json={"items": [
+                {
+                    "course_id": first_course_id,
+                    "target_type": "classroom",
+                    "target_id": class_a_id,
+                    "starts_at": (current + timedelta(days=2)).isoformat(),
+                },
+                {
+                    "course_id": second_course_id,
+                    "target_type": "student",
+                    "target_id": 1,
+                    "starts_at": (current - timedelta(hours=1)).isoformat(),
+                },
+                {
+                    "course_id": third_course_id,
+                    "target_type": "classroom",
+                    "target_id": class_b_id,
+                    "starts_at": (current - timedelta(hours=3)).isoformat(),
+                    "due_at": (current - timedelta(hours=2)).isoformat(),
+                },
+                {
+                    "course_id": first_course_id,
+                    "target_type": "student",
+                    "target_id": 2,
+                    "starts_at": (current + timedelta(days=3)).isoformat(),
+                },
+            ]},
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        self.assertEqual(created.json()["created"], 4)
+        canceled_id = next(
+            item["id"]
+            for item in created.json()["schedules"]
+            if item["target_type"] == "student" and item["target_id"] == 2
+        )
+        canceled = await self.client.post(
+            f"/api/course-schedules/{canceled_id}/cancel",
+            headers=self.teacher_headers,
+            json={"reason": "筛选测试取消"},
+        )
+        self.assertEqual(canceled.status_code, 200, canceled.text)
+
+        default_list = (await self.client.get(
+            "/api/course-schedules",
+            headers=self.teacher_headers,
+        )).json()
+        self.assertEqual(default_list["total"], 3)
+        self.assertEqual(default_list["page"], 1)
+        self.assertEqual(default_list["page_size"], 2000)
+
+        filter_cases = (
+            ("target_type=classroom", 2),
+            (f"classroom_id={class_b_id}", 1),
+            ("student_id=1", 1),
+            (f"package_id={first_package_id}", 2),
+            (f"course_id={first_course_id}", 1),
+            ("status=scheduled", 1),
+            ("status=active", 1),
+            ("status=overdue", 1),
+            ("status=canceled", 1),
+            ("q=Beta", 1),
+            ("q=student-a", 1),
+            ("q=Class%20A", 1),
+            (f"target_type=classroom&package_id={second_package_id}&status=overdue", 1),
+        )
+        for query, expected_total in filter_cases:
+            with self.subTest(query=query):
+                response = await self.client.get(
+                    f"/api/course-schedules?{query}",
+                    headers=self.teacher_headers,
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()["total"], expected_total)
+                self.assertEqual(len(response.json()["schedules"]), expected_total)
+
+        paged_first = (await self.client.get(
+            "/api/course-schedules?include_canceled=true&page=1&page_size=2",
+            headers=self.teacher_headers,
+        )).json()
+        paged_second = (await self.client.get(
+            "/api/course-schedules?include_canceled=true&page=2&page_size=2",
+            headers=self.teacher_headers,
+        )).json()
+        self.assertEqual(paged_first["total"], 4)
+        self.assertEqual(paged_first["page"], 1)
+        self.assertEqual(paged_first["page_size"], 2)
+        self.assertEqual(len(paged_first["schedules"]), 2)
+        self.assertEqual(paged_second["total"], 4)
+        self.assertEqual(paged_second["page"], 2)
+        self.assertEqual(len(paged_second["schedules"]), 2)
+        self.assertTrue(
+            {item["id"] for item in paged_first["schedules"]}.isdisjoint(
+                {item["id"] for item in paged_second["schedules"]}
+            )
+        )
+
+        invalid_status = await self.client.get(
+            "/api/course-schedules?status=unknown",
+            headers=self.teacher_headers,
+        )
+        self.assertEqual(invalid_status.status_code, 400)
+        self.assertEqual(invalid_status.json()["detail"]["code"], "COURSE_SCHEDULE_STATUS_INVALID")
+        invalid_target = await self.client.get(
+            "/api/course-schedules?target_type=organization",
+            headers=self.teacher_headers,
+        )
+        self.assertEqual(invalid_target.status_code, 400)
+        self.assertEqual(invalid_target.json()["detail"]["code"], "COURSE_SCHEDULE_TARGET_INVALID")
+
     async def test_course_package_teacher_whitelist_revocation_and_schedule_takeover(self):
         classrooms = (await self.client.get("/api/classrooms", headers=self.teacher_headers)).json()["classrooms"]
         class_a_id = next(item["id"] for item in classrooms if item["name"] == "Class A")
@@ -4672,11 +5097,16 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
         audit_logs = (await self.client.get("/api/audit-logs", headers=self.teacher_headers)).json()["logs"]
         self.assertTrue(any(item["action"] == "curriculum.package.teachers_updated" for item in audit_logs))
 
-    async def test_curriculum_material_permissions_and_result_unlock(self):
+    async def test_curriculum_material_permissions_and_student_workspace(self):
         classrooms = (await self.client.get("/api/classrooms", headers=self.teacher_headers)).json()["classrooms"]
         class_a_id = next(item["id"] for item in classrooms if item["name"] == "Class A")
         teacher_id, staff_headers = await self._create_staff_teacher("materials.teacher", [class_a_id])
         curriculum_root = Path(self.temp_dir.name) / "curriculum"
+        starter_template = (
+            '# Starter\n\n| 项目字段 | 学生填写 |\n| --- | --- |\n'
+            '| 项目名称 | {{field id="project_name" type="text" label="项目名称" required}} |\n'
+            '| 创作方向 | {{field id="direction" type="radio" label="创作方向" options="科技;自然;艺术"}} |'
+        )
         with (
             patch("backend.app.main.CURRICULUM_DIR", curriculum_root),
             patch("backend.app.curriculum.CURRICULUM_DIR", curriculum_root),
@@ -4700,7 +5130,7 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
             )
             course_id = course.json()["course"]["id"]
             for kind, filename, content in (
-                ("starter_markdown", "工程包.md", b"# Starter\nBuild it"),
+                ("starter_markdown", "工程包.md", starter_template.encode("utf-8")),
                 ("result_markdown", "成果包.md", b"# Result\nDone"),
                 ("slides", "课堂PPT.pptx", b"PK\x03\x04fake-pptx"),
             ):
@@ -4753,28 +5183,102 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
             )).status_code, 200)
 
             student_course = (await self.client.get(f"/api/curriculum-courses/{course_id}", headers=self.student_a_headers)).json()["course"]
-            self.assertTrue(student_course["materials"]["slides"]["can_preview"])
+            self.assertEqual(set(student_course["materials"]), {"starter_markdown"})
+            self.assertTrue(student_course["materials"]["starter_markdown"]["can_preview"])
             self.assertTrue(student_course["materials"]["starter_markdown"]["can_download"])
-            self.assertFalse(student_course["materials"]["result_markdown"]["can_preview"])
-            self.assertEqual((await self.client.get(
+            student_slides_preview = await self.client.get(
+                f"/api/curriculum-courses/{course_id}/materials/slides/preview", headers=self.student_a_headers,
+            )
+            self.assertEqual(student_slides_preview.status_code, 403)
+            self.assertEqual(student_slides_preview.json()["detail"]["code"], "COURSE_MATERIAL_PREVIEW_FORBIDDEN")
+            student_slides_download = await self.client.get(
+                f"/api/curriculum-courses/{course_id}/materials/slides/download", headers=self.student_a_headers,
+            )
+            self.assertEqual(student_slides_download.status_code, 403)
+            self.assertEqual(student_slides_download.json()["detail"]["code"], "COURSE_MATERIAL_DOWNLOAD_FORBIDDEN")
+            student_result_preview = await self.client.get(
                 f"/api/curriculum-courses/{course_id}/materials/result_markdown/preview", headers=self.student_a_headers,
+            )
+            self.assertEqual(student_result_preview.status_code, 403)
+            self.assertEqual(student_result_preview.json()["detail"]["code"], "COURSE_RESULT_STUDENT_FORBIDDEN")
+            student_result_download = await self.client.get(
+                f"/api/curriculum-courses/{course_id}/materials/result_markdown/download", headers=self.student_a_headers,
+            )
+            self.assertEqual(student_result_download.status_code, 403)
+            self.assertEqual(student_result_download.json()["detail"]["code"], "COURSE_RESULT_STUDENT_FORBIDDEN")
+
+            initial_workspace = await self.client.get(
+                f"/api/curriculum-courses/{course_id}/workspace", headers=self.student_a_headers,
+            )
+            self.assertEqual(initial_workspace.status_code, 200, initial_workspace.text)
+            self.assertEqual(initial_workspace.json()["workspace"]["content_markdown"], starter_template)
+            self.assertEqual(
+                [field["id"] for field in initial_workspace.json()["workspace"]["fields"]],
+                ["project_name", "direction"],
+            )
+            self.assertEqual(initial_workspace.json()["workspace"]["answers"], {"project_name": "", "direction": ""})
+            self.assertEqual(initial_workspace.json()["workspace"]["validation_warnings"], [])
+            self.assertFalse(initial_workspace.json()["workspace"]["saved"])
+            self.assertIsNone(initial_workspace.json()["workspace"]["project_id"])
+            self.assertEqual((await self.client.get(
+                f"/api/curriculum-courses/{course_id}/workspace", headers=self.student_b_headers,
+            )).status_code, 403)
+            self.assertEqual((await self.client.get(
+                f"/api/curriculum-courses/{course_id}/workspace", headers=staff_headers,
             )).status_code, 403)
 
-            project = await self.client.post(
-                "/api/projects", headers=self.student_a_headers,
-                json={"title": "资料解锁作品", "project_type": "text", "summary": "done"},
+            first_content = starter_template + "\n\n## 我的工程\n\n完成第一版。"
+            saved_workspace = await self.client.put(
+                f"/api/curriculum-courses/{course_id}/workspace",
+                headers=self.student_a_headers,
+                json={
+                    "content_markdown": first_content,
+                    "answers": {"project_name": "AI 花园", "direction": "自然"},
+                },
             )
+            self.assertEqual(saved_workspace.status_code, 200, saved_workspace.text)
+            workspace_project = saved_workspace.json()["project"]
+            project_id = workspace_project["id"]
+            self.assertEqual(workspace_project["curriculum_course_id"], course_id)
+            self.assertEqual(workspace_project["summary"], first_content)
+            self.assertEqual(saved_workspace.json()["workspace"]["project_id"], project_id)
+            self.assertTrue(saved_workspace.json()["workspace"]["saved"])
+            self.assertEqual(
+                saved_workspace.json()["workspace"]["answers"],
+                {"project_name": "AI 花园", "direction": "自然"},
+            )
+
+            second_content = starter_template + "\n\n## 我的工程\n\n完成第二版。"
+            updated_workspace = await self.client.put(
+                f"/api/curriculum-courses/{course_id}/workspace",
+                headers=self.student_a_headers,
+                json={
+                    "content_markdown": second_content,
+                    "answers": {"project_name": "AI 花园第二版", "direction": "科技"},
+                },
+            )
+            self.assertEqual(updated_workspace.status_code, 200, updated_workspace.text)
+            self.assertEqual(updated_workspace.json()["workspace"]["project_id"], project_id)
+            self.assertEqual(updated_workspace.json()["workspace"]["content_markdown"], second_content)
+            self.assertEqual(updated_workspace.json()["workspace"]["answers"]["project_name"], "AI 花园第二版")
+            student_projects = (await self.client.get("/api/projects", headers=self.student_a_headers)).json()["projects"]
+            course_projects = [item for item in student_projects if item["curriculum_course_id"] == course_id]
+            self.assertEqual(len(course_projects), 1)
+            self.assertEqual(course_projects[0]["summary"], second_content)
+
             submitted = await self.client.post(
                 f"/api/course-schedules/{schedule_id}/submissions", headers=self.student_a_headers,
-                json={"project_id": project.json()["project"]["id"]},
+                json={"project_id": project_id},
             )
             self.assertEqual(submitted.status_code, 200, submitted.text)
-            self.assertEqual((await self.client.get(
+            result_after_submission = await self.client.get(
                 f"/api/curriculum-courses/{course_id}/materials/result_markdown/preview", headers=self.student_a_headers,
-            )).status_code, 200)
+            )
+            self.assertEqual(result_after_submission.status_code, 403)
+            self.assertEqual(result_after_submission.json()["detail"]["code"], "COURSE_RESULT_STUDENT_FORBIDDEN")
             self.assertEqual((await self.client.get(
                 f"/api/curriculum-courses/{course_id}/materials/result_markdown/download", headers=self.student_a_headers,
-            )).status_code, 200)
+            )).status_code, 403)
             exported = await self.client.get(f"/api/course-packages/{package_id}/export", headers=self.teacher_headers)
             self.assertEqual(exported.status_code, 200, exported.text)
             with zipfile.ZipFile(io.BytesIO(exported.content)) as archive:

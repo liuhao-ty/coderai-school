@@ -12,7 +12,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlparse
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, or_, text
@@ -57,6 +57,13 @@ from backend.app.db import CLOUD_MODE, DATA_DIR, DATABASE_URL, SessionLocal, def
 from backend.app.audit import record_teacher_audit, teacher_audit_payload
 from backend.app.models import AIProvider, Asset, Classroom, ClassroomTeacher, Course, CourseMaterial, CoursePackage, CoursePackageTeacher, CourseSchedule, CurriculumCourse, FeedbackTemplate, Lesson, ModerationLog, Organization, Project, SubmissionVersion, Task, TaskSubmission, TeacherAuditLog, TeacherSession, UsageLog, User, VideoTask, Workflow, WorkflowRun, now
 from backend.app.curriculum import CURRICULUM_DIR, MATERIAL_KINDS, convert_slides_material, libreoffice_status, materialize_curriculum, store_curriculum_bytes, validate_course_material
+from backend.app.course_fields import (
+    CourseFieldValidationError,
+    course_answers_text,
+    inspect_course_fields,
+    normalize_course_answers,
+    parse_course_fields,
+)
 from backend.app.operations import router as operations_router
 from backend.app.backup import router as backup_router
 from backend.app.privacy import ensure_student_ai_consent, router as privacy_router
@@ -104,6 +111,7 @@ from backend.app.schemas import (
     CourseUpdateRequest,
     CurriculumCourseOrderRequest,
     CurriculumCourseRequest,
+    StudentCourseWorkspaceSaveRequest,
     FeedbackTemplateRequest,
     AssetRegisterRequest,
     ImageGenerateRequest,
@@ -177,7 +185,7 @@ from backend.app.services import (
 )
 
 
-APP_VERSION = "0.2.0-beta.1"
+APP_VERSION = "0.2.0-beta.3"
 
 app = FastAPI(title="CoderAI 学堂 API", version=APP_VERSION)
 app.include_router(operations_router)
@@ -632,15 +640,12 @@ def curriculum_material_permissions(db: Session, material: CourseMaterial, ident
             return material.conversion_status == "ready" and bool(material.preview_path), False
         return True, True
     student = identity["student"]
+    if material.kind != "starter_markdown":
+        return False, False
     started = any(schedule.starts_at <= beijing_now_naive() and schedule.status != "canceled" for schedule in student_course_schedules(db, student, course.id))
     if not started:
         return False, False
-    if material.kind == "slides":
-        return material.conversion_status == "ready" and bool(material.preview_path), False
-    if material.kind == "starter_markdown":
-        return True, True
-    unlocked = student_has_submitted_course(db, student.id, course.id)
-    return unlocked, unlocked
+    return True, True
 
 
 def curriculum_material_payload(db: Session, course: CurriculumCourse, kind: str, identity: dict) -> dict:
@@ -681,6 +686,7 @@ def curriculum_material_payload(db: Session, course: CurriculumCourse, kind: str
 
 def curriculum_course_payload(db: Session, course: CurriculumCourse, identity: dict) -> dict:
     schedules = student_course_schedules(db, identity["student"], course.id, include_canceled=True) if identity["role"] == "student" else []
+    material_kinds = ("starter_markdown",) if identity["role"] == "student" else tuple(COURSE_MATERIAL_LABELS)
     return {
         "id": course.id,
         "package_id": course.package_id,
@@ -691,7 +697,7 @@ def curriculum_course_payload(db: Session, course: CurriculumCourse, identity: d
         "assignment_instructions": course.assignment_instructions,
         "tool_scope": course.tool_scope,
         "rubric": normalize_rubric_payload(course.rubric_json),
-        "materials": {kind: curriculum_material_payload(db, course, kind, identity) for kind in COURSE_MATERIAL_LABELS},
+        "materials": {kind: curriculum_material_payload(db, course, kind, identity) for kind in material_kinds},
         "schedule_ids": [item.id for item in schedules],
         "created_at": course.created_at.isoformat() if course.created_at else None,
         "updated_at": course.updated_at.isoformat() if course.updated_at else None,
@@ -1761,6 +1767,8 @@ def validate_workflow_definition(definition: dict) -> dict:
     if sum(1 for node in normalized_nodes if node["type"] == "input") != 1:
         raise HTTPException(status_code=400, detail={"code": "WORKFLOW_INPUT_REQUIRED", "message": "工作流必须且只能包含一个输入节点。"})
     normalized_edges: list[dict] = []
+    edge_ids: set[str] = set()
+    edge_pairs: set[tuple[str, str]] = set()
     successors = {node_id: [] for node_id in node_ids}
     indegree = {node_id: 0 for node_id in node_ids}
     for index, raw in enumerate(edges):
@@ -1768,9 +1776,14 @@ def validate_workflow_definition(definition: dict) -> dict:
         if source not in indegree or target not in indegree or source == target:
             raise HTTPException(status_code=400, detail={"code": "WORKFLOW_EDGE_INVALID", "message": "工作流包含无效或悬空连线。"})
         edge_id = str(raw.get("id") or f"e-{source}-{target}-{index}")
+        if edge_id in edge_ids or (source, target) in edge_pairs:
+            raise HTTPException(status_code=400, detail={"code": "WORKFLOW_EDGE_DUPLICATE", "message": "工作流不能包含重复连线。"})
+        edge_ids.add(edge_id)
+        edge_pairs.add((source, target))
         normalized_edges.append({"id": edge_id, "source": source, "target": target})
         successors[source].append(target)
         indegree[target] += 1
+    input_id = next(node["id"] for node in normalized_nodes if node["type"] == "input")
     queue = [node_id for node_id, count in indegree.items() if count == 0]
     visited: list[str] = []
     while queue:
@@ -1782,6 +1795,24 @@ def validate_workflow_definition(definition: dict) -> dict:
                 queue.append(target)
     if len(visited) != len(node_ids):
         raise HTTPException(status_code=400, detail={"code": "WORKFLOW_CYCLE", "message": "工作流不能包含循环连线。"})
+    if any(edge["target"] == input_id for edge in normalized_edges):
+        raise HTTPException(status_code=400, detail={"code": "WORKFLOW_INPUT_UPSTREAM_INVALID", "message": "输入节点不能连接上游节点。"})
+    for node in normalized_nodes:
+        if node["type"] == "image.generate" and successors[node["id"]]:
+            raise HTTPException(status_code=400, detail={"code": "WORKFLOW_IMAGE_NOT_TERMINAL", "message": "图片生成节点必须作为终端节点。"})
+    reachable = {input_id}
+    frontier = [input_id]
+    while frontier:
+        current = frontier.pop(0)
+        for target in successors[current]:
+            if target not in reachable:
+                reachable.add(target)
+                frontier.append(target)
+    if len(reachable) != len(node_ids):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "WORKFLOW_NODE_UNREACHABLE", "message": "所有节点都必须从输入节点连通，不能包含悬空或不可达节点。"},
+        )
     return {"nodes": normalized_nodes, "edges": normalized_edges}
 
 
@@ -1990,7 +2021,9 @@ def builtin_workflow_definition(template_id: str) -> tuple[dict, str]:
     return validate_workflow_definition({"nodes": nodes, "edges": edges}), title
 
 
-def workflow_graph(definition: dict) -> tuple[list[str], dict[str, dict], dict[str, list[str]]]:
+def workflow_graph(
+    definition: dict,
+) -> tuple[list[str], dict[str, dict], dict[str, list[str]], dict[str, list[str]]]:
     nodes = {node["id"]: node for node in definition["nodes"]}
     predecessors = {node_id: [] for node_id in nodes}
     successors = {node_id: [] for node_id in nodes}
@@ -2008,7 +2041,71 @@ def workflow_graph(definition: dict) -> tuple[list[str], dict[str, dict], dict[s
             indegree[target] -= 1
             if indegree[target] == 0:
                 queue.append(target)
-    return order, nodes, predecessors
+    return order, nodes, predecessors, successors
+
+
+def workflow_descendants(node_id: str, successors: dict[str, list[str]]) -> set[str]:
+    descendants = {node_id}
+    frontier = [node_id]
+    while frontier:
+        current = frontier.pop(0)
+        for target in successors.get(current, []):
+            if target not in descendants:
+                descendants.add(target)
+                frontier.append(target)
+    return descendants
+
+
+def workflow_source_text(
+    node_id: str,
+    predecessors: dict[str, list[str]],
+    outputs: dict[str, Any],
+) -> str:
+    parts = [
+        value.strip()
+        for source in predecessors[node_id]
+        if isinstance((value := outputs.get(source)), str) and value.strip()
+    ]
+    return "\n\n".join(parts)
+
+
+def workflow_terminal_outputs(
+    order: list[str],
+    nodes: dict[str, dict],
+    successors: dict[str, list[str]],
+    states: dict[str, dict],
+    outputs: dict[str, Any],
+) -> list[dict[str, Any]]:
+    terminal_ids = [node_id for node_id in order if not successors[node_id]]
+    return [
+        {
+            "node_id": node_id,
+            "label": nodes[node_id]["label"],
+            "type": nodes[node_id]["type"],
+            "status": states[node_id]["status"],
+            "output": outputs.get(node_id),
+            "error": states[node_id].get("error", ""),
+        }
+        for node_id in terminal_ids
+    ]
+
+
+def workflow_result_status(
+    terminal_outputs: list[dict[str, Any]],
+    states: dict[str, dict],
+) -> tuple[str, str]:
+    failed_states = [
+        state for state in states.values()
+        if state.get("status") in {"failed", "blocked"}
+    ]
+    if not failed_states:
+        return "success", ""
+    error_message = next(
+        (str(state.get("error") or "") for state in failed_states if state.get("status") == "failed"),
+        "部分节点因上游失败而未运行。",
+    )
+    has_successful_terminal = any(item["status"] == "success" for item in terminal_outputs)
+    return ("partial_failed" if has_successful_terminal else "failed"), error_message
 
 
 def workflow_node_provider_id(db: Session, node: dict, capability: str) -> int | None:
@@ -2051,6 +2148,132 @@ def workflow_cache_path(db: Session, workflow: Workflow | None, node: dict, sour
     return WORKFLOW_CACHE_DIR / f"{digest}.json"
 
 
+def save_workflow_project_result(
+    db: Session,
+    run: WorkflowRun,
+    user: User | None,
+    prompt: str,
+    output_title: str,
+    last_text: str,
+    terminal_outputs: list[dict[str, Any]],
+) -> Project:
+    image_outputs = [
+        item for item in terminal_outputs
+        if item["status"] == "success"
+        and item["type"] == "image.generate"
+        and isinstance(item.get("output"), dict)
+    ]
+    text_sections = [
+        f"## {item['label']}\n{item['output']}"
+        for item in terminal_outputs
+        if item["status"] == "success"
+        and item["type"] in {"input", "text.generate"}
+        and isinstance(item.get("output"), str)
+    ]
+    summary = "\n\n".join([
+        "# 工作流作品",
+        f"## 输入\n{prompt}",
+        *(text_sections or [f"## {output_title}\n{last_text}"]),
+        *(
+            [f"## 图片结果\n已生成 {len(image_outputs)} 张图片，可在作品素材中查看。"]
+            if image_outputs else []
+        ),
+    ])
+    image_results = [item["output"] for item in image_outputs]
+    first_image = image_results[0] if image_results else {}
+    statuses = [str(item.get("moderation_status") or "approved") for item in image_results]
+    moderation_status = "rejected" if "rejected" in statuses else "pending" if "pending" in statuses else "approved"
+    moderation_reason = "；".join(
+        dict.fromkeys(
+            str(item.get("moderation_reason") or "").strip()
+            for item in image_results
+            if str(item.get("moderation_reason") or "").strip()
+        )
+    )
+
+    existing_project = None
+    try:
+        existing_project_id = int((json.loads(run.output_json or "{}").get("project") or {}).get("id") or 0)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        existing_project_id = 0
+    if existing_project_id:
+        candidate = db.get(Project, existing_project_id)
+        if candidate and candidate.project_type == "workflow" and candidate.user_id == run.user_id:
+            existing_project = candidate
+
+    if existing_project:
+        project = existing_project
+        project.title = f"工作流作品：{prompt[:24]}"
+        project.summary = summary
+        project.file_path = str(first_image.get("file_path") or first_image.get("url") or "")
+        project.moderation_status = moderation_status
+        project.moderation_reason = moderation_reason
+        project.moderation_log_id = first_image.get("moderation_log_id")
+        db.query(Asset).filter(Asset.project_id == project.id).delete(synchronize_session=False)
+        db.commit()
+        db.refresh(project)
+    else:
+        project = save_project(
+            db,
+            f"工作流作品：{prompt[:24]}",
+            "workflow",
+            summary,
+            str(first_image.get("file_path") or first_image.get("url") or ""),
+            student=user,
+            moderation_status=moderation_status,
+            moderation_reason=moderation_reason,
+            moderation_log_id=first_image.get("moderation_log_id"),
+            owner_teacher_id=run.owner_teacher_id,
+        )
+
+    for item in image_outputs:
+        image = item["output"]
+        reference = str(image.get("file_path") or image.get("url") or "")
+        if not reference:
+            continue
+        try:
+            inspection = inspect_asset("image", reference)
+        except HTTPException:
+            parsed_name = reference_name(reference) if is_object_reference(reference) else Path(urlparse(reference).path).name
+            extension = Path(parsed_name).suffix.lower() or ".png"
+            inspection = {
+                "size": 0,
+                "extension": extension,
+                "mime_type": mimetypes.guess_type(parsed_name)[0] or "image/png",
+                "checksum": "",
+                "safety_status": "remote_unverified" if reference.startswith("https://") else "unverified",
+            }
+        original_name = (
+            Path(urlparse(reference).path).name
+            if reference.startswith(("http://", "https://"))
+            else reference_name(reference)
+        ) or f"{item['node_id']}.png"
+        db.add(Asset(
+            owner_teacher_id=run.owner_teacher_id,
+            project_id=project.id,
+            classroom_id=run.classroom_id,
+            asset_type="image",
+            file_path=reference,
+            metadata_json=json_dumps({
+                "name": item["label"],
+                "description": "工作流终端图片输出",
+                "tags": ["工作流", "AI 图片"],
+                "workflow_run_id": run.id,
+                "workflow_node_id": item["node_id"],
+            }),
+            original_name=original_name,
+            mime_type=inspection["mime_type"],
+            file_size=inspection["size"],
+            file_extension=inspection["extension"],
+            checksum_sha256=inspection["checksum"],
+            safety_status=inspection["safety_status"],
+        ))
+        attach_image_moderation(db, project, image.get("moderation_log_id"))
+    db.commit()
+    db.refresh(project)
+    return project
+
+
 async def execute_workflow_run_background(
     run_id: int,
     retry_from_node: str | None = None,
@@ -2084,7 +2307,7 @@ async def _execute_workflow_run_background(run_id: int, retry_from_node: str | N
             output_title = workflow.name
         else:
             definition, output_title = builtin_workflow_definition(str(request.get("template_id") or "text_to_image"))
-        order, nodes, predecessors = workflow_graph(definition)
+        order, nodes, predecessors, successors = workflow_graph(definition)
         if retry_from_node and retry_from_node not in nodes:
             run.status, run.error_message = "failed", "要重试的节点不存在。"
             db.commit()
@@ -2092,9 +2315,9 @@ async def _execute_workflow_run_background(run_id: int, retry_from_node: str | N
         states = json.loads(run.node_states_json or "{}")
         if not states:
             states = {node_id: {"status": "pending", "label": nodes[node_id]["label"], "type": nodes[node_id]["type"], "output": None, "error": "", "cached": False} for node_id in order}
-        start_index = order.index(retry_from_node) if retry_from_node else 0
+        retry_nodes = workflow_descendants(retry_from_node, successors) if retry_from_node else set(order)
         if retry_from_node:
-            for node_id in order[start_index:]:
+            for node_id in retry_nodes:
                 states[node_id].update({"status": "pending", "output": None, "error": "", "cached": False})
         run.status = "running"
         run.cancel_requested = False
@@ -2104,23 +2327,20 @@ async def _execute_workflow_run_background(run_id: int, retry_from_node: str | N
         run_moderation(db, prompt, user_id=run.user_id)
         user = db.query(User).filter(User.id == run.user_id).first() if run.user_id else None
         age_level = user.age_level if user else "mixed"
-        outputs: dict[str, Any] = {}
-        last_text = prompt
-        last_image = None
-        for index, node_id in enumerate(order):
+        outputs: dict[str, Any] = {
+            node_id: state.get("output")
+            for node_id, state in states.items()
+            if node_id not in retry_nodes and state.get("status") == "success" and state.get("output") is not None
+        }
+        for node_id in order:
             node = nodes[node_id]
-            if index < start_index:
-                previous_output = states.get(node_id, {}).get("output")
-                if previous_output is not None:
-                    outputs[node_id] = previous_output
-                    if isinstance(previous_output, str):
-                        last_text = previous_output
-                    elif isinstance(previous_output, dict):
-                        last_image = previous_output
+            if node_id not in retry_nodes:
                 continue
             db.refresh(run)
             if run.cancel_requested:
-                states[node_id]["status"] = "canceled"
+                for pending_id in order:
+                    if states[pending_id].get("status") in {"pending", "running"}:
+                        states[pending_id].update({"status": "canceled", "error": "运行已取消。"})
                 run.status = "canceled"
                 run.error_message = "运行已取消；正在调用的云端节点无法即时中断。"
                 run.node_states_json = json_dumps(states)
@@ -2132,14 +2352,26 @@ async def _execute_workflow_run_background(run_id: int, retry_from_node: str | N
                 run.node_states_json = json_dumps(states)
                 db.commit()
                 continue
-            source_values = [outputs[source] for source in predecessors[node_id] if source in outputs]
-            source_text = next((value for value in reversed(source_values) if isinstance(value, str) and value.strip()), last_text)
-            if not source_text.strip():
-                states[node_id].update({"status": "failed", "error": "节点没有可用的文字输入。"})
-                run.status, run.error_message = "failed", "节点没有可用的文字输入。"
+            failed_upstreams = [
+                source for source in predecessors[node_id]
+                if states.get(source, {}).get("status") in {"failed", "blocked", "canceled"}
+            ]
+            if failed_upstreams:
+                states[node_id].update({
+                    "status": "blocked",
+                    "output": None,
+                    "error": "上游节点失败或取消，当前节点未运行。",
+                    "cached": False,
+                })
                 run.node_states_json = json_dumps(states)
                 db.commit()
-                return
+                continue
+            source_text = workflow_source_text(node_id, predecessors, outputs)
+            if not source_text.strip():
+                states[node_id].update({"status": "failed", "error": "节点没有可用的文字输入。"})
+                run.node_states_json = json_dumps(states)
+                db.commit()
+                continue
             cache_path = workflow_cache_path(db, workflow, node, source_text)
             states[node_id].update({"status": "running", "error": "", "cached": False})
             run.node_states_json = json_dumps(states)
@@ -2172,16 +2404,14 @@ async def _execute_workflow_run_background(run_id: int, retry_from_node: str | N
                     if not node_output.get("url") and not node_output.get("file_path"):
                         raise ValueError("图片节点没有返回可用结果。")
                 outputs[node_id] = node_output
-                if isinstance(node_output, str):
-                    last_text = node_output
-                else:
-                    last_image = node_output
                 states[node_id].update({"status": "success", "output": safe_image_output(node_output, {"role": "student"}), "error": ""})
                 run.node_states_json = json_dumps(states)
                 db.commit()
                 db.refresh(run)
                 if run.cancel_requested:
-                    states[node_id]["status"] = "canceled"
+                    for pending_id in order:
+                        if states[pending_id].get("status") in {"pending", "running"}:
+                            states[pending_id].update({"status": "canceled", "error": "运行已取消。"})
                     run.status = "canceled"
                     run.error_message = "运行已取消；当前云端节点已完成，但后续结果未保存为作品。"
                     run.node_states_json = json_dumps(states)
@@ -2190,29 +2420,46 @@ async def _execute_workflow_run_background(run_id: int, retry_from_node: str | N
             except Exception as exc:
                 message = exc.detail.get("message", str(exc)) if isinstance(exc, HTTPException) and isinstance(exc.detail, dict) else str(exc)
                 states[node_id].update({"status": "failed", "error": message})
-                run.status, run.error_message = "failed", message
                 run.node_states_json = json_dumps(states)
                 db.commit()
-                return
-        output: dict[str, Any] = {"text": last_text, "output_title": output_title, "node_outputs": outputs}
-        if last_image:
-            output.update({"refined_prompt": last_text, "image": last_image})
-        project = save_project(
-            db,
-            f"工作流作品：{prompt[:24]}",
-            "workflow",
-            "\n\n".join(["# 工作流作品", f"## 输入\n{prompt}", f"## {output_title}\n{last_text}"]),
-            (last_image.get("file_path") or last_image.get("url", "")) if last_image else "",
-            student=user,
-            moderation_status=str(last_image.get("moderation_status") or "approved") if last_image else "approved",
-            moderation_reason=str(last_image.get("moderation_reason") or "") if last_image else "",
-            moderation_log_id=last_image.get("moderation_log_id") if last_image else None,
-        )
-        if last_image:
-            attach_image_moderation(db, project, last_image.get("moderation_log_id"))
-        output = safe_image_output(output, {"role": "student"})
-        output["project"] = project_payload_for_identity(project, {"role": "student"})
-        run.status = "success"
+                continue
+
+        terminal_outputs = workflow_terminal_outputs(order, nodes, successors, states, outputs)
+        final_status, error_message = workflow_result_status(terminal_outputs, states)
+        successful_texts = [
+            outputs[node_id] for node_id in order
+            if states[node_id]["status"] == "success" and isinstance(outputs.get(node_id), str)
+        ]
+        last_text = successful_texts[-1] if successful_texts else prompt
+        terminal_images = [
+            item["output"] for item in terminal_outputs
+            if item["status"] == "success" and item["type"] == "image.generate" and isinstance(item.get("output"), dict)
+        ]
+        output: dict[str, Any] = {
+            "text": last_text,
+            "output_title": output_title,
+            "node_outputs": outputs,
+            "terminal_outputs": terminal_outputs,
+        }
+        if terminal_images:
+            output.update({"refined_prompt": last_text, "image": terminal_images[0], "images": terminal_images})
+        has_successful_terminal = any(item["status"] == "success" for item in terminal_outputs)
+        if has_successful_terminal:
+            project = save_workflow_project_result(
+                db,
+                run,
+                user,
+                prompt,
+                output_title,
+                last_text,
+                terminal_outputs,
+            )
+            output = safe_image_output(output, {"role": "student"})
+            output["project"] = project_payload_for_identity(project, {"role": "student"})
+        else:
+            output = safe_image_output(output, {"role": "student"})
+        run.status = final_status
+        run.error_message = error_message
         run.output_json = json_dumps(output)
         run.node_states_json = json_dumps(states)
         db.commit()
@@ -2279,7 +2526,7 @@ def cancel_workflow_run(
     db: Session = Depends(get_db),
 ):
     run = require_workflow_run_access(db, run_id, identity)
-    if run.status in {"success", "failed", "canceled"}:
+    if run.status in {"success", "failed", "partial_failed", "canceled"}:
         raise HTTPException(status_code=409, detail={"code": "WORKFLOW_RUN_FINAL", "message": "工作流运行已经结束。"})
     run.cancel_requested = True
     if run.status == "pending":
@@ -2304,7 +2551,7 @@ def retry_workflow_node(
     db: Session = Depends(get_db),
 ):
     run = require_workflow_run_access(db, run_id, identity)
-    if run.status not in {"failed", "canceled"}:
+    if run.status not in {"failed", "partial_failed", "canceled"}:
         raise HTTPException(status_code=409, detail={"code": "WORKFLOW_RETRY_NOT_ALLOWED", "message": "只有失败或取消的运行可以从节点继续。"})
     states = json.loads(run.node_states_json or "{}")
     state = states.get(payload.node_id)
@@ -2341,49 +2588,97 @@ async def execute_saved_workflow(
     user_id: int | None = None,
 ) -> tuple[dict, str, dict | None, str]:
     definition = validate_workflow_definition(json.loads(workflow.definition_json or "{}"))
-    nodes = {node["id"]: node for node in definition["nodes"]}
-    predecessors = {node_id: [] for node_id in nodes}
-    successors = {node_id: [] for node_id in nodes}
-    indegree = {node_id: 0 for node_id in nodes}
-    for edge in definition["edges"]:
-        predecessors[edge["target"]].append(edge["source"])
-        successors[edge["source"]].append(edge["target"])
-        indegree[edge["target"]] += 1
-    queue = [node_id for node_id, count in indegree.items() if count == 0]
-    order: list[str] = []
-    while queue:
-        current = queue.pop(0)
-        order.append(current)
-        for target in successors[current]:
-            indegree[target] -= 1
-            if indegree[target] == 0:
-                queue.append(target)
-
+    order, nodes, predecessors, successors = workflow_graph(definition)
     outputs: dict[str, Any] = {}
-    last_text = prompt
-    last_image = None
+    states = {
+        node_id: {
+            "status": "pending",
+            "label": nodes[node_id]["label"],
+            "type": nodes[node_id]["type"],
+            "output": None,
+            "error": "",
+            "cached": False,
+        }
+        for node_id in order
+    }
+    failures: list[Exception] = []
     for node_id in order:
         node = nodes[node_id]
         if node["type"] == "input":
             outputs[node_id] = prompt
+            states[node_id].update({"status": "success", "output": prompt})
             continue
-        source_values = [outputs[source] for source in predecessors[node_id] if source in outputs]
-        source_text = next((value for value in reversed(source_values) if isinstance(value, str)), last_text)
-        if node["type"] == "text.generate":
-            mode = str(node["params"].get("mode") or "prompt_refine")
-            provider_id = workflow_node_provider_id(db, node, "text")
-            last_text = await generate_text(db, source_text, mode, age_level, user_id=user_id, provider_id=provider_id)
-            outputs[node_id] = last_text
-        elif node["type"] == "image.generate":
-            style = str(node["params"].get("style") or "classroom-friendly")
-            size = str(node["params"].get("size") or "1024x1024")
-            provider_id = workflow_node_provider_id(db, node, "image")
-            last_image = await generate_image(db, source_text, style, size, user_id=user_id, provider_id=provider_id)
-            outputs[node_id] = last_image
-    output = {"text": last_text, "output_title": workflow.name, "node_outputs": outputs}
+        if any(states[source]["status"] in {"failed", "blocked", "canceled"} for source in predecessors[node_id]):
+            states[node_id].update({
+                "status": "blocked",
+                "error": "上游节点失败或取消，当前节点未运行。",
+            })
+            continue
+        source_text = workflow_source_text(node_id, predecessors, outputs)
+        if not source_text:
+            error = ValueError("节点没有可用的文字输入。")
+            states[node_id].update({"status": "failed", "error": str(error)})
+            failures.append(error)
+            continue
+        try:
+            if node["type"] == "text.generate":
+                mode = str(node["params"].get("mode") or "prompt_refine")
+                provider_id = workflow_node_provider_id(db, node, "text")
+                node_output = await generate_text(
+                    db,
+                    source_text,
+                    mode,
+                    age_level,
+                    user_id=user_id,
+                    provider_id=provider_id,
+                )
+            else:
+                style = str(node["params"].get("style") or "classroom-friendly")
+                size = str(node["params"].get("size") or "1024x1024")
+                provider_id = workflow_node_provider_id(db, node, "image")
+                node_output = await generate_image(
+                    db,
+                    source_text,
+                    style,
+                    size,
+                    user_id=user_id,
+                    provider_id=provider_id,
+                )
+                if not node_output.get("url") and not node_output.get("file_path"):
+                    raise ValueError("图片节点没有返回可用结果。")
+            outputs[node_id] = node_output
+            states[node_id].update({"status": "success", "output": node_output})
+        except Exception as exc:
+            message = exc.detail.get("message", str(exc)) if isinstance(exc, HTTPException) and isinstance(exc.detail, dict) else str(exc)
+            states[node_id].update({"status": "failed", "error": message})
+            failures.append(exc)
+
+    terminal_outputs = workflow_terminal_outputs(order, nodes, successors, states, outputs)
+    execution_status, error_message = workflow_result_status(terminal_outputs, states)
+    if execution_status == "failed" and failures:
+        raise failures[0]
+    successful_texts = [
+        outputs[node_id] for node_id in order
+        if states[node_id]["status"] == "success" and isinstance(outputs.get(node_id), str)
+    ]
+    last_text = successful_texts[-1] if successful_texts else prompt
+    terminal_images = [
+        item["output"] for item in terminal_outputs
+        if item["status"] == "success" and item["type"] == "image.generate" and isinstance(item.get("output"), dict)
+    ]
+    last_image = terminal_images[0] if terminal_images else None
+    output = {
+        "text": last_text,
+        "output_title": workflow.name,
+        "node_outputs": outputs,
+        "terminal_outputs": terminal_outputs,
+        "execution_status": execution_status,
+        "error_message": error_message,
+    }
     if last_image:
         output["refined_prompt"] = last_text
         output["image"] = last_image
+        output["images"] = terminal_images
     return output, last_text, last_image, workflow.name
 
 
@@ -2447,32 +2742,38 @@ async def run_workflow(
                 output = {"refined_prompt": text, "image": image, "output_title": output_title}
         project = None
         if identity["role"] != "anonymous":
-            summary_parts = ["# 工作流作品", f"## 输入\n{payload.prompt}", f"## {output_title}\n{text}"]
-            if image:
-                summary_parts.extend(
-                    [
-                        "## 生成图片",
-                        f"- 图片链接：{image.get('url') or '无'}",
-                        f"- 本地文件：{image.get('file_path') or '无'}",
-                    ]
+            terminal_outputs = output.get("terminal_outputs")
+            if saved_workflow and isinstance(terminal_outputs, list):
+                project = save_workflow_project_result(
+                    db,
+                    run,
+                    identity["student"],
+                    payload.prompt,
+                    output_title,
+                    text,
+                    terminal_outputs,
                 )
-            summary = "\n\n".join(summary_parts)
-            project = save_project(
-                db,
-                f"工作流作品：{payload.prompt[:24]}",
-                "workflow",
-                summary,
-                (image.get("file_path") or image.get("url", "")) if image else "",
-                student=identity["student"],
-                moderation_status=str(image.get("moderation_status") or "approved") if image else "approved",
-                moderation_reason=str(image.get("moderation_reason") or "") if image else "",
-                moderation_log_id=image.get("moderation_log_id") if image else None,
-                owner_teacher_id=run.owner_teacher_id,
-            )
-            if image:
-                attach_image_moderation(db, project, image.get("moderation_log_id"))
+            else:
+                summary_parts = ["# 工作流作品", f"## 输入\n{payload.prompt}", f"## {output_title}\n{text}"]
+                if image:
+                    summary_parts.append("## 生成图片\n已生成 1 张图片，可在作品预览中查看。")
+                project = save_project(
+                    db,
+                    f"工作流作品：{payload.prompt[:24]}",
+                    "workflow",
+                    "\n\n".join(summary_parts),
+                    (image.get("file_path") or image.get("url", "")) if image else "",
+                    student=identity["student"],
+                    moderation_status=str(image.get("moderation_status") or "approved") if image else "approved",
+                    moderation_reason=str(image.get("moderation_reason") or "") if image else "",
+                    moderation_log_id=image.get("moderation_log_id") if image else None,
+                    owner_teacher_id=run.owner_teacher_id,
+                )
+                if image:
+                    attach_image_moderation(db, project, image.get("moderation_log_id"))
         public_output = safe_image_output(output, identity)
-        run.status = "success"
+        run.status = str(output.get("execution_status") or "success")
+        run.error_message = str(output.get("error_message") or "")
         run.output_json = json_dumps(public_output)
         db.commit()
         return {
@@ -3548,6 +3849,171 @@ def get_curriculum_course(course_id: int, identity: dict = Depends(require_stude
     return {"course": curriculum_course_payload(db, course, identity)}
 
 
+MAX_STUDENT_COURSE_WORKSPACE_BYTES = 2 * 1024 * 1024
+
+
+def student_course_workspace_context(
+    db: Session,
+    course_id: int,
+    student: User,
+) -> tuple[CurriculumCourse, CourseMaterial, dict]:
+    course = curriculum_course_or_404(db, course_id)
+    identity = {"role": "student", "teacher": None, "student": student}
+    ensure_curriculum_course_read_access(db, course, identity)
+    material = db.query(CourseMaterial).filter_by(
+        course_id=course.id,
+        kind="starter_markdown",
+    ).first()
+    if not material:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "COURSE_STARTER_MISSING", "message": "管理员暂未补充工程包。"},
+        )
+    can_preview, _ = curriculum_material_permissions(db, material, identity)
+    if not can_preview:
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "COURSE_STARTER_NOT_STARTED", "message": "课程开始后才能查看和编辑工程包。"},
+        )
+    return course, material, identity
+
+
+def student_course_project(db: Session, course_id: int, student_id: int) -> Project | None:
+    return db.query(Project).filter(
+        Project.curriculum_course_id == course_id,
+        Project.user_id == student_id,
+    ).first()
+
+
+def student_course_workspace_payload(
+    db: Session,
+    course: CurriculumCourse,
+    material: CourseMaterial,
+    student: User,
+    project: Project | None = None,
+) -> dict:
+    project = project or student_course_project(db, course.id, student.id)
+    if project:
+        content = project.summary
+    else:
+        try:
+            with materialize_curriculum(material.source_path, suffix=".md") as source_path:
+                if source_path.stat().st_size > MAX_STUDENT_COURSE_WORKSPACE_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail={"code": "COURSE_STARTER_TOO_LARGE", "message": "工程包内容过大，暂不支持在线编辑。"},
+                    )
+                content = source_path.read_text(encoding="utf-8")
+        except HTTPException:
+            raise
+        except (FileNotFoundError, OSError, ValueError, UnicodeError) as exc:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "COURSE_STARTER_FILE_MISSING", "message": "工程包文件已缺失，请联系管理员重新上传。"},
+            ) from exc
+    fields, validation_warnings = inspect_course_fields(content)
+    answers: dict[str, Any] = {}
+    if project and project.workspace_answers_json:
+        try:
+            loaded_answers = json.loads(project.workspace_answers_json)
+            if isinstance(loaded_answers, dict):
+                answers = loaded_answers
+            else:
+                validation_warnings.append("已保存的工程包答案格式不正确，已忽略。")
+        except json.JSONDecodeError:
+            validation_warnings.append("已保存的工程包答案无法读取，已忽略。")
+    try:
+        answers = normalize_course_answers(fields, answers)
+    except CourseFieldValidationError as exc:
+        validation_warnings.append(str(exc))
+        answers = {}
+    return {
+        "course_id": course.id,
+        "material_id": material.id,
+        "title": course.title,
+        "original_name": material.original_name,
+        "content_markdown": content,
+        "fields": [{key: value for key, value in field.items() if key != "marker"} for field in fields],
+        "answers": answers,
+        "validation_warnings": validation_warnings,
+        "saved": project is not None,
+        "project_id": project.id if project else None,
+        "project_status": project.lifecycle_status if project else "",
+        "updated_at": project.updated_at.isoformat() if project and project.updated_at else None,
+    }
+
+
+@app.get("/api/curriculum-courses/{course_id}/workspace")
+def get_student_course_workspace(
+    course_id: int,
+    student: User = Depends(require_student_account),
+    db: Session = Depends(get_db),
+):
+    course, material, _ = student_course_workspace_context(db, course_id, student)
+    return {"workspace": student_course_workspace_payload(db, course, material, student)}
+
+
+@app.put("/api/curriculum-courses/{course_id}/workspace")
+def save_student_course_workspace(
+    course_id: int,
+    payload: StudentCourseWorkspaceSaveRequest,
+    student: User = Depends(require_student_account),
+    db: Session = Depends(get_db),
+):
+    course, material, _ = student_course_workspace_context(db, course_id, student)
+    project = student_course_project(db, course.id, student.id)
+    try:
+        fields = parse_course_fields(payload.content_markdown)
+        existing_answers: dict[str, Any] = {}
+        if project and project.workspace_answers_json:
+            try:
+                decoded = json.loads(project.workspace_answers_json)
+                existing_answers = decoded if isinstance(decoded, dict) else {}
+            except json.JSONDecodeError:
+                existing_answers = {}
+        answers = normalize_course_answers(
+            fields,
+            payload.answers if payload.answers is not None else existing_answers,
+        )
+    except CourseFieldValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "COURSE_WORKSPACE_FIELDS_INVALID", "message": str(exc)},
+        ) from exc
+    moderation_content = "\n\n".join(
+        item for item in (payload.content_markdown, course_answers_text(fields, answers)) if item
+    )
+    run_moderation(db, moderation_content, user_id=student.id)
+    if not project:
+        project = Project(
+            title=f"{course.title} - 工程包"[:160],
+            project_type="text",
+            user_id=student.id,
+            curriculum_course_id=course.id,
+            classroom_id=student.classroom_id,
+            owner_name=student.name,
+            summary=payload.content_markdown,
+            workspace_answers_json=json_dumps(answers),
+        )
+        db.add(project)
+    else:
+        project.summary = payload.content_markdown
+        project.workspace_answers_json = json_dumps(answers)
+        project.classroom_id = student.classroom_id
+        project.owner_name = student.name
+        project.lifecycle_status = "active"
+        project.archived_at = None
+        project.trashed_at = None
+        project.moderation_status = "approved"
+        project.moderation_reason = ""
+    db.commit()
+    db.refresh(project)
+    return {
+        "workspace": student_course_workspace_payload(db, course, material, student, project),
+        "project": to_project_dict(project),
+    }
+
+
 @app.put("/api/curriculum-courses/{course_id}")
 def update_curriculum_course(
     course_id: int,
@@ -3599,6 +4065,16 @@ async def upload_curriculum_material(
         metadata = validate_course_material(kind, file.filename or "", content)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail={"code": "COURSE_MATERIAL_INVALID", "message": str(exc)})
+    form_fields: list[dict[str, Any]] = []
+    if kind == "starter_markdown":
+        try:
+            markdown = content.decode("utf-8")
+            form_fields = parse_course_fields(markdown)
+        except CourseFieldValidationError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "COURSE_MATERIAL_FIELDS_INVALID", "message": str(exc)},
+            ) from exc
     target_name = "slides.pptx" if kind == "slides" else "starter.md" if kind == "starter_markdown" else "result.md"
     reference = store_curriculum_bytes(
         course.package_id,
@@ -3629,7 +4105,11 @@ async def upload_curriculum_material(
         delete_curriculum_file(old_preview)
         enqueue_slides_conversion(background_tasks, convert_slides_material, material.id)
     record_teacher_audit(db, teacher, "curriculum.material.updated", target_type="course_material", target_id=material.id, summary=f"更新{COURSE_MATERIAL_LABELS[kind]}：{course.title}")
-    return {"material": curriculum_material_payload(db, course, kind, {"role": "teacher", "teacher": actor, "student": None})}
+    return {
+        "material": curriculum_material_payload(db, course, kind, {"role": "teacher", "teacher": actor, "student": None}),
+        "form_fields": [{key: value for key, value in field.items() if key != "marker"} for field in form_fields],
+        "validation_warnings": [],
+    }
 
 
 @app.delete("/api/curriculum-courses/{course_id}/materials/{kind}")
@@ -3680,8 +4160,10 @@ def preview_curriculum_material(
     _, material = curriculum_material_or_404(db, course_id, kind)
     can_preview, _ = curriculum_material_permissions(db, material, identity)
     if not can_preview:
-        code = "COURSE_RESULT_LOCKED" if kind == "result_markdown" and identity["role"] == "student" else "COURSE_MATERIAL_PREVIEW_FORBIDDEN"
-        raise HTTPException(status_code=403, detail={"code": code, "message": "当前账号暂不能预览这项课程资料。"})
+        student_result_forbidden = kind == "result_markdown" and identity["role"] == "student"
+        code = "COURSE_RESULT_STUDENT_FORBIDDEN" if student_result_forbidden else "COURSE_MATERIAL_PREVIEW_FORBIDDEN"
+        message = "学生端不开放成果包。" if student_result_forbidden else "当前账号暂不能预览这项课程资料。"
+        raise HTTPException(status_code=403, detail={"code": code, "message": message})
     if kind == "slides":
         if material.conversion_status != "ready" or not material.preview_path:
             raise HTTPException(status_code=409, detail={"code": "COURSE_SLIDES_PREVIEW_UNAVAILABLE", "message": "PPT 预览暂不可用，管理员可检查转换状态并重试。"})
@@ -3705,8 +4187,10 @@ def download_curriculum_material(
     _, material = curriculum_material_or_404(db, course_id, kind)
     _, can_download = curriculum_material_permissions(db, material, identity)
     if not can_download:
-        code = "COURSE_MATERIAL_DOWNLOAD_FORBIDDEN" if kind == "slides" else "COURSE_RESULT_LOCKED"
-        raise HTTPException(status_code=403, detail={"code": code, "message": "当前账号不能下载这项课程资料。"})
+        student_result_forbidden = kind == "result_markdown" and identity["role"] == "student"
+        code = "COURSE_RESULT_STUDENT_FORBIDDEN" if student_result_forbidden else "COURSE_MATERIAL_DOWNLOAD_FORBIDDEN"
+        message = "学生端不开放成果包。" if student_result_forbidden else "当前账号不能下载这项课程资料。"
+        raise HTTPException(status_code=403, detail={"code": code, "message": message})
     if not object_exists(material.source_path):
         raise HTTPException(status_code=404, detail={"code": "COURSE_MATERIAL_FILE_MISSING", "message": "课程资料记录存在，但文件已缺失。"})
     return curriculum_file_response(
@@ -4392,17 +4876,75 @@ def create_course_schedules(
 @app.get("/api/course-schedules")
 def list_course_schedules(
     include_canceled: bool = False,
+    status: str = "",
+    target_type: str = "",
+    classroom_id: int | None = None,
+    student_id: int | None = None,
+    package_id: int | None = None,
+    course_id: int | None = None,
+    q: str = Query(default="", max_length=160),
+    page: int | None = Query(default=None, ge=1),
+    page_size: int | None = Query(default=None, ge=1, le=100),
     identity: dict = Depends(require_student_or_teacher),
     db: Session = Depends(get_db),
 ):
+    allowed_statuses = {"", "scheduled", "active", "overdue", "canceled"}
+    if status not in allowed_statuses:
+        raise HTTPException(status_code=400, detail={"code": "COURSE_SCHEDULE_STATUS_INVALID", "message": "排课状态筛选不正确。"})
+    if target_type not in {"", "student", "classroom"}:
+        raise HTTPException(status_code=400, detail={"code": "COURSE_SCHEDULE_TARGET_INVALID", "message": "排课目标类型筛选不正确。"})
     query = db.query(CourseSchedule)
-    if not include_canceled:
+    if not include_canceled and status != "canceled":
         query = query.filter(CourseSchedule.status != "canceled")
+    if target_type:
+        query = query.filter(CourseSchedule.target_type == target_type)
+    if classroom_id is not None:
+        query = query.filter(CourseSchedule.classroom_id == classroom_id)
+    if student_id is not None:
+        query = query.filter(CourseSchedule.target_student_id == student_id)
+    if package_id is not None:
+        query = query.filter(CourseSchedule.course.has(CurriculumCourse.package_id == package_id))
+    if course_id is not None:
+        query = query.filter(CourseSchedule.course_id == course_id)
+    current = beijing_now_naive()
+    if status == "canceled":
+        query = query.filter(CourseSchedule.status == "canceled")
+    elif status == "scheduled":
+        query = query.filter(CourseSchedule.status != "canceled", CourseSchedule.starts_at > current)
+    elif status == "overdue":
+        query = query.filter(
+            CourseSchedule.status != "canceled",
+            CourseSchedule.due_at.is_not(None),
+            CourseSchedule.due_at < current,
+        )
+    elif status == "active":
+        query = query.filter(
+            CourseSchedule.status != "canceled",
+            CourseSchedule.starts_at <= current,
+            or_(CourseSchedule.due_at.is_(None), CourseSchedule.due_at >= current),
+        )
+    keyword = q.strip()
+    if keyword:
+        pattern = f"%{keyword}%"
+        query = query.filter(or_(
+            CourseSchedule.course.has(or_(
+                CurriculumCourse.title.ilike(pattern),
+                CurriculumCourse.package.has(CoursePackage.title.ilike(pattern)),
+            )),
+            CourseSchedule.target_student.has(or_(User.name.ilike(pattern), User.username.ilike(pattern))),
+            CourseSchedule.classroom.has(Classroom.name.ilike(pattern)),
+            CourseSchedule.creator.has(User.name.ilike(pattern)),
+        ))
     if identity["role"] == "student":
         student = identity["student"]
         rows = query.order_by(CourseSchedule.starts_at.asc(), CourseSchedule.id.asc()).limit(2000).all()
         schedules = [row for row in rows if schedule_applies_to_student(row, student)]
-        return {"schedules": [schedule_payload(db, row, student=student) for row in schedules]}
+        return {
+            "schedules": [schedule_payload(db, row, student=student) for row in schedules],
+            "total": len(schedules),
+            "page": 1,
+            "page_size": len(schedules),
+        }
     actor = identity["teacher"]
     if not is_admin_actor(actor):
         classroom_ids = assigned_classroom_ids(db, actor)
@@ -4410,8 +4952,18 @@ def list_course_schedules(
             (CourseSchedule.target_type == "student") & (CourseSchedule.created_by_user_id == actor.id),
             (CourseSchedule.target_type == "classroom") & (CourseSchedule.classroom_id.in_(classroom_ids) if classroom_ids else False),
         ))
-    schedules = query.order_by(CourseSchedule.starts_at.desc(), CourseSchedule.id.desc()).limit(2000).all()
-    return {"schedules": [schedule_payload(db, row, actor=actor) for row in schedules]}
+    total = query.count()
+    ordered = query.order_by(CourseSchedule.starts_at.desc(), CourseSchedule.id.desc())
+    pagination_requested = page is not None or page_size is not None
+    normalized_page = page or 1
+    normalized_page_size = page_size or (20 if pagination_requested else 2000)
+    schedules = ordered.offset((normalized_page - 1) * normalized_page_size).limit(normalized_page_size).all()
+    return {
+        "schedules": [schedule_payload(db, row, actor=actor) for row in schedules],
+        "total": total,
+        "page": normalized_page,
+        "page_size": normalized_page_size,
+    }
 
 
 @app.get("/api/course-schedules/{schedule_id}")

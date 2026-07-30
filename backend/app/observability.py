@@ -41,9 +41,33 @@ def configure_logging() -> None:
 
 class CoderAIMetricsCollector:
     def collect(self):
-        from backend.app.db import SessionLocal
+        from backend.app.db import SessionLocal, engine
         from backend.app.models import RetentionRequest, StudentSession, TeacherSession, UsageLog, VideoTask, WorkflowRun, now
         from backend.app.tenancy import without_tenant_filter
+
+        pool = engine.pool
+        for metric_name, description, accessor in (
+            ("coderai_db_pool_size", "Configured SQLAlchemy connection pool size.", "size"),
+            ("coderai_db_pool_checked_out", "Connections currently checked out from SQLAlchemy.", "checkedout"),
+            ("coderai_db_pool_overflow", "Current SQLAlchemy overflow connection count.", "overflow"),
+        ):
+            metric = GaugeMetricFamily(metric_name, description)
+            value = getattr(pool, accessor, None)
+            if callable(value):
+                try:
+                    metric.add_metric([], float(value()))
+                    yield metric
+                except (TypeError, ValueError):
+                    pass
+        pool_size = getattr(pool, "size", None)
+        max_overflow = getattr(pool, "_max_overflow", None)
+        if callable(pool_size) and isinstance(max_overflow, int):
+            capacity = GaugeMetricFamily(
+                "coderai_db_pool_capacity",
+                "Maximum SQLAlchemy pooled plus overflow connections.",
+            )
+            capacity.add_metric([], float(pool_size() + max_overflow))
+            yield capacity
 
         db = SessionLocal()
         try:
@@ -122,6 +146,14 @@ HTTP_DURATION = Histogram(
     labelnames=("method", "route"),
     buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10),
 )
+DATABASE_POOL_TIMEOUTS = Counter(
+    "coderai_db_pool_timeouts_total",
+    "Database connection pool checkout timeouts.",
+)
+
+
+def record_database_pool_timeout() -> None:
+    DATABASE_POOL_TIMEOUTS.inc()
 
 
 def _request_route(request: Request) -> str:

@@ -26,6 +26,7 @@ import { IconTitle } from "../../components/IconTitle";
 import { EmptyState } from "../../components/PageState";
 import type { GuardianConsent, PrivacyPolicy, StudentDeletionPreflight, StudentPrivacyState } from "../../domain-types";
 import { api } from "../../lib/api";
+import { saveBlobFile } from "../../lib/downloads";
 import { explainError } from "../../lib/errors";
 import { formatBeijingTime, formatBytes } from "../../lib/format";
 import { RetentionGovernancePanel } from "./RetentionGovernancePanel";
@@ -183,13 +184,9 @@ export function PrivacyDataPanel({ onRefresh }: { onRefresh: () => Promise<void>
     setLoading("export");
     try {
       const response = await api.get(`/api/privacy/students/${selectedStudentId}/export`, { responseType: "blob" });
-      const url = URL.createObjectURL(response.data);
-      const anchor = document.createElement("a");
-      anchor.href = url;
-      anchor.download = `coderai-student-${selectedStudentId}-data.zip`;
-      anchor.click();
-      URL.revokeObjectURL(url);
-      message.success("学生个人数据已导出");
+      if (await saveBlobFile(response.data, `coderai-student-${selectedStudentId}-data.zip`)) {
+        message.success("学生个人数据已导出");
+      }
     } catch (error) {
       message.error(explainError(error));
     } finally {

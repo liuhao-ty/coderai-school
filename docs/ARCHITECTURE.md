@@ -1,7 +1,7 @@
 # CoderAI 学堂架构
 
-更新时间：2026-07-22（北京时间）
-目标版本：`0.2.0-beta.1`
+更新时间：2026-07-30（北京时间）
+目标版本：Windows 客户端 `0.2.0-beta.4`，云端 API `0.2.0-beta.3`
 
 ## 1. 部署边界
 
@@ -77,7 +77,7 @@ Operations: Prometheus + Alertmanager + independent backup storage
 
 - SQLAlchemy 2 定义模型
 - Alembic 管理云端结构，入口为 `alembic.ini`
-- `backend/migrations/versions/20260720_0001_initial_cloud_schema.py` 是首个云端基线
+- `backend/migrations/versions/20260720_0001_cloud_schema.py` 是首个云端基线，`20260726_0002_student_course_projects.py` 增加学生工程包作品关联，`20260727_0003_workspace_answers.py` 增加问卷式工程包答案存储
 - 云端 `CODERAI_AUTO_CREATE_SCHEMA=false`，容器启动前执行 `alembic upgrade head`
 - SQLite 幂等兼容迁移只服务本地开发和历史数据读取
 
@@ -109,6 +109,8 @@ Operations: Prometheus + Alertmanager + independent backup storage
 - 新课程层级为“课程包 -> 课程 -> PPT、工程包.md、成果包.md”
 - 三类资料均可为空；有至少一门课程即可发布课程包
 - 教师只能预览 PDF，不能下载 PPTX/PDF；Markdown 可预览和下载
+- 学生端只获得工程包；PPT/PDF 和成果包不返回学生课程响应，直连接口同样拒绝
+- 工程包在线保存到学生在该课程下的唯一文字作品，管理员原始 Markdown 保持只读，作品可复用现有提交与批改链路
 - 课程包授权与作者相互独立，作者可选教师或管理员
 - 排课以课程为原子，支持学员和班级目标；已有提交保存评分规则快照
 - 图片、视频和工作流结果通过统一作品与审核链路保存
@@ -139,7 +141,7 @@ Operations: Prometheus + Alertmanager + independent backup storage
 ## 10. 发布与回滚
 
 - `main` 的 `1a3848a` 是云端改造前回滚基线
-- 云端版本在 `release/0.2.0-beta.1` 上形成可审查提交
+- 云端版本在 `release/0.2.0-beta.3` 上形成可审查发布快照
 - GitHub Actions 执行 Ruff、依赖审计、后端测试、前端构建、Tauri 测试、E2E、容器集成和 Windows 冒烟构建
 - 正式工作流从 GitHub Secrets 导入 Authenticode PFX 和 Tauri 更新签名私钥
 - 回滚数据库前先停止写入并执行恢复演练；客户端问题通过从回滚提交构建更高补丁版本发布，避免签名更新降级问题

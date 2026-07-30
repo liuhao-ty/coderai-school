@@ -17,6 +17,7 @@ import { useRef, useState } from "react";
 import { IconTitle } from "../../components/IconTitle";
 import type { Classroom, SchoolStage } from "../../domain-types";
 import { api } from "../../lib/api";
+import { saveTextFile } from "../../lib/downloads";
 import { explainError } from "../../lib/errors";
 import { SCHOOL_STAGE_OPTIONS } from "../../lib/schoolStages";
 
@@ -90,14 +91,15 @@ export function StudentRegistrationPanel({
     }
   };
 
-  const downloadTemplate = () => {
+  const downloadTemplate = async () => {
     const content = "\ufeff姓名,用户名,班级,学龄分类,账号状态\n示例学生,student.example,示例班级,小学低龄,active\n";
-    const url = URL.createObjectURL(new Blob([content], { type: "text/csv;charset=utf-8" }));
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = "学生账号导入模板.csv";
-    anchor.click();
-    URL.revokeObjectURL(url);
+    try {
+      if (await saveTextFile(content, "学生账号导入模板.csv", "text/csv;charset=utf-8")) {
+        message.success("学生账号导入模板已保存");
+      }
+    } catch (error) {
+      message.error(`模板保存失败：${explainError(error)}`);
+    }
   };
 
   return (
@@ -139,7 +141,7 @@ export function StudentRegistrationPanel({
                 ]} />
                 <input ref={importInputRef} type="file" accept=".csv,text/csv" hidden onChange={(event) => void importStudents(event.target.files?.[0])} />
                 <Button type="primary" icon={<FileUp size={15} />} loading={importing} onClick={() => importInputRef.current?.click()}>选择 CSV 批量开户</Button>
-                <Button icon={<FileDown size={15} />} onClick={downloadTemplate}>下载模板</Button>
+                <Button icon={<FileDown size={15} />} onClick={() => void downloadTemplate()}>下载模板</Button>
               </Space>
               <Alert type="warning" showIcon message="更新模式不会覆盖现有学生密码。" />
             </Space>

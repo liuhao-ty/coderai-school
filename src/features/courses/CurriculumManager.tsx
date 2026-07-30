@@ -47,6 +47,7 @@ import type {
   SchoolStage,
 } from "../../domain-types";
 import { api } from "../../lib/api";
+import { saveBlobFile } from "../../lib/downloads";
 import { explainError } from "../../lib/errors";
 import { formatBeijingTime } from "../../lib/format";
 import { ALL_SCHOOL_STAGES, SCHOOL_STAGE_OPTIONS, schoolStageLabel } from "../../lib/schoolStages";
@@ -104,17 +105,6 @@ function conversionStatus(material: CourseMaterialState) {
   if (material.conversion_status === "failed") return { color: "red", label: "转换失败" };
   if (material.conversion_status === "processing") return { color: "blue", label: "正在转换" };
   return { color: "gold", label: "等待转换" };
-}
-
-function saveBlob(blob: Blob, filename: string) {
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = filename;
-  document.body.appendChild(anchor);
-  anchor.click();
-  anchor.remove();
-  URL.revokeObjectURL(url);
 }
 
 export function CurriculumManager({
@@ -323,7 +313,9 @@ export function CurriculumManager({
     setBusy(`download-${course.id}-${material.kind}`);
     try {
       const response = await api.get(`/api/curriculum-courses/${course.id}/materials/${material.kind}/download`, { responseType: "blob" });
-      saveBlob(response.data, material.original_name || `${material.label}.md`);
+      if (await saveBlobFile(response.data, material.original_name || `${material.label}.md`)) {
+        message.success("课程资料已保存");
+      }
     } catch (error) {
       message.error(explainError(error));
     } finally {
@@ -348,7 +340,9 @@ export function CurriculumManager({
     setBusy("package-export");
     try {
       const response = await api.get(`/api/course-packages/${selectedPackage.id}/export`, { responseType: "blob" });
-      saveBlob(response.data, `coderai-course-package-${selectedPackage.id}.zip`);
+      if (await saveBlobFile(response.data, `coderai-course-package-${selectedPackage.id}.zip`)) {
+        message.success("课程包已导出");
+      }
     } catch (error) {
       message.error(explainError(error));
     } finally {
@@ -464,7 +458,7 @@ export function CurriculumManager({
                       </Tag>
                     )}
                   </Space>
-                  <Paragraph type="secondary">{selectedPackage.description || "暂未填写课程包说明。"}</Paragraph>
+                  <Paragraph className="preWrapText" type="secondary">{selectedPackage.description || "暂未填写课程包说明。"}</Paragraph>
                 </div>
                 <Space wrap>
                   <Button icon={<RefreshCcw size={15} />} loading={busy === "refresh"} onClick={() => void onRefresh()}>刷新</Button>
@@ -536,7 +530,7 @@ export function CurriculumManager({
                       <div className="curriculumCourseHeader">
                         <div>
                           <Space wrap><Tag color="blue">第 {courseIndex + 1} 课</Tag><Title level={4}>{course.title}</Title></Space>
-                          <Text type="secondary">{course.description || "暂未填写课程简介。"}</Text>
+                          <Text className="preWrapText" type="secondary">{course.description || "暂未填写课程简介。"}</Text>
                         </div>
                         {audience === "admin" && (
                           <Space>
@@ -551,7 +545,7 @@ export function CurriculumManager({
                       </div>
 
                       <div className="curriculumRuleStrip">
-                        <div><Text type="secondary">作业说明</Text><Paragraph>{course.assignment_instructions || "管理员暂未补充"}</Paragraph></div>
+                        <div><Text type="secondary">作业说明</Text><Paragraph className="preWrapText">{course.assignment_instructions || "管理员暂未补充"}</Paragraph></div>
                         <div><Text type="secondary">开放工具</Text><Space wrap>{course.tool_scope ? course.tool_scope.split(",").map((tool) => <Tag key={tool}>{tool}</Tag>) : <Tag>不开放 AI 工具</Tag>}</Space></div>
                         <div><Text type="secondary">评分</Text><Text>{course.rubric.reduce((sum, item) => sum + item.max_score, 0)} 分</Text></div>
                       </div>

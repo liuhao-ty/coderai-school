@@ -831,6 +831,11 @@ textarea {
   max-width: 100%;
 }
 
+.workflowNodeUpstreamSelect {
+  width: 280px;
+  max-width: 100%;
+}
+
 .workflowCanvasNodeLabel {
   display: grid;
   min-width: 150px;
@@ -851,6 +856,16 @@ textarea {
   background: #fbfdff;
   border-radius: 6px;
   margin-bottom: 6px;
+}
+
+.workflowNodeList .workflowNodeListItem {
+  border: 1px solid transparent;
+  cursor: pointer;
+}
+
+.workflowNodeList .workflowNodeListItem.selected {
+  background: #eef5ff;
+  border-color: #91b5ea;
 }
 
 .courseReader {
@@ -1388,6 +1403,10 @@ textarea {
   gap: 10px;
 }
 
+.studentMaterialGrid {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .materialSlot,
 .studentMaterial {
   display: grid;
@@ -1443,6 +1462,88 @@ textarea {
   min-height: 280px;
 }
 
+.courseWorkspaceToolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.courseWorkspaceEditor,
+.courseWorkspacePreview {
+  min-height: 500px !important;
+}
+
+.preWrapText {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.courseWorkspacePreview table {
+  width: max-content;
+  min-width: 100%;
+  border-collapse: collapse;
+}
+
+.courseWorkspacePreview th,
+.courseWorkspacePreview td {
+  min-width: 150px;
+  max-width: 460px;
+  padding: 10px 12px;
+  vertical-align: top;
+  border: 1px solid #dfe5ec;
+}
+
+.courseWorkspacePreview th {
+  background: #eef3f8;
+  text-align: left;
+}
+
+.courseFieldControl,
+.courseFieldPreview {
+  display: grid;
+  min-width: 180px;
+  gap: 7px;
+  white-space: normal;
+}
+
+.courseFieldControl-textarea {
+  min-width: 260px;
+}
+
+.courseFieldLabel,
+.courseFieldPreviewLabel {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #344054;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.courseFieldControl .ant-radio-group,
+.courseFieldControl .ant-checkbox-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+}
+
+.courseFieldControl .ant-checkbox-wrapper,
+.courseFieldControl .ant-radio-wrapper {
+  margin-inline-start: 0;
+}
+
+.courseFieldPreview > span:last-child {
+  min-height: 30px;
+  padding: 5px 8px;
+  color: #1d2939;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: #fff;
+  border: 1px solid #dfe5ec;
+  border-radius: 6px;
+}
+
 .scheduleComposer,
 .scheduleListSection,
 .studentAssignmentSection {
@@ -1466,6 +1567,31 @@ textarea {
 
 .scheduleListSection .ant-table-wrapper {
   min-width: 0;
+}
+
+.scheduleFilterGrid {
+  display: grid;
+  grid-template-columns: minmax(240px, 1.5fr) repeat(3, minmax(150px, 1fr));
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.scheduleFilterGrid > .ant-input-affix-wrapper,
+.scheduleFilterGrid > .ant-select,
+.scheduleFilterGrid > .ant-btn,
+.scheduleCanceledToggle {
+  min-width: 0;
+  min-height: 36px;
+}
+
+.scheduleCanceledToggle {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 0 10px;
+  background: #f8fafc;
+  border: 1px solid #d9dfe7;
+  border-radius: 6px;
 }
 
 .studentCourseLayout {
@@ -1553,6 +1679,10 @@ textarea {
 }
 
 @media (max-width: 1000px) {
+  .scheduleFilterGrid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .reviewFormGrid,
   .curriculumOverviewGrid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1587,6 +1717,10 @@ textarea {
 }
 
 @media (max-width: 760px) {
+  .scheduleFilterGrid {
+    grid-template-columns: 1fr;
+  }
+
   .reviewFormGrid,
   .curriculumOverviewGrid {
     grid-template-columns: 1fr;

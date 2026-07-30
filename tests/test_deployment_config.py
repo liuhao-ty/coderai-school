@@ -13,7 +13,10 @@ class PublicIpDeploymentConfigTests(unittest.TestCase):
         self.assertNotIn("\nhttps://{$CODERAI_PUBLIC_IP} {", caddyfile)
         self.assertNotIn("default_sni", caddyfile)
         self.assertIn("/etc/letsencrypt/live/coderai-ip/fullchain.pem", caddyfile)
+        self.assertIn("handle /.well-known/acme-challenge/*", caddyfile)
+        self.assertNotIn("handle_path /.well-known/acme-challenge/*", caddyfile)
         self.assertIn("handle_path /desktop-updates/*", caddyfile)
+        self.assertIn("health_interval 2s", caddyfile)
         self.assertNotIn("CODERAI_DOMAIN", caddyfile)
 
     def test_compose_mounts_certificate_webroot_and_update_files(self):
@@ -43,6 +46,7 @@ class PublicIpDeploymentConfigTests(unittest.TestCase):
         self.assertIn("--preferred-profile shortlived", bootstrap)
         self.assertIn('--ip-address "$CODERAI_PUBLIC_IP"', bootstrap)
         self.assertIn("--webroot-path /var/www/certbot", renewal)
+        self.assertIn("caddy reload --force", renewal)
         self.assertIn("coderai_tls_certificate_valid_beyond_48h", renewal)
         self.assertIn("OnUnitActiveSec=12h", timer)
         alerts = (ROOT / "deploy" / "monitoring" / "alerts.yml").read_text(encoding="utf-8")
@@ -69,10 +73,21 @@ class PublicIpDeploymentConfigTests(unittest.TestCase):
         build_script = (ROOT / "tools" / "build-tauri.ps1").read_text(encoding="utf-8")
         self.assertIn("(Get-Content -LiteralPath $passwordPath -Raw).Trim() | ConvertTo-SecureString", build_script)
 
+    def test_windows_desktop_uses_gui_subsystem_and_native_file_save_plugins(self):
+        main = (ROOT / "src-tauri" / "src" / "main.rs").read_text(encoding="utf-8")
+        library = (ROOT / "src-tauri" / "src" / "lib.rs").read_text(encoding="utf-8")
+        capability = (ROOT / "src-tauri" / "capabilities" / "default.json").read_text(encoding="utf-8")
+        self.assertIn('cfg_attr(not(debug_assertions), windows_subsystem = "windows")', main)
+        self.assertIn("tauri_plugin_dialog::init()", library)
+        self.assertIn("tauri_plugin_fs::init()", library)
+        self.assertIn('"dialog:allow-save"', capability)
+        self.assertIn('"fs:allow-write-file"', capability)
+
     def test_update_manifest_accepts_current_tauri_nsis_installers(self):
         manifest_script = (ROOT / "tools" / "generate-update-manifest.ps1").read_text(encoding="utf-8")
         self.assertIn('Name.EndsWith("-setup.exe")', manifest_script)
         self.assertIn('Name.EndsWith(".nsis.zip")', manifest_script)
+        self.assertIn("Name.Contains($versionMarker)", manifest_script)
         self.assertIn("[Text.UTF8Encoding]::new($false)", manifest_script)
 
 

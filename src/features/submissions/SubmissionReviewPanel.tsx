@@ -10,6 +10,7 @@ import remarkGfm from "remark-gfm";
 import { IconTitle } from "../../components/IconTitle";
 import type { FeedbackTemplateItem, Project, SubmissionStatistics, SubmissionVersion, TaskSubmission } from "../../domain-types";
 import { api } from "../../lib/api";
+import { saveBlobFile } from "../../lib/downloads";
 import { projectTypeLabel, submissionStatusColor, submissionStatusLabel } from "../../lib/domain";
 import { explainError } from "../../lib/errors";
 import { formatBeijingTime } from "../../lib/format";
@@ -80,13 +81,9 @@ export function SubmissionReviewPanel({
     setSupportLoading(true);
     try {
       const res = await api.get("/api/submissions/export", { responseType: "blob" });
-      const url = URL.createObjectURL(res.data);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = `CoderAI-批改记录-${dayjs().format("YYYYMMDD-HHmmss")}.csv`;
-      link.click();
-      URL.revokeObjectURL(url);
-      message.success("批改记录已导出");
+      if (await saveBlobFile(res.data, `CoderAI-批改记录-${dayjs().format("YYYYMMDD-HHmmss")}.csv`)) {
+        message.success("批改记录已导出");
+      }
     } catch (error) {
       message.error(explainError(error));
     } finally {

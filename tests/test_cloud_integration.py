@@ -119,7 +119,7 @@ class CloudServiceIntegrationTests(unittest.TestCase):
                 self.assertEqual(ready.json()["status"], "ready")
                 version = client.get("/api/version")
                 self.assertEqual(version.status_code, 200)
-                self.assertEqual(version.json()["version"], "0.2.0-beta.1")
+                self.assertEqual(version.json()["version"], "0.2.0-beta.3")
                 metrics = client.get("/metrics")
                 self.assertEqual(metrics.status_code, 200)
                 self.assertIn("coderai_http_requests_total", metrics.text)

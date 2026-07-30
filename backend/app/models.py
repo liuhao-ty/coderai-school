@@ -237,15 +237,30 @@ class Task(TenantScopedMixin, Base):
 
 class Project(TenantScopedMixin, Base):
     __tablename__ = "projects"
+    __table_args__ = (
+        Index(
+            "ux_projects_org_student_curriculum_course",
+            "organization_id",
+            "user_id",
+            "curriculum_course_id",
+            unique=True,
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     owner_teacher_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     title: Mapped[str] = mapped_column(String(160), nullable=False)
     project_type: Mapped[str] = mapped_column(String(40), default="text")
     user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    curriculum_course_id: Mapped[int | None] = mapped_column(
+        ForeignKey("curriculum_courses.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     classroom_id: Mapped[int | None] = mapped_column(ForeignKey("classrooms.id"), nullable=True)
     owner_name: Mapped[str] = mapped_column(String(120), default="默认学生")
     summary: Mapped[str] = mapped_column(Text, default="")
+    workspace_answers_json: Mapped[str] = mapped_column(Text, default="{}")
     file_path: Mapped[str] = mapped_column(Text, default="")
     lifecycle_status: Mapped[str] = mapped_column(String(20), default="active")
     moderation_status: Mapped[str] = mapped_column(String(20), default="approved")
@@ -256,6 +271,7 @@ class Project(TenantScopedMixin, Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
     user = relationship("User")
+    curriculum_course = relationship("CurriculumCourse")
     classroom = relationship("Classroom")
 
 

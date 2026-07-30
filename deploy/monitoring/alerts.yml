@@ -19,6 +19,18 @@ groups:
         labels: { severity: warning }
         annotations:
           summary: "CoderAI workflow or video backlog exceeds 20"
+      - alert: CoderAIDatabasePoolHigh
+        expr: coderai_db_pool_checked_out / clamp_min(coderai_db_pool_capacity, 1) > 0.8
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "CoderAI database pool usage exceeds 80 percent"
+      - alert: CoderAIDatabasePoolTimeout
+        expr: increase(coderai_db_pool_timeouts_total[10m]) > 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "CoderAI database connection pool timed out"
       - alert: CoderAIDiskSpaceLow
         expr: node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"} < 0.15
         for: 10m

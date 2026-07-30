@@ -62,6 +62,7 @@ import {
 } from "./lib/api";
 import { allowedToolsFromTasks } from "./lib/domain";
 import { checkDesktopUpdate, compareVersions, currentClientVersion, installDesktopUpdate } from "./lib/desktopRuntime";
+import { isTransientConnectionError } from "./lib/errors";
 import { useAppStore, type WorkspaceRole } from "./store/appStore";
 import type { StudentAuth, TeacherAuth } from "./types";
 
@@ -76,6 +77,7 @@ type StudentPage = "workspace" | "courses" | "workflows" | "projects";
 type TeacherPage = TeacherSectionKey | "workflows" | "projects";
 type AdminPage = AdminSectionKey;
 type WorkspacePage = StudentPage | TeacherPage | AdminPage;
+type ScheduleView = "create" | "records";
 
 const studentPages = new Set<StudentPage>(["workspace", "courses", "workflows", "projects"]);
 const teacherPages = new Set<TeacherPage>(["overview", "classes", "students", "courses", "schedules", "submissions", "moderation", "account", "workflows", "projects"]);
@@ -130,6 +132,7 @@ export default function App() {
   const navigate = useNavigate();
   const returningToLaunch = useRef(false);
   const [weakPasswordPromptOpen, setWeakPasswordPromptOpen] = useState(false);
+  const [staffAuthReady, setStaffAuthReady] = useState(false);
   const [online, setOnline] = useState(() => navigator.onLine);
   const [updateState, setUpdateState] = useState<{ version: string; required: boolean; body: string } | null>(null);
   const [updateProgress, setUpdateProgress] = useState<number | null>(null);
@@ -161,6 +164,7 @@ export default function App() {
   const staffMode = mode === "teacher" || mode === "admin";
   const adminTeachingActive = mode === "admin" && ["teaching", "classes", "students", "courses", "schedules", "submissions", "moderation", "workflows", "projects"].includes(page as string);
   const workspaceRole: WorkspaceRole | null = mode === "student" ? "student" : mode === "teacher" ? "teacher" : mode === "admin" ? "admin" : null;
+  const scheduleView: ScheduleView = location.pathname.split("/")[3] === "create" ? "create" : "records";
   const selectedCoursePackageId = useMemo(() => {
     if (page !== "courses") return null;
     const raw = new URLSearchParams(location.search).get("package");
@@ -168,7 +172,11 @@ export default function App() {
     const packageId = Number(raw);
     return coursePackages.some((item) => item.id === packageId) ? packageId : null;
   }, [coursePackages, location.search, page]);
-  const selectedMenuKey = selectedCoursePackageId === null ? page : `course-package-${selectedCoursePackageId}`;
+  const selectedMenuKey = selectedCoursePackageId !== null
+    ? `course-package-${selectedCoursePackageId}`
+    : page === "schedules"
+      ? `schedules-${scheduleView}`
+      : page;
 
   useEffect(() => {
     const updateOnline = () => setOnline(navigator.onLine);
@@ -235,6 +243,16 @@ export default function App() {
   }, [workspaceRole]);
 
   useEffect(() => {
+    if (
+      (mode === "teacher" || mode === "admin")
+      && page === "schedules"
+      && location.pathname.split("/").length < 4
+    ) {
+      navigate(`/${mode}/schedules/records`, { replace: true });
+    }
+  }, [location.pathname, mode, navigate, page]);
+
+  useEffect(() => {
     if (returningToLaunch.current) {
       if (mode === "launch") returningToLaunch.current = false;
       return;
@@ -271,14 +289,17 @@ export default function App() {
       navigate("/admin/overview", { replace: true });
       return;
     }
-    if (workspaceRole) {
+    if (workspaceRole && (!staffMode || staffAuthReady)) {
       if (mode === "student" && !studentProfile) setStudentProfile(loadStudentProfile());
       void refresh(workspaceRole).catch(() => undefined);
     }
-  }, [mode, navigate, refresh, setStudentProfile, staffMode, studentProfile, teacherProfile?.role, workspaceRole]);
+  }, [mode, navigate, refresh, setStudentProfile, staffAuthReady, staffMode, studentProfile, teacherProfile?.role, workspaceRole]);
 
   useEffect(() => {
-    if (!staffMode) return;
+    if (!staffMode) {
+      setStaffAuthReady(false);
+      return;
+    }
     const refreshAuthIfNeeded = async () => {
       const refreshToken = getAuthValue(TEACHER_REFRESH_TOKEN_KEY);
       const accessExpiresAt = localStorage.getItem(TEACHER_ACCESS_EXPIRES_KEY);
@@ -287,7 +308,10 @@ export default function App() {
         navigate("/teacher/login", { replace: true });
         return;
       }
-      if (accessExpiresAt && dayjs(accessExpiresAt).diff(dayjs(), "minute") >= 30) return;
+      if (accessExpiresAt && dayjs(accessExpiresAt).diff(dayjs(), "minute") >= 30) {
+        setStaffAuthReady(true);
+        return;
+      }
       try {
         const response = await api.post("/api/auth/teacher-refresh", { refresh_token: refreshToken });
         const nextAuth = response.data as TeacherAuth;
@@ -297,17 +321,21 @@ export default function App() {
           navigate("/teacher/change-password", { replace: true });
           return;
         }
-        await refresh(nextAuth.user.role === "admin" ? "admin" : "teacher");
-      } catch {
+        setStaffAuthReady(true);
+      } catch (error) {
+        if (isTransientConnectionError(error)) {
+          setStaffAuthReady(true);
+          return;
+        }
         clearTeacherAuth();
         clearWorkspace();
         navigate("/teacher/login", { replace: true });
       }
     };
     void refreshAuthIfNeeded();
-    const timer = window.setInterval(() => void refreshAuthIfNeeded(), 30 * 60 * 1000);
+    const timer = window.setInterval(() => void refreshAuthIfNeeded(), 5 * 60 * 1000);
     return () => window.clearInterval(timer);
-  }, [clearWorkspace, navigate, refresh, staffMode]);
+  }, [clearWorkspace, navigate, staffMode]);
 
   useEffect(() => {
     if (mode === "student" && page === "workflows" && hydrated && !studentAllowedTools.has("workflow")) {
@@ -342,6 +370,7 @@ export default function App() {
     clearStudentAuth();
     storeTeacherAuth(auth);
     clearWorkspace();
+    setStaffAuthReady(false);
     if (interactiveLogin && auth.user.role === "teacher" && auth.password_is_weak && !auth.password_change_required) {
       sessionStorage.setItem(TEACHER_WEAK_PASSWORD_SESSION_KEY, String(auth.session_id));
       setWeakPasswordPromptOpen(true);
@@ -436,6 +465,7 @@ export default function App() {
             students={students}
             coursePackages={coursePackages}
             courseSchedules={courseSchedules}
+            scheduleView={scheduleView}
             onRefresh={() => refresh("teacher")}
           />
         )}
@@ -455,6 +485,7 @@ export default function App() {
             students={students}
             coursePackages={coursePackages}
             courseSchedules={courseSchedules}
+            scheduleView={scheduleView}
             onRefresh={() => refresh("admin")}
           />
         )}
@@ -507,7 +538,15 @@ export default function App() {
         { key: "classes", icon: <GraduationCap size={17} />, label: "班级管理" },
         { key: "students", icon: <UsersRound size={17} />, label: "学员管理" },
         { key: "courses-root", icon: <BookOpen size={17} />, label: "课程管理", children: courseMenuChildren },
-        { key: "schedules", icon: <CalendarClock size={17} />, label: "排课管理" },
+        {
+          key: "schedules-root",
+          icon: <CalendarClock size={17} />,
+          label: "排课管理",
+          children: [
+            { key: "schedules-create", label: "新建排课" },
+            { key: "schedules-records", label: "排课记录" },
+          ],
+        },
         { key: "submissions", icon: <ClipboardCheck size={17} />, label: "作业批改" },
         { key: "moderation", icon: <ShieldCheck size={17} />, label: "安全检测" },
       ],
@@ -533,7 +572,15 @@ export default function App() {
         { key: "classes", icon: <GraduationCap size={17} />, label: "班级管理" },
         { key: "students", icon: <UsersRound size={17} />, label: "学员管理" },
         { key: "courses-root", icon: <BookOpen size={17} />, label: "课程管理", children: courseMenuChildren },
-        { key: "schedules", icon: <CalendarClock size={17} />, label: "排课管理" },
+        {
+          key: "schedules-root",
+          icon: <CalendarClock size={17} />,
+          label: "排课管理",
+          children: [
+            { key: "schedules-create", label: "新建排课" },
+            { key: "schedules-records", label: "排课记录" },
+          ],
+        },
         { key: "submissions", icon: <ClipboardCheck size={17} />, label: "作业批改" },
         { key: "moderation", icon: <ShieldCheck size={17} />, label: "安全检测" },
         { key: "workflows", icon: <Workflow size={17} />, label: "工作流" },
@@ -587,10 +634,14 @@ export default function App() {
           <Menu
             mode="inline"
             selectedKeys={[selectedMenuKey]}
-            defaultOpenKeys={mode === "teacher" ? ["teaching", "courses-root", "creation"] : mode === "admin" ? ["teaching-management", "courses-root", "system", "maintenance"] : []}
+            defaultOpenKeys={mode === "teacher" ? ["teaching", "courses-root", "schedules-root", "creation"] : mode === "admin" ? ["teaching-management", "courses-root", "schedules-root", "system", "maintenance"] : []}
             onClick={({ key }) => {
               if (key.startsWith("course-package-")) {
                 navigate(`/${mode}/courses?package=${key.slice("course-package-".length)}`);
+                return;
+              }
+              if (key === "schedules-create" || key === "schedules-records") {
+                navigate(`/${mode}/schedules/${key.slice("schedules-".length)}`);
                 return;
               }
               navigate(`/${mode}/${key}`);
@@ -692,7 +743,9 @@ export default function App() {
           <Route path="/teacher/change-password" element={<TeacherPasswordChangeScreen onBack={backToLaunch} onSuccess={(auth) => enterTeacher(auth, false)} />} />
           <Route path="/student/:page" element={workspace} />
           <Route path="/teacher/:page" element={workspace} />
+          <Route path="/teacher/:page/:subpage" element={workspace} />
           <Route path="/admin/:page" element={workspace} />
+          <Route path="/admin/:page/:subpage" element={workspace} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </AntApp>

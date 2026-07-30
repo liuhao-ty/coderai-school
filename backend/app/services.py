@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import mimetypes
+from dataclasses import dataclass
 from time import perf_counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -64,7 +65,50 @@ RETRYABLE_PROVIDER_ERROR_CODES = frozenset({
 T = TypeVar("T")
 
 
-def provider_model(provider: AIProvider, capability: str) -> str:
+@dataclass(frozen=True)
+class ProviderRuntimeConfig:
+    id: int
+    name: str
+    provider_type: str
+    base_url: str
+    api_key: str
+    text_model: str
+    image_model: str
+    video_model: str
+    enabled: bool
+    last_test_status: str
+    last_test_message: str
+    last_tested_at: datetime | None
+    created_at: datetime | None
+    updated_at: datetime | None
+
+
+def provider_runtime_config(provider: AIProvider) -> ProviderRuntimeConfig:
+    return ProviderRuntimeConfig(
+        id=provider.id,
+        name=provider.name,
+        provider_type=provider.provider_type,
+        base_url=provider.base_url,
+        api_key=provider.api_key,
+        text_model=provider.text_model,
+        image_model=provider.image_model,
+        video_model=provider.video_model,
+        enabled=provider.enabled,
+        last_test_status=provider.last_test_status,
+        last_test_message=provider.last_test_message,
+        last_tested_at=provider.last_tested_at,
+        created_at=provider.created_at,
+        updated_at=provider.updated_at,
+    )
+
+
+def release_provider_lookup_connection(db: Session) -> None:
+    # Provider selection is read-only. Ending this transaction before an
+    # external HTTP wait prevents slow model calls from occupying the DB pool.
+    db.rollback()
+
+
+def provider_model(provider: AIProvider | ProviderRuntimeConfig, capability: str) -> str:
     return str(getattr(provider, f"{capability}_model", "") or "").strip()
 
 
@@ -172,7 +216,7 @@ def active_provider(
     return provider
 
 
-def provider_api_key(provider: AIProvider) -> str:
+def provider_api_key(provider: AIProvider | ProviderRuntimeConfig) -> str:
     try:
         return decrypt_secret(provider.api_key)
     except SecretProtectionError as exc:
@@ -185,7 +229,7 @@ def provider_api_key(provider: AIProvider) -> str:
         ) from exc
 
 
-def ensure_provider_capability(provider: AIProvider, capability: str):
+def ensure_provider_capability(provider: AIProvider | ProviderRuntimeConfig, capability: str):
     capabilities = provider_capabilities(provider.provider_type)
     if capability not in capabilities:
         raise HTTPException(
@@ -286,7 +330,8 @@ async def run_with_provider_fallback(
     operation: Callable[[AIProvider], Awaitable[T]],
 ) -> T:
     failures: list[dict[str, Any]] = []
-    candidates = provider_candidates(db, capability)
+    candidates = [provider_runtime_config(provider) for provider in provider_candidates(db, capability)]
+    release_provider_lookup_connection(db)
     for index, provider in enumerate(candidates):
         try:
             return await operation(provider)
@@ -297,7 +342,15 @@ async def run_with_provider_fallback(
     raise HTTPException(status_code=502, detail={"code": "AI_PROVIDER_ERROR", "message": "模型路由没有返回结果。"})
 
 
-def _record_provider_test(db: Session, provider: AIProvider, status: str, message: str) -> None:
+def _record_provider_test(
+    db: Session,
+    provider: AIProvider | ProviderRuntimeConfig,
+    status: str,
+    message: str,
+) -> None:
+    provider = db.query(AIProvider).filter(AIProvider.id == provider.id).first()
+    if not provider:
+        return
     provider.last_test_status = status
     provider.last_test_message = message[:500]
     provider.last_tested_at = now()
@@ -305,7 +358,14 @@ def _record_provider_test(db: Session, provider: AIProvider, status: str, messag
 
 
 async def test_provider_connection(db: Session, capability: str = "text", provider_id: int | None = None) -> dict[str, Any]:
-    provider = active_provider(db, capability if provider_id is None else None, provider_id, include_disabled=provider_id is not None)
+    provider = provider_runtime_config(
+        active_provider(
+            db,
+            capability if provider_id is None else None,
+            provider_id,
+            include_disabled=provider_id is not None,
+        )
+    )
     try:
         ensure_provider_capability(provider, capability)
         model = provider_model(provider, capability)
@@ -317,6 +377,7 @@ async def test_provider_connection(db: Session, capability: str = "text", provid
             message = "适配器、模型和密钥配置检查通过；真实生成请在对应工具中验收。"
             _record_provider_test(db, provider, "success", message)
             return {"ok": True, "capability": capability, "provider_id": provider.id, "provider": provider.name, "model": model, "message": message}
+        release_provider_lookup_connection(db)
         started = perf_counter()
         async with httpx.AsyncClient(timeout=15) as client:
             response = await client.post(
@@ -686,7 +747,8 @@ async def generate_text(
     provider_id: int | None = None,
 ) -> str:
     if provider_id is not None:
-        provider = active_provider(db, "text", provider_id)
+        provider = provider_runtime_config(active_provider(db, "text", provider_id))
+        release_provider_lookup_connection(db)
         return await _generate_text_with_provider(db, provider, prompt, mode, age_level, user_id)
     return await run_with_provider_fallback(
         db,
@@ -705,7 +767,8 @@ async def generate_image(
     provider_id: int | None = None,
 ) -> dict[str, Any]:
     if provider_id is not None:
-        provider = active_provider(db, "image", provider_id)
+        provider = provider_runtime_config(active_provider(db, "image", provider_id))
+        release_provider_lookup_connection(db)
         return await _generate_image_with_provider(db, provider, prompt, style, size, source_image_path, user_id)
     return await run_with_provider_fallback(
         db,
@@ -1209,7 +1272,9 @@ async def generate_video_task(
             raise mapped
 
     if provider_id is not None:
-        provider, provider_task_id = await submit(active_provider(db, "video", provider_id))
+        provider = provider_runtime_config(active_provider(db, "video", provider_id))
+        release_provider_lookup_connection(db)
+        provider, provider_task_id = await submit(provider)
     else:
         provider, provider_task_id = await run_with_provider_fallback(db, "video", submit)
     project = None
@@ -1934,6 +1999,7 @@ def to_project_dict(project: Project) -> dict[str, Any]:
         "title": project.title,
         "project_type": project.project_type,
         "user_id": project.user_id,
+        "curriculum_course_id": project.curriculum_course_id,
         "student_archived": bool(project.user and project.user.archived_at),
         "classroom_id": project.classroom_id,
         "owner_name": project.owner_name,

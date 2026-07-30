@@ -1,40 +1,73 @@
-import { Alert, App, Button, Drawer, Empty, List, Select, Space, Tag, Typography } from "antd";
-import { BookOpen, CheckCircle2, Clock3, Download, Eye, FileText, Presentation, Send } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { Alert, App, Button, Checkbox, Drawer, Empty, Input, List, Radio, Segmented, Select, Space, Tag, Typography } from "antd";
+import { BookOpen, CheckCircle2, Clock3, Download, Edit3, Eye, FileText, Save, Send } from "lucide-react";
+import { type ReactNode, useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import type {
-  CourseMaterialKind,
   CoursePackageItem,
   CourseScheduleItem,
   Project,
   TaskSubmission,
 } from "../../domain-types";
 import { api } from "../../lib/api";
+import { saveBlobFile } from "../../lib/downloads";
 import { explainError } from "../../lib/errors";
 import { formatBeijingTime } from "../../lib/format";
 import { schoolStageLabel } from "../../lib/schoolStages";
 
 
 const { Text, Title, Paragraph } = Typography;
+type WorkspaceMode = "fill" | "source" | "preview";
+type CourseWorkspaceField = {
+  id: string;
+  type: "text" | "textarea" | "radio" | "checkbox";
+  label: string;
+  required: boolean;
+  options: string[];
+};
+type CourseWorkspaceAnswers = Record<string, string | string[]>;
+type CourseWorkspace = {
+  course_id: number;
+  material_id: number;
+  title: string;
+  original_name: string;
+  content_markdown: string;
+  fields: CourseWorkspaceField[];
+  answers: CourseWorkspaceAnswers;
+  validation_warnings: string[];
+  saved: boolean;
+  project_id?: number | null;
+  project_status: string;
+  updated_at?: string | null;
+};
+
+function workspaceMarkdownWithFields(markdown: string, fields: CourseWorkspaceField[]) {
+  const byId = new Map(fields.map((field) => [field.id, field]));
+  return markdown.replace(/\{\{field\b[^{}]*\}\}/g, (marker) => {
+    const id = marker.match(/\bid\s*=\s*"([^"]+)"/)?.[1] || "";
+    const field = byId.get(id);
+    if (!field) return marker;
+    const label = field.label.replace(/([\\[\]])/g, "\\$1");
+    return `[${label}](coderai-field:${encodeURIComponent(field.id)})`;
+  });
+}
+
+function answersFingerprint(answers: CourseWorkspaceAnswers) {
+  return JSON.stringify(
+    Object.fromEntries(
+      Object.entries(answers)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, value]) => [key, Array.isArray(value) ? [...value].sort() : value]),
+    ),
+  );
+}
 
 function scheduleState(status: CourseScheduleItem["status"]) {
   if (status === "active") return { color: "green", label: "学习中" };
   if (status === "overdue") return { color: "red", label: "已逾期" };
   if (status === "canceled") return { color: "default", label: "已取消" };
   return { color: "blue", label: "未开始" };
-}
-
-function saveBlob(blob: Blob, filename: string) {
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = filename;
-  document.body.appendChild(anchor);
-  anchor.click();
-  anchor.remove();
-  URL.revokeObjectURL(url);
 }
 
 export function StudentCourseReader({
@@ -50,18 +83,32 @@ export function StudentCourseReader({
   submissions: TaskSubmission[];
   onRefresh: () => Promise<void>;
 }) {
-  const { message } = App.useApp();
+  const { message, modal } = App.useApp();
   const orderedSchedules = useMemo(
     () => [...schedules].sort((left, right) => left.starts_at.localeCompare(right.starts_at)),
     [schedules],
   );
   const [selectedScheduleId, setSelectedScheduleId] = useState<number | null>(orderedSchedules[0]?.id ?? null);
   const [selectedProjectId, setSelectedProjectId] = useState<number | undefined>();
-  const [preview, setPreview] = useState<{ kind: CourseMaterialKind; title: string } | null>(null);
-  const [previewText, setPreviewText] = useState("");
-  const [previewUrl, setPreviewUrl] = useState("");
-  const [previewLoading, setPreviewLoading] = useState(false);
+  const [workspaceOpen, setWorkspaceOpen] = useState(false);
+  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("preview");
+  const [workspaceText, setWorkspaceText] = useState("");
+  const [savedWorkspaceText, setSavedWorkspaceText] = useState("");
+  const [workspaceFields, setWorkspaceFields] = useState<CourseWorkspaceField[]>([]);
+  const [workspaceAnswers, setWorkspaceAnswers] = useState<CourseWorkspaceAnswers>({});
+  const [savedWorkspaceAnswers, setSavedWorkspaceAnswers] = useState<CourseWorkspaceAnswers>({});
+  const [workspaceWarnings, setWorkspaceWarnings] = useState<string[]>([]);
+  const [workspaceProjectId, setWorkspaceProjectId] = useState<number | null>(null);
+  const [workspaceUpdatedAt, setWorkspaceUpdatedAt] = useState<string | null>(null);
+  const [workspaceLoading, setWorkspaceLoading] = useState(false);
+  const [workspaceError, setWorkspaceError] = useState("");
   const [busy, setBusy] = useState("");
+  const workspaceDirty = workspaceText !== savedWorkspaceText
+    || answersFingerprint(workspaceAnswers) !== answersFingerprint(savedWorkspaceAnswers);
+  const workspaceFormMarkdown = useMemo(
+    () => workspaceMarkdownWithFields(workspaceText, workspaceFields),
+    [workspaceFields, workspaceText],
+  );
 
   const selectedSchedule = orderedSchedules.find((item) => item.id === selectedScheduleId) || orderedSchedules[0] || null;
   const selectedPackage = packages.find((item) => item.id === selectedSchedule?.package_id);
@@ -79,48 +126,187 @@ export function StudentCourseReader({
     }
   }, [orderedSchedules, selectedScheduleId]);
 
-  useEffect(() => () => {
-    if (previewUrl) URL.revokeObjectURL(previewUrl);
-  }, [previewUrl]);
+  useEffect(() => {
+    setWorkspaceOpen(false);
+    setWorkspaceText("");
+    setSavedWorkspaceText("");
+    setWorkspaceFields([]);
+    setWorkspaceAnswers({});
+    setSavedWorkspaceAnswers({});
+    setWorkspaceWarnings([]);
+    setWorkspaceProjectId(null);
+    setWorkspaceUpdatedAt(null);
+    setWorkspaceError("");
+  }, [selectedCourse?.id]);
 
-  const closePreview = () => {
-    if (previewUrl) URL.revokeObjectURL(previewUrl);
-    setPreview(null);
-    setPreviewText("");
-    setPreviewUrl("");
+  const resetWorkspace = () => {
+    setWorkspaceOpen(false);
+    setWorkspaceText("");
+    setSavedWorkspaceText("");
+    setWorkspaceFields([]);
+    setWorkspaceAnswers({});
+    setSavedWorkspaceAnswers({});
+    setWorkspaceWarnings([]);
+    setWorkspaceProjectId(null);
+    setWorkspaceUpdatedAt(null);
+    setWorkspaceError("");
   };
 
-  const openPreview = async (kind: CourseMaterialKind) => {
+  const requestWorkspaceClose = () => {
+    if (!workspaceDirty) {
+      resetWorkspace();
+      return;
+    }
+    modal.confirm({
+      title: "放弃未保存的修改？",
+      content: "关闭后，本次尚未保存的工程包内容将丢失。",
+      okText: "放弃修改",
+      cancelText: "继续编辑",
+      okButtonProps: { danger: true },
+      onOk: resetWorkspace,
+    });
+  };
+
+  const openWorkspace = async (mode: WorkspaceMode) => {
     if (!selectedCourse) return;
-    const material = selectedCourse.materials[kind];
-    setPreview({ kind, title: `${selectedCourse.title} · ${material.label}` });
-    setPreviewLoading(true);
-    setPreviewText("");
-    if (previewUrl) URL.revokeObjectURL(previewUrl);
-    setPreviewUrl("");
+    setWorkspaceOpen(true);
+    setWorkspaceMode(mode);
+    setWorkspaceLoading(true);
+    setWorkspaceError("");
     try {
-      if (kind === "slides") {
-        const response = await api.get(`/api/curriculum-courses/${selectedCourse.id}/materials/${kind}/preview`, { responseType: "blob" });
-        const pdf = new Blob([response.data], { type: "application/pdf" });
-        setPreviewUrl(URL.createObjectURL(pdf));
-      } else {
-        const response = await api.get(`/api/curriculum-courses/${selectedCourse.id}/materials/${kind}/preview`, { responseType: "text" });
-        setPreviewText(String(response.data || ""));
-      }
+      const response = await api.get<{ workspace: CourseWorkspace }>(
+        `/api/curriculum-courses/${selectedCourse.id}/workspace`,
+      );
+      const workspace = response.data.workspace;
+      setWorkspaceText(workspace.content_markdown);
+      setSavedWorkspaceText(workspace.content_markdown);
+      setWorkspaceFields(workspace.fields || []);
+      setWorkspaceAnswers(workspace.answers || {});
+      setSavedWorkspaceAnswers(workspace.answers || {});
+      setWorkspaceWarnings(workspace.validation_warnings || []);
+      setWorkspaceMode(workspace.fields?.length ? mode : mode === "fill" ? "source" : mode);
+      setWorkspaceProjectId(workspace.project_id ?? null);
+      setWorkspaceUpdatedAt(workspace.updated_at ?? null);
+      if (workspace.project_id) setSelectedProjectId(workspace.project_id);
     } catch (error) {
-      message.error(explainError(error));
+      setWorkspaceError(explainError(error));
     } finally {
-      setPreviewLoading(false);
+      setWorkspaceLoading(false);
     }
   };
 
-  const downloadMaterial = async (kind: CourseMaterialKind) => {
+  const saveWorkspace = async () => {
     if (!selectedCourse) return;
-    const material = selectedCourse.materials[kind];
-    setBusy(`download-${kind}`);
+    setBusy("workspace-save");
     try {
-      const response = await api.get(`/api/curriculum-courses/${selectedCourse.id}/materials/${kind}/download`, { responseType: "blob" });
-      saveBlob(response.data, material.original_name || `${material.label}.md`);
+      const currentFieldIds = new Set(
+        [...workspaceText.matchAll(/\{\{field\b[^{}]*\}\}/g)]
+          .map((match) => match[0].match(/\bid\s*=\s*"([^"]+)"/)?.[1])
+          .filter((fieldId): fieldId is string => Boolean(fieldId)),
+      );
+      const currentAnswers = Object.fromEntries(
+        Object.entries(workspaceAnswers).filter(([fieldId]) => currentFieldIds.has(fieldId)),
+      );
+      const response = await api.put<{ workspace: CourseWorkspace }>(
+        `/api/curriculum-courses/${selectedCourse.id}/workspace`,
+        { content_markdown: workspaceText, answers: currentAnswers },
+      );
+      const workspace = response.data.workspace;
+      setWorkspaceText(workspace.content_markdown);
+      setSavedWorkspaceText(workspace.content_markdown);
+      setWorkspaceFields(workspace.fields || []);
+      setWorkspaceAnswers(workspace.answers || {});
+      setSavedWorkspaceAnswers(workspace.answers || {});
+      setWorkspaceWarnings(workspace.validation_warnings || []);
+      setWorkspaceProjectId(workspace.project_id ?? null);
+      setWorkspaceUpdatedAt(workspace.updated_at ?? null);
+      if (workspace.project_id) setSelectedProjectId(workspace.project_id);
+      message.success("工程包已保存到我的作品");
+      await onRefresh();
+    } catch (error) {
+      message.error(explainError(error));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const updateWorkspaceAnswer = (fieldId: string, value: string | string[]) => {
+    setWorkspaceAnswers((current) => ({ ...current, [fieldId]: value }));
+  };
+
+  const renderWorkspaceField = (field: CourseWorkspaceField, readOnly: boolean) => {
+    const value = workspaceAnswers[field.id] ?? (field.type === "checkbox" ? [] : "");
+    if (readOnly) {
+      const displayValue = Array.isArray(value) ? value.join("、") : value;
+      return (
+        <span className="courseFieldPreview">
+          <span className="courseFieldPreviewLabel">{field.label}{field.required ? " *" : ""}</span>
+          <span>{displayValue || "未填写"}</span>
+        </span>
+      );
+    }
+    return (
+      <span className={`courseFieldControl courseFieldControl-${field.type}`}>
+        <span className="courseFieldLabel">{field.label}{field.required && <Tag color="red">必填</Tag>}</span>
+        {field.type === "text" && (
+          <Input
+            size="small"
+            value={typeof value === "string" ? value : ""}
+            onChange={(event) => updateWorkspaceAnswer(field.id, event.target.value)}
+            aria-label={field.label}
+          />
+        )}
+        {field.type === "textarea" && (
+          <Input.TextArea
+            value={typeof value === "string" ? value : ""}
+            autoSize={{ minRows: 2, maxRows: 8 }}
+            onChange={(event) => updateWorkspaceAnswer(field.id, event.target.value)}
+            aria-label={field.label}
+          />
+        )}
+        {field.type === "radio" && (
+          <Radio.Group
+            value={typeof value === "string" ? value : ""}
+            options={field.options.map((option) => ({ label: option, value: option }))}
+            onChange={(event) => updateWorkspaceAnswer(field.id, event.target.value)}
+            aria-label={field.label}
+          />
+        )}
+        {field.type === "checkbox" && (
+          <Checkbox.Group
+            value={Array.isArray(value) ? value : []}
+            options={field.options}
+            onChange={(values) => updateWorkspaceAnswer(field.id, values)}
+            aria-label={field.label}
+          />
+        )}
+      </span>
+    );
+  };
+
+  const workspaceMarkdownComponents = {
+    a: ({ href, children }: { href?: string; children?: ReactNode }) => {
+      if (href?.startsWith("coderai-field:")) {
+        const fieldId = decodeURIComponent(href.slice("coderai-field:".length));
+        const field = workspaceFields.find((item) => item.id === fieldId);
+        if (field) return renderWorkspaceField(field, workspaceMode === "preview");
+      }
+      return <a href={href}>{children}</a>;
+    },
+  };
+
+  const downloadMaterial = async () => {
+    if (!selectedCourse) return;
+    const material = selectedCourse.materials.starter_markdown;
+    setBusy("download-starter");
+    try {
+      const response = await api.get(
+        `/api/curriculum-courses/${selectedCourse.id}/materials/starter_markdown/download`,
+        { responseType: "blob" },
+      );
+      if (await saveBlobFile(response.data, material.original_name || "工程包.md")) {
+        message.success("工程包原件已保存");
+      }
     } catch (error) {
       message.error(explainError(error));
     } finally {
@@ -186,7 +372,7 @@ export function StudentCourseReader({
                       {selectedPackage?.school_stages.map((stage) => <Tag key={stage}>{schoolStageLabel(stage)}</Tag>)}
                     </Space>
                     <Title level={3}>{selectedCourse.title}</Title>
-                    <Paragraph type="secondary">{selectedCourse.description || "管理员暂未填写课程简介。"}</Paragraph>
+                    <Paragraph className="preWrapText" type="secondary">{selectedCourse.description || "管理员暂未填写课程简介。"}</Paragraph>
                   </div>
                   <div className="studentCourseDates">
                     <Text><Clock3 size={14} /> 开始：{formatBeijingTime(selectedSchedule.starts_at)}</Text>
@@ -200,22 +386,23 @@ export function StudentCourseReader({
                 <section>
                   <div className="studentCourseSectionTitle"><BookOpen size={18} /><Title level={4}>课程资料</Title></div>
                   <div className="studentMaterialGrid">
-                    {(Object.keys(selectedCourse.materials) as CourseMaterialKind[]).map((kind) => {
-                      const material = selectedCourse.materials[kind];
+                    {(() => {
+                      const material = selectedCourse.materials.starter_markdown;
                       const isLocked = !material.missing && !material.can_preview;
                       return (
-                        <article className="studentMaterial" key={kind}>
-                          <Space>{kind === "slides" ? <Presentation size={18} /> : <FileText size={18} />}<Text strong>{material.label}</Text></Space>
+                        <article className="studentMaterial">
+                          <Space><FileText size={18} /><Text strong>{material.label}</Text></Space>
                           <Text type="secondary">{material.missing ? "管理员暂未补充" : material.original_name}</Text>
-                          {isLocked && <Tag color="gold">{kind === "result_markdown" ? "首次提交后解锁" : "课程开始后开放"}</Tag>}
-                          {kind === "slides" && !material.missing && material.conversion_status !== "ready" && <Tag color="default">PPT 预览暂不可用</Tag>}
+                          {isLocked && <Tag color="gold">课程开始后开放</Tag>}
+                          {workspaceProjectId && <Tag color="green">已保存到作品库</Tag>}
                           <Space wrap>
-                            {material.can_preview && <Button size="small" icon={<Eye size={14} />} onClick={() => void openPreview(kind)}>预览</Button>}
-                            {material.can_download && <Button size="small" icon={<Download size={14} />} loading={busy === `download-${kind}`} onClick={() => void downloadMaterial(kind)}>下载</Button>}
+                            {material.can_preview && <Button size="small" icon={<Eye size={14} />} onClick={() => void openWorkspace("preview")}>查看</Button>}
+                            {material.can_preview && <Button size="small" type="primary" icon={<Edit3 size={14} />} onClick={() => void openWorkspace("fill")}>在线填写与编辑</Button>}
+                            {material.can_download && <Button size="small" icon={<Download size={14} />} loading={busy === "download-starter"} onClick={() => void downloadMaterial()}>下载原件</Button>}
                           </Space>
                         </article>
                       );
-                    })}
+                    })()}
                   </div>
                 </section>
 
@@ -223,7 +410,7 @@ export function StudentCourseReader({
                   <div className="studentCourseSectionTitle"><Send size={18} /><Title level={4}>作品提交</Title></div>
                   <div className="assignmentInstructions">
                     <Text type="secondary">提交要求</Text>
-                    <Paragraph>{selectedCourse.assignment_instructions || "老师暂未补充特别要求，请按课堂说明完成作品。"}</Paragraph>
+                    <Paragraph className="preWrapText">{selectedCourse.assignment_instructions || "老师暂未补充特别要求，请按课堂说明完成作品。"}</Paragraph>
                     <Space wrap><Text type="secondary">允许工具</Text>{selectedCourse.tool_scope ? selectedCourse.tool_scope.split(",").map((item) => <Tag key={item}>{item}</Tag>) : <Tag>无 AI 工具</Tag>}</Space>
                   </div>
 
@@ -259,10 +446,74 @@ export function StudentCourseReader({
         </div>
       )}
 
-      <Drawer title={preview?.title || "课程资料预览"} open={Boolean(preview)} onClose={closePreview} width={860}>
-        {previewLoading && <Alert type="info" showIcon message="正在加载课程资料" />}
-        {!previewLoading && preview?.kind === "slides" && previewUrl && <iframe className="coursePdfPreview" src={previewUrl} title="课堂 PPT PDF 预览" />}
-        {!previewLoading && preview && preview.kind !== "slides" && <article className="markdownPreview courseMarkdownPreview"><ReactMarkdown remarkPlugins={[remarkGfm]}>{previewText || "资料内容为空。"}</ReactMarkdown></article>}
+      <Drawer
+        title={selectedCourse ? `${selectedCourse.title} · 工程包` : "工程包"}
+        open={workspaceOpen}
+        onClose={requestWorkspaceClose}
+        width={900}
+        extra={(
+          <Button
+            type="primary"
+            icon={<Save size={15} />}
+            disabled={workspaceLoading || Boolean(workspaceError) || !workspaceDirty}
+            loading={busy === "workspace-save"}
+            onClick={() => void saveWorkspace()}
+          >
+            保存
+          </Button>
+        )}
+      >
+        {workspaceLoading && <Alert type="info" showIcon message="正在加载工程包" />}
+        {!workspaceLoading && workspaceError && (
+          <Alert
+            type="error"
+            showIcon
+            message="工程包加载失败"
+            description={workspaceError}
+            action={<Button size="small" onClick={() => void openWorkspace(workspaceMode)}>重试</Button>}
+          />
+        )}
+        {!workspaceLoading && !workspaceError && workspaceOpen && (
+          <Space direction="vertical" size={16} className="fullWidth">
+            <div className="courseWorkspaceToolbar">
+              <Segmented
+                value={workspaceMode}
+                onChange={(value) => setWorkspaceMode(value as WorkspaceMode)}
+                options={[
+                  { value: "fill", label: "填写", icon: <Edit3 size={14} />, disabled: !workspaceFields.length },
+                  { value: "source", label: "源码", icon: <FileText size={14} /> },
+                  { value: "preview", label: "预览", icon: <Eye size={14} /> },
+                ]}
+              />
+              <Text type="secondary">
+                {workspaceUpdatedAt ? `保存于 ${formatBeijingTime(workspaceUpdatedAt)}` : "尚未保存"}
+              </Text>
+            </div>
+            {workspaceWarnings.map((warning) => (
+              <Alert key={warning} type="warning" showIcon message="工程包字段需要检查" description={warning} />
+            ))}
+            {workspaceMode === "source" ? (
+              <Input.TextArea
+                className="markdownEditor courseWorkspaceEditor"
+                aria-label="工程包 Markdown 编辑器"
+                value={workspaceText}
+                maxLength={500_000}
+                onChange={(event) => setWorkspaceText(event.target.value)}
+                placeholder="# 我的课堂工程"
+              />
+            ) : (
+              <article className={`markdownPreview courseMarkdownPreview courseWorkspacePreview ${workspaceMode === "fill" ? "courseWorkspaceForm" : ""}`}>
+                <ReactMarkdown
+                  remarkPlugins={[remarkGfm]}
+                  components={workspaceMarkdownComponents}
+                  urlTransform={(url) => url}
+                >
+                  {workspaceFormMarkdown || "工程包内容为空。"}
+                </ReactMarkdown>
+              </article>
+            )}
+          </Space>
+        )}
       </Drawer>
     </div>
   );

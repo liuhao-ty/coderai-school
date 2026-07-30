@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 from fastapi import Header, HTTPException, Request
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 
@@ -30,6 +31,14 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 engine_options: dict = {"pool_pre_ping": True}
 if IS_SQLITE:
     engine_options["connect_args"] = {"check_same_thread": False}
+else:
+    engine_options.update({
+        "pool_size": max(1, int(os.environ.get("CODERAI_DB_POOL_SIZE", "8"))),
+        "max_overflow": max(0, int(os.environ.get("CODERAI_DB_MAX_OVERFLOW", "4"))),
+        "pool_timeout": max(1, int(os.environ.get("CODERAI_DB_POOL_TIMEOUT_SECONDS", "5"))),
+        "pool_recycle": max(60, int(os.environ.get("CODERAI_DB_POOL_RECYCLE_SECONDS", "1800"))),
+        "pool_use_lifo": True,
+    })
 engine = create_engine(DATABASE_URL, **engine_options)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
@@ -60,9 +69,28 @@ async def get_db(
                 status_code=403,
                 detail={"code": "ORGANIZATION_DISABLED", "message": "当前机构已停用。"},
             )
+        organization_id = organization.id
+        organization_code = organization.code
+        if not IS_SQLITE:
+            # The tenant lookup must not retain a connection for the whole request.
+            db.expunge(organization)
+            db.rollback()
         request.state.organization = organization
-        with organization_context(organization.id, organization.code):
+        with organization_context(organization_id, organization_code):
             yield db
+    except SQLAlchemyTimeoutError as exc:
+        db.rollback()
+        from backend.app.observability import record_database_pool_timeout
+
+        record_database_pool_timeout()
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "DATABASE_BUSY",
+                "message": "服务正在处理较多请求，请稍后重试。",
+            },
+            headers={"Retry-After": "2"},
+        ) from exc
     finally:
         db.close()
 
@@ -198,6 +226,8 @@ def migrate_sqlite_schema():
         ensure_column(conn, "usage_logs", "owner_teacher_id", "INTEGER")
         ensure_column(conn, "moderation_logs", "owner_teacher_id", "INTEGER")
         ensure_column(conn, "projects", "user_id", "INTEGER")
+        ensure_column(conn, "projects", "curriculum_course_id", "INTEGER")
+        ensure_column(conn, "projects", "workspace_answers_json", "TEXT DEFAULT '{}'")
         ensure_column(conn, "projects", "classroom_id", "INTEGER")
         ensure_column(conn, "projects", "lifecycle_status", "VARCHAR(20) DEFAULT 'active'")
         ensure_column(conn, "projects", "moderation_status", "VARCHAR(20) DEFAULT 'approved'")
@@ -293,6 +323,12 @@ def migrate_sqlite_schema():
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_video_tasks_provider_id ON video_tasks(provider_id)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_target_student_id ON tasks(target_student_id)"))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_tasks_course_schedule_id ON tasks(course_schedule_id) WHERE course_schedule_id IS NOT NULL"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_projects_curriculum_course_id ON projects(curriculum_course_id)"))
+        conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_projects_org_student_curriculum_course "
+            "ON projects(organization_id, user_id, curriculum_course_id) "
+            "WHERE user_id IS NOT NULL AND curriculum_course_id IS NOT NULL"
+        ))
         for table_name in (
             "classrooms", "courses", "lessons", "tasks", "projects", "task_submissions",
             "feedback_templates", "assets", "workflows", "workflow_runs", "video_tasks",

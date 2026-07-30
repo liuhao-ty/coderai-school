@@ -17,15 +17,16 @@ export function WorkspaceSkeleton() {
 }
 
 export function WorkspaceError({ message, onRetry }: { message: string; onRetry: () => void }) {
+  const partial = message.startsWith("部分数据暂未更新");
   return (
     <Alert
       className="workspaceError"
-      type="error"
+      type={partial ? "warning" : "error"}
       showIcon
-      message="课堂数据加载失败"
+      message={partial ? "部分数据暂未更新" : "课堂数据加载失败"}
       description={
         <Space direction="vertical" size={12}>
-          <span>{message || "无法连接本地服务，请检查网络和服务状态。"}</span>
+          <span>{message || "暂时无法连接 CoderAI 云端服务，请检查网络后重试。"}</span>
           <Button icon={<RotateCcw size={15} />} onClick={onRetry}>重新加载</Button>
         </Space>
       }

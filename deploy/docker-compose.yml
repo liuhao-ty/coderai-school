@@ -6,6 +6,10 @@ x-app-environment: &app-environment
   CODERAI_STORAGE_BACKEND: s3
   CODERAI_AUTO_CREATE_SCHEMA: "false"
   CODERAI_DATABASE_URL: ${CODERAI_DATABASE_URL}
+  CODERAI_DB_POOL_SIZE: ${CODERAI_DB_POOL_SIZE:-8}
+  CODERAI_DB_MAX_OVERFLOW: ${CODERAI_DB_MAX_OVERFLOW:-4}
+  CODERAI_DB_POOL_TIMEOUT_SECONDS: ${CODERAI_DB_POOL_TIMEOUT_SECONDS:-5}
+  CODERAI_DB_POOL_RECYCLE_SECONDS: ${CODERAI_DB_POOL_RECYCLE_SECONDS:-1800}
   CODERAI_REDIS_URL: ${CODERAI_REDIS_URL:-redis://redis:6379/0}
   CODERAI_S3_BUCKET: ${CODERAI_S3_BUCKET:-coderai-pilot}
   CODERAI_S3_ENDPOINT: ${CODERAI_S3_ENDPOINT:-http://minio:9000}
@@ -99,7 +103,7 @@ services:
       args:
         CODERAI_APT_MIRROR: ${CODERAI_APT_MIRROR:-}
         CODERAI_PIP_INDEX_URL: ${CODERAI_PIP_INDEX_URL:-}
-    image: coderai-api:0.2.0-beta.1
+    image: coderai-api:0.2.0-beta.3
     restart: "no"
     command: ["migrate"]
     environment: *app-environment
@@ -112,7 +116,7 @@ services:
         condition: service_completed_successfully
 
   api:
-    image: coderai-api:0.2.0-beta.1
+    image: coderai-api:0.2.0-beta.3
     restart: unless-stopped
     command: ["api"]
     environment:
@@ -132,7 +136,7 @@ services:
       - no-new-privileges:true
 
   worker:
-    image: coderai-api:0.2.0-beta.1
+    image: coderai-api:0.2.0-beta.3
     restart: unless-stopped
     command: ["worker"]
     environment:
@@ -147,7 +151,7 @@ services:
       - no-new-privileges:true
 
   beat:
-    image: coderai-api:0.2.0-beta.1
+    image: coderai-api:0.2.0-beta.3
     restart: unless-stopped
     command: ["beat"]
     environment: *app-environment
@@ -181,7 +185,7 @@ services:
       - no-new-privileges:true
 
   backup:
-    image: coderai-api:0.2.0-beta.1
+    image: coderai-api:0.2.0-beta.3
     restart: unless-stopped
     command: ["backup", "--loop"]
     environment:

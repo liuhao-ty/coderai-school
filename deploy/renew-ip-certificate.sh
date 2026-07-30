@@ -36,7 +36,7 @@ docker run --rm \
 
 if docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" ps -q caddy | grep -q .; then
     docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" exec -T caddy \
-        caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+        caddy reload --force --config /etc/caddy/Caddyfile --adapter caddyfile
 fi
 
 if docker run --rm --entrypoint python \

@@ -144,7 +144,9 @@ export function workflowRunStatusLabel(status: string) {
   if (status === "pending") return "等待中";
   if (status === "running") return "运行中";
   if (status === "success") return "成功";
+  if (status === "partial_failed") return "部分完成";
   if (status === "failed") return "失败";
+  if (status === "blocked") return "已阻断";
   if (status === "canceled") return "已取消";
   return status || "未知";
 }
@@ -153,7 +155,9 @@ export function workflowRunStatusColor(status: string) {
   if (status === "pending") return "default";
   if (status === "running") return "blue";
   if (status === "success") return "green";
+  if (status === "partial_failed") return "orange";
   if (status === "failed") return "red";
+  if (status === "blocked") return "orange";
   if (status === "canceled") return "default";
   return "default";
 }

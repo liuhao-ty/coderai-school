@@ -20,12 +20,14 @@ if (-not $Version) {
     $Version = [string]$package.version
 }
 
+$versionMarker = "_$Version" + "_"
 $artifact = Get-ChildItem -LiteralPath $bundlePath -File | Where-Object {
+    $_.Name.Contains($versionMarker) -and
     ($_.Name.EndsWith("-setup.exe") -or $_.Name.EndsWith(".nsis.zip")) -and
         (Test-Path -LiteralPath "$($_.FullName).sig")
 } | Sort-Object @{ Expression = { if ($_.Name.EndsWith("-setup.exe")) { 0 } else { 1 } } }, Name | Select-Object -First 1
 if (-not $artifact) {
-    throw "No signed NSIS updater installer was found."
+    throw "No signed NSIS updater installer was found for version $Version."
 }
 
 $signature = (Get-Content -LiteralPath "$($artifact.FullName).sig" -Raw).Trim()

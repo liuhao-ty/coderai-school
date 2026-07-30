@@ -50,6 +50,7 @@ export function TeacherPanel({
   students,
   coursePackages,
   courseSchedules,
+  scheduleView = "records",
   onRefresh,
   audience = "teacher",
 }: {
@@ -60,6 +61,7 @@ export function TeacherPanel({
   students: StudentProfile[];
   coursePackages: CoursePackageItem[];
   courseSchedules: CourseScheduleItem[];
+  scheduleView?: "create" | "records";
   onRefresh: () => Promise<void>;
   audience?: "teacher" | "admin";
 }) {
@@ -176,7 +178,7 @@ export function TeacherPanel({
       {section === "classes" && <ClassroomStudentManager classrooms={classrooms} students={students} onRefresh={onRefresh} />}
       {section === "students" && <StudentAccountManager mode={isAdmin ? "admin" : "teacher"} students={students} classrooms={classrooms} onRefresh={onRefresh} />}
       {section === "courses" && <CurriculumManager audience={isAdmin ? "admin" : "teacher"} packages={coursePackages} onRefresh={onRefresh} />}
-      {section === "schedules" && <ScheduleManager audience={isAdmin ? "admin" : "teacher"} packages={coursePackages} schedules={courseSchedules} students={students} classrooms={classrooms} onRefresh={onRefresh} />}
+      {section === "schedules" && <ScheduleManager view={scheduleView} audience={isAdmin ? "admin" : "teacher"} packages={coursePackages} schedules={courseSchedules} students={students} classrooms={classrooms} onRefresh={onRefresh} />}
       {section === "submissions" && <SubmissionReviewPanel submissions={submissions} onRefresh={onRefresh} audience={isAdmin ? "admin" : "teacher"} />}
       {section === "moderation" && <ModerationCheckPanel canManageSettings={isAdmin} />}
       {section === "account" && <AccountSecurityPanel />}

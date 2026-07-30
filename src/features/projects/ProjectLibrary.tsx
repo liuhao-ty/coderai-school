@@ -11,6 +11,7 @@ import remarkGfm from "remark-gfm";
 import type { Classroom, Project } from "../../domain-types";
 import { EmptyState } from "../../components/PageState";
 import { api } from "../../lib/api";
+import { saveBlobFile } from "../../lib/downloads";
 import { projectTypeLabel } from "../../lib/domain";
 import { explainBlobError, explainError } from "../../lib/errors";
 import { formatBeijingTime } from "../../lib/format";
@@ -205,9 +206,9 @@ export function ProjectLibrary({
         triggerDownload(selectedProject.file_path, imageDownloadName(selectedProject), true);
       } else {
         const response = await api.get(`/api/projects/${selectedProject.id}/file`, { responseType: "blob" });
-        const downloadUrl = URL.createObjectURL(response.data);
-        triggerDownload(downloadUrl, imageDownloadName(selectedProject));
-        window.setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000);
+        if (await saveBlobFile(response.data, imageDownloadName(selectedProject))) {
+          message.success("原图已保存");
+        }
       }
     } catch (error) {
       message.error(`图片下载失败：${await explainBlobError(error)}`);

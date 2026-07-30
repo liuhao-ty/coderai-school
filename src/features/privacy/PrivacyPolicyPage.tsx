@@ -6,6 +6,7 @@ import remarkGfm from "remark-gfm";
 
 import type { PrivacyPolicy, StudentPrivacyState } from "../../domain-types";
 import { api, getAuthValue, STUDENT_TOKEN_KEY } from "../../lib/api";
+import { saveBlobFile } from "../../lib/downloads";
 import { explainError } from "../../lib/errors";
 
 
@@ -45,13 +46,9 @@ export function PrivacyPolicyPage({ onBack }: { onBack: () => void }) {
     setExporting(true);
     try {
       const response = await api.get("/api/privacy/me/export", { responseType: "blob" });
-      const url = URL.createObjectURL(response.data);
-      const anchor = document.createElement("a");
-      anchor.href = url;
-      anchor.download = `coderai-my-data-${new Date().toISOString().slice(0, 10)}.zip`;
-      anchor.click();
-      URL.revokeObjectURL(url);
-      message.success("个人数据已导出");
+      if (await saveBlobFile(response.data, `coderai-my-data-${new Date().toISOString().slice(0, 10)}.zip`)) {
+        message.success("个人数据已导出");
+      }
     } catch (error) {
       message.error(explainError(error));
     } finally {
