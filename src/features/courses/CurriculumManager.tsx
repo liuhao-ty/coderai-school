@@ -528,9 +528,24 @@ export function CurriculumManager({
                   {[...selectedPackage.courses].sort((left, right) => left.order_index - right.order_index).map((course, courseIndex) => (
                     <article className="curriculumCourse" key={course.id}>
                       <div className="curriculumCourseHeader">
-                        <div>
-                          <Space wrap><Tag color="blue">第 {courseIndex + 1} 课</Tag><Title level={4}>{course.title}</Title></Space>
-                          <Text className="preWrapText" type="secondary">{course.description || "暂未填写课程简介。"}</Text>
+                        <div className="curriculumCourseIdentity">
+                          <div className="curriculumCourseTitleRow">
+                            <Tag color="blue">第 {courseIndex + 1} 课</Tag>
+                            <Title level={4}>{course.title}</Title>
+                          </div>
+                          <Paragraph
+                            className="curriculumCourseDescription preWrapText"
+                            type="secondary"
+                            ellipsis={course.description
+                              ? {
+                                  rows: 3,
+                                  expandable: "collapsible",
+                                  symbol: (expanded) => expanded ? "收起" : "展开预览",
+                                }
+                              : false}
+                          >
+                            {course.description || "暂未填写课程简介。"}
+                          </Paragraph>
                         </div>
                         {audience === "admin" && (
                           <Space>

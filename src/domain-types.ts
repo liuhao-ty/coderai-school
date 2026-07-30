@@ -14,6 +14,7 @@ export type Project = {
   file_path: string;
   file_exists: boolean;
   file_status: string;
+  latest_submitted_at?: string | null;
   created_at: string;
   updated_at: string;
   lifecycle_status: "active" | "archived" | "trashed";

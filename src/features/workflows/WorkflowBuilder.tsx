@@ -642,7 +642,11 @@ export function WorkflowBuilder({
                   <Select
                     value={String(node.params?.mode || "prompt_refine")}
                     onChange={(value) => updateWorkflowNode(node.id, { params: { ...node.params, mode: value } })}
-                    options={[{ value: "prompt_refine", label: "提示词优化" }, { value: "story", label: "故事扩写" }, { value: "code_explain", label: "代码解释" }]}
+                    options={[
+                      { value: "prompt_refine", label: "提示词优化" },
+                      { value: "story", label: "故事扩写" },
+                      ...(isTeacher ? [{ value: "code_explain", label: "代码解释" }] : []),
+                    ]}
                   />
                 )}
                 {node.type === "image.generate" && (

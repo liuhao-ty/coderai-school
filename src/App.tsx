@@ -10,7 +10,9 @@ import {
   ClipboardCheck,
   DatabaseBackup,
   Download,
+  FileText,
   GraduationCap,
+  Image as ImageIcon,
   KeyRound,
   LayoutDashboard,
   Library,
@@ -22,6 +24,7 @@ import {
   ShieldCheck,
   UserRoundCog,
   UsersRound,
+  Video,
   WifiOff,
   Workflow,
 } from "lucide-react";
@@ -39,7 +42,7 @@ import {
 } from "./features/auth/AuthScreens";
 import { PrivacyPolicyPage } from "./features/privacy/PrivacyPolicyPage";
 import { ProjectLibrary } from "./features/projects/ProjectLibrary";
-import { StudentWorkspace } from "./features/student/StudentWorkspace";
+import { StudentWorkspace, type StudentWorkspaceView } from "./features/student/StudentWorkspace";
 import { StudentCourseReader } from "./features/courses/StudentCourseReader";
 import { AdminPanel } from "./features/teacher/AdminPanel";
 import { TeacherPanel } from "./features/teacher/TeacherPanel";
@@ -78,8 +81,10 @@ type TeacherPage = TeacherSectionKey | "workflows" | "projects";
 type AdminPage = AdminSectionKey;
 type WorkspacePage = StudentPage | TeacherPage | AdminPage;
 type ScheduleView = "create" | "records";
+type StudentWorkspaceRoute = StudentWorkspaceView | "workflow";
 
 const studentPages = new Set<StudentPage>(["workspace", "courses", "workflows", "projects"]);
+const studentWorkspaceRoutes = new Set<StudentWorkspaceRoute>(["notifications", "materials", "text", "image", "video", "workflow"]);
 const teacherPages = new Set<TeacherPage>(["overview", "classes", "students", "courses", "schedules", "submissions", "moderation", "account", "workflows", "projects"]);
 const adminPages = new Set<AdminPage>([
   "overview", "accounts", "models", "privacy", "security", "operations", "extensions",
@@ -165,6 +170,10 @@ export default function App() {
   const adminTeachingActive = mode === "admin" && ["teaching", "classes", "students", "courses", "schedules", "submissions", "moderation", "workflows", "projects"].includes(page as string);
   const workspaceRole: WorkspaceRole | null = mode === "student" ? "student" : mode === "teacher" ? "teacher" : mode === "admin" ? "admin" : null;
   const scheduleView: ScheduleView = location.pathname.split("/")[3] === "create" ? "create" : "records";
+  const studentWorkspaceCandidate = location.pathname.split("/")[3] as StudentWorkspaceRoute | undefined;
+  const studentWorkspaceView: StudentWorkspaceRoute = studentWorkspaceCandidate && studentWorkspaceRoutes.has(studentWorkspaceCandidate)
+    ? studentWorkspaceCandidate
+    : "notifications";
   const selectedCoursePackageId = useMemo(() => {
     if (page !== "courses") return null;
     const raw = new URLSearchParams(location.search).get("package");
@@ -172,7 +181,9 @@ export default function App() {
     const packageId = Number(raw);
     return coursePackages.some((item) => item.id === packageId) ? packageId : null;
   }, [coursePackages, location.search, page]);
-  const selectedMenuKey = selectedCoursePackageId !== null
+  const selectedMenuKey = mode === "student" && page === "workspace"
+    ? `workspace-${studentWorkspaceView}`
+    : selectedCoursePackageId !== null
     ? `course-package-${selectedCoursePackageId}`
     : page === "schedules"
       ? `schedules-${scheduleView}`
@@ -338,10 +349,27 @@ export default function App() {
   }, [clearWorkspace, navigate, staffMode]);
 
   useEffect(() => {
-    if (mode === "student" && page === "workflows" && hydrated && !studentAllowedTools.has("workflow")) {
-      navigate("/student/workspace", { replace: true });
+    if (mode !== "student" || !hydrated) return;
+    if (page === "workflows") {
+      navigate(
+        studentAllowedTools.has("workflow")
+          ? "/student/workspace/workflow"
+          : "/student/workspace/notifications",
+        { replace: true },
+      );
+      return;
     }
-  }, [hydrated, mode, navigate, page, studentAllowedTools]);
+    if (page !== "workspace") return;
+    const requestedView = location.pathname.split("/")[3] as StudentWorkspaceRoute | undefined;
+    const toolRequired = requestedView === "text" || requestedView === "image" || requestedView === "video" || requestedView === "workflow";
+    if (
+      !requestedView
+      || !studentWorkspaceRoutes.has(requestedView)
+      || (toolRequired && !studentAllowedTools.has(requestedView))
+    ) {
+      navigate("/student/workspace/notifications", { replace: true });
+    }
+  }, [hydrated, location.pathname, mode, navigate, page, studentAllowedTools]);
 
   useEffect(() => {
     if (!staffMode || teacherProfile?.role !== "teacher") {
@@ -431,8 +459,9 @@ export default function App() {
     return (
       <>
         {error && <WorkspaceError message={error} onRetry={retry} />}
-        {mode === "student" && page === "workspace" && (
+        {mode === "student" && page === "workspace" && studentWorkspaceView !== "workflow" && (
           <StudentWorkspace
+            view={studentWorkspaceView}
             onRefresh={() => refresh("student")}
             provider={provider}
             classTasks={classTasks}
@@ -444,7 +473,7 @@ export default function App() {
           />
         )}
         {mode === "student" && page === "courses" && <StudentCourseReader packages={coursePackages} schedules={courseSchedules} projects={projects} submissions={submissions} onRefresh={() => refresh("student")} />}
-        {mode === "student" && page === "workflows" && studentAllowedTools.has("workflow") && (
+        {mode === "student" && page === "workspace" && studentWorkspaceView === "workflow" && studentAllowedTools.has("workflow") && (
           <WorkflowBuilder onRefresh={() => refresh("student")} provider={provider} classrooms={[]} isTeacher={false} />
         )}
         {mode === "student" && page === "projects" && (
@@ -503,9 +532,20 @@ export default function App() {
   };
 
   const studentMenu = [
-    { key: "workspace", icon: <Bot size={18} />, label: "学习工作台" },
+    {
+      key: "student-workspace-root",
+      icon: <Bot size={18} />,
+      label: "学习工作台",
+      children: [
+        { key: "workspace-notifications", icon: <ClipboardCheck size={17} />, label: "课堂通知" },
+        { key: "workspace-materials", icon: <Library size={17} />, label: "课堂素材" },
+        ...(studentAllowedTools.has("text") ? [{ key: "workspace-text", icon: <FileText size={17} />, label: "文字生成" }] : []),
+        ...(studentAllowedTools.has("image") ? [{ key: "workspace-image", icon: <ImageIcon size={17} />, label: "图片生成" }] : []),
+        ...(studentAllowedTools.has("video") ? [{ key: "workspace-video", icon: <Video size={17} />, label: "视频生成" }] : []),
+        ...(studentAllowedTools.has("workflow") ? [{ key: "workspace-workflow", icon: <Workflow size={17} />, label: "工作流生成" }] : []),
+      ],
+    },
     { key: "courses", icon: <BookOpen size={18} />, label: "课程学习" },
-    ...(studentAllowedTools.has("workflow") ? [{ key: "workflows", icon: <Workflow size={18} />, label: "工作流制作" }] : []),
     { key: "projects", icon: <Library size={18} />, label: "我的作品" },
   ];
   const courseMenuChildren = [
@@ -634,8 +674,12 @@ export default function App() {
           <Menu
             mode="inline"
             selectedKeys={[selectedMenuKey]}
-            defaultOpenKeys={mode === "teacher" ? ["teaching", "courses-root", "schedules-root", "creation"] : mode === "admin" ? ["teaching-management", "courses-root", "schedules-root", "system", "maintenance"] : []}
+            defaultOpenKeys={mode === "student" ? ["student-workspace-root"] : mode === "teacher" ? ["teaching", "courses-root", "schedules-root", "creation"] : mode === "admin" ? ["teaching-management", "courses-root", "schedules-root", "system", "maintenance"] : []}
             onClick={({ key }) => {
+              if (mode === "student" && key.startsWith("workspace-")) {
+                navigate(`/student/workspace/${key.slice("workspace-".length)}`);
+                return;
+              }
               if (key.startsWith("course-package-")) {
                 navigate(`/${mode}/courses?package=${key.slice("course-package-".length)}`);
                 return;
@@ -742,6 +786,7 @@ export default function App() {
           <Route path="/teacher/login" element={<TeacherLoginScreen onBack={backToLaunch} onSuccess={enterTeacher} />} />
           <Route path="/teacher/change-password" element={<TeacherPasswordChangeScreen onBack={backToLaunch} onSuccess={(auth) => enterTeacher(auth, false)} />} />
           <Route path="/student/:page" element={workspace} />
+          <Route path="/student/:page/:subpage" element={workspace} />
           <Route path="/teacher/:page" element={workspace} />
           <Route path="/teacher/:page/:subpage" element={workspace} />
           <Route path="/admin/:page" element={workspace} />

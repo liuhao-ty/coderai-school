@@ -2832,18 +2832,76 @@ def create_project(
 
 
 @app.get("/api/projects")
-def list_projects(scope: str = "active", identity: dict = Depends(require_student_or_teacher), db: Session = Depends(get_db)):
+def list_projects(
+    scope: str = "active",
+    student_id: int | None = None,
+    classroom_id: int | None = None,
+    project_type: str = Query(default="", max_length=40),
+    q: str = Query(default="", max_length=160),
+    submitted_from: datetime | None = None,
+    submitted_to: datetime | None = None,
+    identity: dict = Depends(require_student_or_teacher),
+    db: Session = Depends(get_db),
+):
     if scope not in {"active", "archived", "trash", "all"}:
         raise HTTPException(status_code=400, detail={"code": "PROJECT_SCOPE_INVALID", "message": "作品范围不合法。"})
-    query = db.query(Project)
+    submitted_from_local = local_naive(submitted_from)
+    submitted_to_local = local_naive(submitted_to)
+    if submitted_from_local and submitted_to_local and submitted_from_local > submitted_to_local:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "PROJECT_SUBMITTED_RANGE_INVALID", "message": "提交时间的开始时间不能晚于结束时间。"},
+        )
+    latest_version = db.query(
+        SubmissionVersion.project_id.label("project_id"),
+        func.max(SubmissionVersion.created_at).label("submitted_at"),
+    ).group_by(SubmissionVersion.project_id).subquery()
+    legacy_submission = db.query(
+        TaskSubmission.project_id.label("project_id"),
+        func.max(TaskSubmission.updated_at).label("submitted_at"),
+    ).group_by(TaskSubmission.project_id).subquery()
+    latest_submitted_at = func.coalesce(
+        latest_version.c.submitted_at,
+        legacy_submission.c.submitted_at,
+    ).label("latest_submitted_at")
+    query = db.query(Project, latest_submitted_at).outerjoin(
+        latest_version,
+        latest_version.c.project_id == Project.id,
+    ).outerjoin(
+        legacy_submission,
+        legacy_submission.c.project_id == Project.id,
+    )
     if identity["role"] == "student":
         query = query.filter(Project.user_id == identity["student"].id, Project.moderation_status == "approved")
     elif not is_admin_actor(identity_teacher(identity)):
         query = query.filter(staff_scope_condition(Project, db, identity["teacher"]))
     if scope != "all":
         query = query.filter(Project.lifecycle_status == ("trashed" if scope == "trash" else scope))
-    projects = query.order_by(Project.updated_at.desc()).limit(300).all()
-    return {"projects": [to_project_dict(project) for project in projects]}
+    if student_id is not None:
+        query = query.filter(Project.user_id == student_id)
+    if classroom_id is not None:
+        query = query.filter(Project.classroom_id == classroom_id)
+    if project_type.strip():
+        query = query.filter(Project.project_type == project_type.strip())
+    keyword = q.strip()
+    if keyword:
+        pattern = f"%{keyword}%"
+        query = query.filter(or_(
+            Project.title.ilike(pattern),
+            Project.owner_name.ilike(pattern),
+            Project.summary.ilike(pattern),
+            Project.user.has(User.username.ilike(pattern)),
+        ))
+    if submitted_from_local is not None:
+        query = query.filter(latest_submitted_at >= submitted_from_local)
+    if submitted_to_local is not None:
+        query = query.filter(latest_submitted_at <= submitted_to_local)
+    total = query.count()
+    rows = query.order_by(Project.updated_at.desc()).limit(300).all()
+    return {
+        "projects": [to_project_dict(project, submitted_at) for project, submitted_at in rows],
+        "total": total,
+    }
 
 
 @app.get("/api/projects/{project_id}")
@@ -5189,20 +5247,13 @@ def submit_task_project(
 ):
     if identity["role"] != "student":
         raise HTTPException(status_code=403, detail={"code": "STUDENT_REQUIRED", "message": "只有学生端可以提交作业。"})
-    student = identity["student"]
-    task = db.query(Task).filter(Task.id == task_id).first()
-    if not task:
-        raise HTTPException(status_code=404, detail={"code": "TASK_NOT_FOUND", "message": "课堂任务不存在。"})
-    if task.target_student_id is not None and task.target_student_id != student.id:
-        raise HTTPException(status_code=403, detail={"code": "TASK_FORBIDDEN", "message": "这项任务没有排给当前学生。"})
-    if task.course_schedule and not schedule_applies_to_student(task.course_schedule, student):
-        raise HTTPException(status_code=403, detail={"code": "TASK_FORBIDDEN", "message": "这项排课当前不属于该学生。"})
-    if task.classroom_id and task.classroom_id != student.classroom_id:
-        raise HTTPException(status_code=403, detail={"code": "TASK_FORBIDDEN", "message": "不能提交其他班级的任务。"})
-    if task.status != "published" or (task.starts_at and task.starts_at > beijing_now_naive()):
-        raise HTTPException(status_code=403, detail={"code": "TASK_NOT_OPEN", "message": "课堂任务尚未发布或还未开始。"})
-    submission = submit_project_for_task(db, task, student, payload.project_id)
-    return {"submission": to_submission_dict(submission)}
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "code": "LEGACY_TASK_SUBMISSION_DISABLED",
+            "message": "课堂任务提交入口已停用，请在课程学习中提交作品。",
+        },
+    )
 
 
 @app.get("/api/submissions")

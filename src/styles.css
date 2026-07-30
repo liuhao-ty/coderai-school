@@ -1349,6 +1349,31 @@ textarea {
   min-width: 0;
 }
 
+.curriculumCourseIdentity {
+  display: grid;
+  flex: 1 1 auto;
+  gap: 10px;
+}
+
+.curriculumCourseTitleRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.curriculumCourseTitleRow .ant-tag {
+  flex: 0 0 auto;
+  margin-inline-end: 0;
+}
+
+.curriculumCourseDescription {
+  display: block;
+  width: 100%;
+  margin: 0 !important;
+  line-height: 1.7;
+}
+
 .curriculumMeta {
   padding: 12px 0 18px;
   margin-bottom: 18px;
@@ -1609,6 +1634,18 @@ textarea {
 .studentScheduleListHeader {
   align-items: center;
   min-height: 42px;
+}
+
+.studentCourseSearch {
+  margin: 0 0 12px;
+}
+
+.studentCoursePagination {
+  margin-top: 12px;
+}
+
+.studentCoursePagination .ant-pagination-options {
+  margin-inline-start: 0;
 }
 
 .studentScheduleItem {

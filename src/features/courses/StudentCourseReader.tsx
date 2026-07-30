@@ -1,4 +1,4 @@
-import { Alert, App, Button, Checkbox, Drawer, Empty, Input, List, Radio, Segmented, Select, Space, Tag, Typography } from "antd";
+import { Alert, App, Button, Checkbox, Drawer, Empty, Input, List, Pagination, Radio, Segmented, Select, Space, Tag, Typography } from "antd";
 import { BookOpen, CheckCircle2, Clock3, Download, Edit3, Eye, FileText, Save, Send } from "lucide-react";
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
@@ -85,8 +85,37 @@ export function StudentCourseReader({
 }) {
   const { message, modal } = App.useApp();
   const orderedSchedules = useMemo(
-    () => [...schedules].sort((left, right) => left.starts_at.localeCompare(right.starts_at)),
+    () => [...schedules].sort((left, right) => {
+      const statusOrder: Record<CourseScheduleItem["status"], number> = {
+        active: 0,
+        scheduled: 1,
+        overdue: 2,
+        canceled: 3,
+      };
+      const statusDifference = statusOrder[left.status] - statusOrder[right.status];
+      if (statusDifference) return statusDifference;
+      if (left.status === "scheduled") return left.starts_at.localeCompare(right.starts_at);
+      if (left.status === "overdue") {
+        return (right.due_at || right.starts_at).localeCompare(left.due_at || left.starts_at);
+      }
+      return right.starts_at.localeCompare(left.starts_at);
+    }),
     [schedules],
+  );
+  const [courseSearch, setCourseSearch] = useState("");
+  const [coursePage, setCoursePage] = useState(1);
+  const [coursePageSize, setCoursePageSize] = useState(10);
+  const filteredSchedules = useMemo(() => {
+    const keyword = courseSearch.trim().toLowerCase();
+    if (!keyword) return orderedSchedules;
+    return orderedSchedules.filter((item) =>
+      item.course_title.toLowerCase().includes(keyword)
+      || item.package_title.toLowerCase().includes(keyword),
+    );
+  }, [courseSearch, orderedSchedules]);
+  const pageSchedules = useMemo(
+    () => filteredSchedules.slice((coursePage - 1) * coursePageSize, coursePage * coursePageSize),
+    [coursePage, coursePageSize, filteredSchedules],
   );
   const [selectedScheduleId, setSelectedScheduleId] = useState<number | null>(orderedSchedules[0]?.id ?? null);
   const [selectedProjectId, setSelectedProjectId] = useState<number | undefined>();
@@ -110,7 +139,7 @@ export function StudentCourseReader({
     [workspaceFields, workspaceText],
   );
 
-  const selectedSchedule = orderedSchedules.find((item) => item.id === selectedScheduleId) || orderedSchedules[0] || null;
+  const selectedSchedule = pageSchedules.find((item) => item.id === selectedScheduleId) || pageSchedules[0] || null;
   const selectedPackage = packages.find((item) => item.id === selectedSchedule?.package_id);
   const selectedCourse = selectedPackage?.courses.find((item) => item.id === selectedSchedule?.course_id);
   const submission = submissions.find((item) => item.task_id === selectedSchedule?.task_id);
@@ -119,12 +148,21 @@ export function StudentCourseReader({
     .map((item) => ({ value: item.id, label: `${item.title} · ${item.project_type}` }));
 
   useEffect(() => {
-    if (selectedScheduleId && !orderedSchedules.some((item) => item.id === selectedScheduleId)) {
-      setSelectedScheduleId(orderedSchedules[0]?.id ?? null);
-    } else if (!selectedScheduleId && orderedSchedules[0]) {
-      setSelectedScheduleId(orderedSchedules[0].id);
+    if (selectedScheduleId && !pageSchedules.some((item) => item.id === selectedScheduleId)) {
+      setSelectedScheduleId(pageSchedules[0]?.id ?? null);
+    } else if (!selectedScheduleId && pageSchedules[0]) {
+      setSelectedScheduleId(pageSchedules[0].id);
     }
-  }, [orderedSchedules, selectedScheduleId]);
+  }, [pageSchedules, selectedScheduleId]);
+
+  useEffect(() => {
+    setCoursePage(1);
+  }, [coursePageSize, courseSearch]);
+
+  useEffect(() => {
+    const lastPage = Math.max(1, Math.ceil(filteredSchedules.length / coursePageSize));
+    if (coursePage > lastPage) setCoursePage(lastPage);
+  }, [coursePage, coursePageSize, filteredSchedules.length]);
 
   useEffect(() => {
     setWorkspaceOpen(false);
@@ -341,8 +379,17 @@ export function StudentCourseReader({
         <div className="studentCourseLayout">
           <aside className="studentScheduleList" aria-label="我的课程列表">
             <div className="studentScheduleListHeader"><Text strong>我的课程</Text><Tag>{orderedSchedules.length}</Tag></div>
+            <Input.Search
+              className="studentCourseSearch"
+              allowClear
+              value={courseSearch}
+              onChange={(event) => setCourseSearch(event.target.value)}
+              placeholder="搜索课程或课程包名称"
+              aria-label="搜索课程名称"
+            />
             <List
-              dataSource={orderedSchedules}
+              dataSource={pageSchedules}
+              locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="没有匹配的课程" /> }}
               renderItem={(item) => {
                 const state = scheduleState(item.status);
                 return (
@@ -353,10 +400,24 @@ export function StudentCourseReader({
                     <Space direction="vertical" size={6} className="fullWidth">
                       <Text strong>{item.course_title}</Text>
                       <Text type="secondary">{item.package_title}</Text>
+                      <Text type="secondary">开始：{formatBeijingTime(item.starts_at)}</Text>
                       <Space wrap><Tag color={state.color}>{state.label}</Tag>{item.has_submitted && <Tag color="green" icon={<CheckCircle2 size={12} />}>已提交</Tag>}</Space>
                     </Space>
                   </List.Item>
                 );
+              }}
+            />
+            <Pagination
+              className="studentCoursePagination"
+              current={coursePage}
+              pageSize={coursePageSize}
+              total={filteredSchedules.length}
+              pageSizeOptions={[5, 10, 20]}
+              showSizeChanger
+              showLessItems
+              onChange={(page, pageSize) => {
+                setCoursePage(page);
+                setCoursePageSize(pageSize);
               }}
             />
           </aside>
@@ -372,7 +433,6 @@ export function StudentCourseReader({
                       {selectedPackage?.school_stages.map((stage) => <Tag key={stage}>{schoolStageLabel(stage)}</Tag>)}
                     </Space>
                     <Title level={3}>{selectedCourse.title}</Title>
-                    <Paragraph className="preWrapText" type="secondary">{selectedCourse.description || "管理员暂未填写课程简介。"}</Paragraph>
                   </div>
                   <div className="studentCourseDates">
                     <Text><Clock3 size={14} /> 开始：{formatBeijingTime(selectedSchedule.starts_at)}</Text>
@@ -441,7 +501,9 @@ export function StudentCourseReader({
                   {!projectOptions.length && selectedSchedule.status !== "scheduled" && <Text type="secondary">作品库暂无可提交作品，请先在学习工作台完成并保存作品。</Text>}
                 </section>
               </Space>
-            ) : <Alert type="warning" showIcon message="课程内容暂时不可用" />}
+            ) : filteredSchedules.length
+              ? <Alert type="warning" showIcon message="课程内容暂时不可用" />
+              : <Empty description="没有匹配的课程，请调整搜索关键词" />}
           </main>
         </div>
       )}

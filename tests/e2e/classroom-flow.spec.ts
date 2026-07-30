@@ -17,6 +17,13 @@ const PERSONAL_COURSE_TITLE = `E2E 个人创意课 ${RUN_ID}`;
 const CLASS_COURSE_TITLE = `E2E 班级协作课 ${RUN_ID}`;
 const PROJECT_TITLE = `E2E 文字作品 ${RUN_ID}`;
 const TEACHER_FEEDBACK = "E2E 批改通过，内容完整。";
+const COURSE_INTRO = [
+  "课程简介内容第一行应当位于标题下方。",
+  "第二行用于验证教师备课时的多行显示。",
+  "第三行用于验证默认三行预览。",
+  "第四行只应在展开预览后完整显示。",
+  "第五行用于验证展开后不会丢失换行。",
+].join("\n");
 
 type AuthPayload = Record<string, unknown> & {
   token: string;
@@ -130,7 +137,8 @@ async function setStudentAuth(page: Page, auth: AuthPayload) {
     localStorage.setItem("coderai_student_password_change_required", payload.password_change_required ? "true" : "false");
   }, auth);
   await page.goto("/#/student/workspace");
-  await expect(page.getByRole("heading", { name: "学生AI创作工作台" })).toBeVisible();
+  await expect(page).toHaveURL(/#\/student\/workspace\/notifications$/);
+  await expect(page.getByRole("heading", { name: "课堂通知" })).toBeVisible();
 }
 
 async function selectAntOption(page: Page, label: string, optionText: string) {
@@ -171,11 +179,22 @@ test("管理员建课、教师双模式排课、学生提交和教师批改形�
     await page.getByRole("button", { name: "添加课程" }).click();
     const courseDialog = page.getByRole("dialog", { name: "添加课程" });
     await courseDialog.getByLabel("课程名称").fill(title);
-    await courseDialog.getByLabel("课程简介").fill(`${title} 的课程简介`);
+    await courseDialog.getByLabel("课程简介").fill(`${title}\n${COURSE_INTRO}`);
     await courseDialog.getByLabel("提交说明").fill(instructions);
     await courseDialog.getByRole("button", { name: "保存课程" }).click();
     await expect(page.getByText("课程已添加", { exact: true }).last()).toBeVisible();
   }
+
+  const adminCourseCard = page.locator("article.curriculumCourse").filter({ hasText: PERSONAL_COURSE_TITLE });
+  const adminCourseTitleBounds = await adminCourseCard.getByRole("heading", { name: PERSONAL_COURSE_TITLE }).boundingBox();
+  const adminCourseDescription = adminCourseCard.locator(".curriculumCourseDescription");
+  const adminCourseDescriptionBounds = await adminCourseDescription.boundingBox();
+  expect(adminCourseTitleBounds).not.toBeNull();
+  expect(adminCourseDescriptionBounds).not.toBeNull();
+  expect(adminCourseDescriptionBounds!.y).toBeGreaterThanOrEqual(adminCourseTitleBounds!.y + adminCourseTitleBounds!.height);
+  await adminCourseCard.getByText("展开预览", { exact: true }).click();
+  await expect(adminCourseCard.getByText("收起", { exact: true })).toBeVisible();
+  await adminCourseCard.getByText("收起", { exact: true }).click();
 
   await expect(page.getByText("待补充", { exact: true })).toHaveCount(6);
   await page.getByRole("button", { name: "发布", exact: true }).click();
@@ -200,6 +219,9 @@ test("管理员建课、教师双模式排课、学生提交和教师批改形�
   await page.goForward();
   await expect(page.getByRole("heading", { name: PERSONAL_COURSE_TITLE })).toBeVisible();
   await expect(page.getByRole("heading", { name: CLASS_COURSE_TITLE })).toBeVisible();
+  const teacherCourseCard = page.locator("article.curriculumCourse").filter({ hasText: PERSONAL_COURSE_TITLE });
+  await teacherCourseCard.getByText("展开预览", { exact: true }).click();
+  await expect(teacherCourseCard.getByText("收起", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "新建课程包" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "添加课程" })).toHaveCount(0);
   await expect(page.getByText("管理员暂未补充", { exact: true })).toHaveCount(6);
@@ -215,11 +237,26 @@ test("管理员建课、教师双模式排课、学生提交和教师批改形�
   await expect(page.locator(".ant-table-row").filter({ hasText: CLASS_COURSE_TITLE })).toBeVisible();
 
   await setStudentAuth(page, studentAuth);
+  await expect(page.getByRole("menuitem", { name: "课堂通知" })).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "课堂素材" })).toBeVisible();
+  await expect(page.getByText("编程助手", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "提交作品" })).toHaveCount(0);
   await page.getByRole("menuitem", { name: "课程学习" }).click();
   await expect(page.getByRole("heading", { name: "课程学习" })).toBeVisible();
   await expect(page.locator(".studentScheduleItem").filter({ hasText: PERSONAL_COURSE_TITLE })).toBeVisible();
   await expect(page.locator(".studentScheduleItem").filter({ hasText: CLASS_COURSE_TITLE })).toBeVisible();
+  const courseSearch = page.getByRole("searchbox", { name: "搜索课程名称" });
+  await courseSearch.fill(PERSONAL_COURSE_TITLE);
+  await expect(page.locator(".studentScheduleItem").filter({ hasText: PERSONAL_COURSE_TITLE })).toBeVisible();
+  await expect(page.locator(".studentScheduleItem").filter({ hasText: CLASS_COURSE_TITLE })).toHaveCount(0);
+  await courseSearch.clear();
+  await page.locator(".studentCoursePagination .ant-select-selector").click();
+  await expect(page.locator(".ant-select-item-option").filter({ hasText: /^5/ })).toBeVisible();
+  await expect(page.locator(".ant-select-item-option").filter({ hasText: /^10/ })).toBeVisible();
+  await expect(page.locator(".ant-select-item-option").filter({ hasText: /^20/ })).toBeVisible();
+  await page.keyboard.press("Escape");
   await page.locator(".studentScheduleItem").filter({ hasText: PERSONAL_COURSE_TITLE }).click();
+  await expect(page.locator(".studentCourseContent")).not.toContainText("课程简介内容第一行");
   await expect(page.locator(".studentMaterial")).toHaveCount(1);
   await expect(page.locator(".studentMaterial")).toContainText("工程包");
   await expect(page.getByText("管理员暂未补充", { exact: true })).toHaveCount(1);
@@ -295,5 +332,5 @@ test("管理员建课、教师双模式排课、学生提交和教师批改形�
   await page.getByLabel("用户名").fill(STUDENT_USERNAME);
   await page.getByLabel("密码").fill(STUDENT_PASSWORD);
   await page.getByRole("button", { name: "登录", exact: true }).click();
-  await expect(page).toHaveURL(/#\/student\/workspace$/);
+  await expect(page).toHaveURL(/#\/student\/workspace\/notifications$/);
 });

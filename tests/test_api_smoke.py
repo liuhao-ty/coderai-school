@@ -7,7 +7,7 @@ import sqlite3
 import tempfile
 import unittest
 import zipfile
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -21,7 +21,7 @@ from sqlalchemy.orm import sessionmaker
 from backend.app.auth import PASSWORD_CHANGE_REQUIRED_KEY, PASSWORD_SETTING_KEY, SECRET_SETTING_KEY, set_setting
 from backend.app import db as db_module
 from backend.app.db import Base, CLOUD_MODE, get_db
-from backend.app.main import app
+from backend.app.main import app, submit_project_for_task
 from backend.app.models import AIProvider, AppSetting, Asset, Classroom, ClassroomTeacher, Course, CourseMaterial, CoursePackage, CoursePackageTeacher, CurriculumCourse, GuardianConsent, Lesson, ModerationLog, PrivacyPolicy, Project, ProviderAcceptanceRun, SubmissionVersion, Task, TaskSubmission, TeacherAuditLog, TeacherSession, UsageLog, User, VideoTask, Workflow, WorkflowRun, now
 from backend.app.licensing import canonical_license_payload
 from backend.app.plugins import canonical_plugin_manifest
@@ -35,6 +35,7 @@ from backend.app.services import (
     generate_zhipu_image,
     moderate_image_output,
     run_moderation,
+    to_submission_dict,
 )
 
 
@@ -110,6 +111,18 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post("/api/auth/student-login", json={"username": username, "password": password})
         self.assertEqual(response.status_code, 200)
         return {"X-CoderAI-Student-Token": response.json()["token"]}
+
+    def _create_historical_submission(self, task_id: int, project_id: int, student_id: int = 1) -> dict:
+        db = self.Session()
+        try:
+            task = db.get(Task, task_id)
+            student = db.get(User, student_id)
+            self.assertIsNotNone(task)
+            self.assertIsNotNone(student)
+            submission = submit_project_for_task(db, task, student, project_id)
+            return to_submission_dict(submission)
+        finally:
+            db.close()
 
     async def _create_staff_teacher(self, username: str, classroom_ids: list[int] | None = None):
         password = "Teacher2026"
@@ -1387,23 +1400,16 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
             json={"title": "Versioned Task", "status": "published", "due_at": "2020-01-01T08:00:00"},
         )
         task_id = task.json()["task"]["id"]
-        first = await self.client.post(
-            f"/api/classes/tasks/{task_id}/submissions", headers=self.student_a_headers,
-            json={"project_id": project_id},
-        )
-        self.assertEqual(first.status_code, 200)
-        self.assertTrue(first.json()["submission"]["is_late"])
-        submission_id = first.json()["submission"]["id"]
+        first = self._create_historical_submission(task_id, project_id)
+        self.assertTrue(first["is_late"])
+        submission_id = first["id"]
 
         await self.client.put(
             f"/api/projects/{project_id}", headers=self.student_a_headers,
             json={"title": "Versioned Work", "summary": "second version"},
         )
-        second = await self.client.post(
-            f"/api/classes/tasks/{task_id}/submissions", headers=self.student_a_headers,
-            json={"project_id": project_id},
-        )
-        self.assertEqual(second.json()["submission"]["version_count"], 2)
+        second = self._create_historical_submission(task_id, project_id)
+        self.assertEqual(second["version_count"], 2)
         versions = await self.client.get(f"/api/submissions/{submission_id}/versions", headers=self.student_a_headers)
         self.assertEqual([item["version_number"] for item in versions.json()["versions"]], [2, 1])
         self.assertEqual(versions.json()["versions"][0]["project_summary"], "second version")
@@ -1420,6 +1426,83 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(db.query(SubmissionVersion).count(), 0)
         finally:
             db.close()
+
+    async def test_project_filters_use_latest_submission_time_and_preserve_teacher_scope(self):
+        project_a = await self.client.post(
+            "/api/projects",
+            headers=self.student_a_headers,
+            json={"title": "January Robot", "project_type": "text", "summary": "first class project"},
+        )
+        project_b = await self.client.post(
+            "/api/projects",
+            headers=self.student_b_headers,
+            json={"title": "February Painting", "project_type": "text", "summary": "second class project"},
+        )
+        unsubmitted = await self.client.post(
+            "/api/projects",
+            headers=self.student_a_headers,
+            json={"title": "Never Submitted", "project_type": "text", "summary": "draft only"},
+        )
+        task_a = await self.client.post(
+            "/api/classes/tasks",
+            headers=self.teacher_headers,
+            json={"title": "January Task", "tool_scope": "text"},
+        )
+        task_b = await self.client.post(
+            "/api/classes/tasks",
+            headers=self.teacher_headers,
+            json={"title": "February Task", "tool_scope": "text"},
+        )
+        project_a_id = project_a.json()["project"]["id"]
+        project_b_id = project_b.json()["project"]["id"]
+        self._create_historical_submission(task_a.json()["task"]["id"], project_a_id)
+        self._create_historical_submission(task_a.json()["task"]["id"], project_a_id)
+        self._create_historical_submission(task_b.json()["task"]["id"], project_b_id, student_id=2)
+
+        db = self.Session()
+        try:
+            versions_a = db.query(SubmissionVersion).filter(
+                SubmissionVersion.project_id == project_a_id,
+            ).order_by(SubmissionVersion.version_number).all()
+            versions_b = db.query(SubmissionVersion).filter(
+                SubmissionVersion.project_id == project_b_id,
+            ).all()
+            versions_a[0].created_at = datetime(2026, 1, 10, 9, 0, 0)
+            versions_a[1].created_at = datetime(2026, 1, 20, 15, 30, 0)
+            versions_b[0].created_at = datetime(2026, 2, 10, 9, 0, 0)
+            class_a_id = db.get(User, 1).classroom_id
+            db.commit()
+        finally:
+            db.close()
+
+        january = await self.client.get(
+            "/api/projects",
+            headers=self.teacher_headers,
+            params={
+                "submitted_from": "2026-01-20T00:00:00+08:00",
+                "submitted_to": "2026-01-20T23:59:59+08:00",
+                "student_id": 1,
+                "classroom_id": class_a_id,
+                "project_type": "text",
+                "q": "robot",
+            },
+        )
+        self.assertEqual(january.status_code, 200, january.text)
+        self.assertEqual([item["id"] for item in january.json()["projects"]], [project_a_id])
+        self.assertEqual(january.json()["projects"][0]["latest_submitted_at"], "2026-01-20T15:30:00+08:00")
+
+        all_projects = (await self.client.get("/api/projects", headers=self.teacher_headers)).json()["projects"]
+        unsubmitted_row = next(item for item in all_projects if item["id"] == unsubmitted.json()["project"]["id"])
+        self.assertIsNone(unsubmitted_row["latest_submitted_at"])
+
+        _, staff_headers = await self._create_staff_teacher("project-scope-teacher", [class_a_id])
+        forbidden_class = await self.client.get(
+            "/api/projects",
+            headers=staff_headers,
+            params={"student_id": 2, "submitted_from": "2026-01-01T00:00:00+08:00"},
+        )
+        self.assertEqual(forbidden_class.status_code, 200, forbidden_class.text)
+        self.assertEqual(forbidden_class.json()["projects"], [])
 
     async def test_grading_rubric_templates_statistics_and_csv_export(self):
         invalid_task = await self.client.post(
@@ -1439,11 +1522,11 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
             "/api/projects", headers=self.student_a_headers,
             json={"title": "Graded Work", "project_type": "text", "summary": "work"},
         )
-        submitted = await self.client.post(
-            f"/api/classes/tasks/{task.json()['task']['id']}/submissions", headers=self.student_a_headers,
-            json={"project_id": project.json()["project"]["id"]},
+        submitted = self._create_historical_submission(
+            task.json()["task"]["id"],
+            project.json()["project"]["id"],
         )
-        submission_id = submitted.json()["submission"]["id"]
+        submission_id = submitted["id"]
         too_high = await self.client.put(
             f"/api/submissions/{submission_id}/review", headers=self.teacher_headers,
             json={"status": "reviewed", "score": 61, "feedback": "too high"},
@@ -1512,11 +1595,8 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
             json={"title": "Submit Work", "tool_scope": "text"},
         )
         task_id = task.json()["task"]["id"]
-        submitted = await self.client.post(
-            f"/api/classes/tasks/{task_id}/submissions", headers=self.student_a_headers,
-            json={"project_id": project_id},
-        )
-        self.assertEqual(submitted.status_code, 200)
+        submitted = self._create_historical_submission(task_id, project_id)
+        self.assertIsNotNone(submitted["id"])
         self.assertEqual((await self.client.delete(f"/api/projects/{project_id}", headers=self.student_a_headers)).status_code, 409)
         task_deleted = await self.client.delete(f"/api/classes/tasks/{task_id}", headers=self.teacher_headers)
         self.assertEqual(task_deleted.json()["deleted_submissions"], 1)
@@ -1576,16 +1656,10 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
             f"/api/classes/tasks/{task_id}/submissions", headers=self.student_a_headers,
             json={"project_id": project_id},
         )
-        self.assertEqual(blocked_submission.status_code, 409)
-        self.assertEqual(blocked_submission.json()["detail"]["code"], "PROJECT_NOT_ACTIVE")
+        self.assertEqual(blocked_submission.status_code, 410)
+        self.assertEqual(blocked_submission.json()["detail"]["code"], "LEGACY_TASK_SUBMISSION_DISABLED")
         await self.client.post(f"/api/projects/{project_id}/restore", headers=self.student_a_headers)
-        self.assertEqual(
-            (await self.client.post(
-                f"/api/classes/tasks/{task_id}/submissions", headers=self.student_a_headers,
-                json={"project_id": project_id},
-            )).status_code,
-            200,
-        )
+        self._create_historical_submission(task_id, project_id)
         self.assertEqual(
             (await self.client.delete(f"/api/projects/{project_id}", headers=self.student_a_headers)).status_code,
             409,
@@ -1699,8 +1773,8 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
             headers=self.student_a_headers,
             json={"project_id": project.json()["project"]["id"]},
         )
-        self.assertEqual(response.status_code, 403)
-        self.assertEqual(response.json()["detail"]["code"], "TASK_FORBIDDEN")
+        self.assertEqual(response.status_code, 410)
+        self.assertEqual(response.json()["detail"]["code"], "LEGACY_TASK_SUBMISSION_DISABLED")
 
     async def test_missing_provider_returns_stable_error(self):
         response = await self.client.post(
@@ -2363,14 +2437,13 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
             headers=self.teacher_headers,
             json={"title": "Audit Task", "tool_scope": "text"},
         )
-        submission = await self.client.post(
-            f"/api/classes/tasks/{task.json()['task']['id']}/submissions",
-            headers=self.student_a_headers,
-            json={"project_id": project.json()["project"]["id"]},
+        submission = self._create_historical_submission(
+            task.json()["task"]["id"],
+            project.json()["project"]["id"],
         )
         self.assertEqual(
             (await self.client.put(
-                f"/api/submissions/{submission.json()['submission']['id']}/review",
+                f"/api/submissions/{submission['id']}/review",
                 headers=self.teacher_headers,
                 json={"status": "reviewed", "score": 88, "feedback": "private teacher feedback"},
             )).status_code,
@@ -2870,14 +2943,14 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
             "/api/classes/tasks", headers=self.teacher_headers,
             json={"title": "Timezone Task", "tool_scope": "text"},
         )
-        submission = await self.client.post(
-            f"/api/classes/tasks/{task.json()['task']['id']}/submissions", headers=self.student_a_headers,
-            json={"project_id": project.json()["project"]["id"]},
+        submission = self._create_historical_submission(
+            task.json()["task"]["id"],
+            project.json()["project"]["id"],
         )
         for value in (
             project.json()["project"]["created_at"],
             task.json()["task"]["created_at"],
-            submission.json()["submission"]["created_at"],
+            submission["created_at"],
         ):
             self.assertTrue(value.endswith("+08:00"), value)
 
@@ -4382,11 +4455,7 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
         task = await self.client.post(
             "/api/classes/tasks", headers=self.teacher_headers, json={"title": "Privacy Export Task"},
         )
-        await self.client.post(
-            f"/api/classes/tasks/{task.json()['task']['id']}/submissions",
-            headers=self.student_a_headers,
-            json={"project_id": project_a.json()["project"]["id"]},
-        )
+        self._create_historical_submission(task.json()["task"]["id"], project_a.json()["project"]["id"])
         consent_response = await self.client.post(
             "/api/privacy/students/1/consents",
             headers=self.teacher_headers,
@@ -4475,11 +4544,7 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
         task = await self.client.post(
             "/api/classes/tasks", headers=self.teacher_headers, json={"title": "Delete Data Task"},
         )
-        await self.client.post(
-            f"/api/classes/tasks/{task.json()['task']['id']}/submissions",
-            headers=self.student_a_headers,
-            json={"project_id": project_id},
-        )
+        self._create_historical_submission(task.json()["task"]["id"], project_id)
         db = self.Session()
         try:
             db.get(Project, project_id).file_path = str(project_file)

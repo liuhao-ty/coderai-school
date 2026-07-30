@@ -2,7 +2,7 @@ import {
   Alert, App as AntApp, Button, Card, Col, Drawer, Form, Input, List, Popconfirm, Radio, Row, Segmented, Select, Space, Statistic, Tabs, Tag, Typography
 } from "antd";
 import {
-  BookOpen, Bot, ClipboardList, Eye, FileUp, Image, Library, Play, RotateCcw, Save, Video
+  BookOpen, ClipboardList, Eye, Image, Library, Play, RotateCcw, Video
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
@@ -24,8 +24,10 @@ import { PluginToolsPanel } from "./PluginToolsPanel";
 
 
 const { Title, Text, Paragraph } = Typography;
+export type StudentWorkspaceView = "notifications" | "materials" | "text" | "image" | "video";
 
 export function StudentWorkspace({
+  view,
   onRefresh,
   provider,
   classTasks,
@@ -35,6 +37,7 @@ export function StudentWorkspace({
   videoTasks,
   studentProfile
 }: {
+  view: StudentWorkspaceView;
   onRefresh: () => Promise<void>;
   provider: ProviderState;
   classTasks: ClassTask[];
@@ -46,7 +49,6 @@ export function StudentWorkspace({
 }) {
   const { message } = AntApp.useApp();
   const [textResult, setTextResult] = useState("");
-  const [codeResult, setCodeResult] = useState("");
   const [imageResult, setImageResult] = useState<{
     url?: string;
     file_path?: string;
@@ -57,8 +59,6 @@ export function StudentWorkspace({
   const [videoNotice, setVideoNotice] = useState<{ type: "success" | "warning" | "error"; message: string } | null>(null);
   const [refreshingVideoId, setRefreshingVideoId] = useState<number | null>(null);
   const [loading, setLoading] = useState("");
-  const [submittingTaskId, setSubmittingTaskId] = useState<number | null>(null);
-  const [taskProjectMap, setTaskProjectMap] = useState<Record<number, number>>({});
   const [studentPreviewAsset, setStudentPreviewAsset] = useState<AssetItem | null>(null);
   const [studentPreviewAssetUrl, setStudentPreviewAssetUrl] = useState("");
   const [studentPreviewLoading, setStudentPreviewLoading] = useState(false);
@@ -68,8 +68,12 @@ export function StudentWorkspace({
   const [imageInput, setImageInput] = useState<{ file_name: string; file_path: string; size: number } | null>(null);
   const [videoInput, setVideoInput] = useState<{ file_name: string; file_path: string; size: number } | null>(null);
   const [uploadingInput, setUploadingInput] = useState<"image" | "video" | "">("");
-  const [generationError, setGenerationError] = useState<{ tool: "text" | "image" | "video" | "code"; message: string; code: string; values: any } | null>(null);
+  const [generationError, setGenerationError] = useState<{ tool: "text" | "image" | "video"; message: string; code: string; values: any } | null>(null);
   const allowedTools = useMemo(() => allowedToolsFromTasks(classTasks), [classTasks]);
+  const legacyTasks = useMemo(
+    () => classTasks.filter((task) => !task.course_schedule_id && task.task_kind !== "schedule"),
+    [classTasks],
+  );
   const studentSchoolStage = normalizeSchoolStage(studentProfile?.age_level);
   const isPrimaryLowerStudent = studentSchoolStage === "primary_lower";
   const canUseText = allowedTools.has("text");
@@ -118,27 +122,6 @@ export function StudentWorkspace({
     }
   };
 
-  const runCodeAssistant = async (values: { prompt: string }) => {
-    setLoading("code");
-    setGenerationError(null);
-    setCodeResult("");
-    try {
-      const res = await api.post("/api/text/generate", {
-        prompt: values.prompt,
-        mode: "code_explain",
-        age_level: studentSchoolStage
-      });
-      setCodeResult(res.data.text);
-      await onRefresh();
-      message.success("编程助手结果已保存到作品库");
-    } catch (error) {
-      setGenerationError({ tool: "code", message: explainError(error), code: errorCode(error), values });
-      message.error(explainError(error));
-    } finally {
-      setLoading("");
-    }
-  };
-
   const runVideo = async (values: { prompt: string; source_image_path?: string; duration_seconds: number }) => {
     setLoading("video");
     setGenerationError(null);
@@ -180,7 +163,6 @@ export function StudentWorkspace({
     if (tool === "text") void runText(values);
     if (tool === "image") void runImage(values);
     if (tool === "video") void runVideo(values);
-    if (tool === "code") void runCodeAssistant(values);
   };
 
   const refreshVideoTask = async (taskId: number) => {
@@ -222,24 +204,6 @@ export function StudentWorkspace({
     }
   };
 
-  const submitTask = async (taskId: number) => {
-    const projectId = taskProjectMap[taskId];
-    if (!projectId) {
-      message.warning("请先选择要提交的作品");
-      return;
-    }
-    setSubmittingTaskId(taskId);
-    try {
-      await api.post(`/api/classes/tasks/${taskId}/submissions`, { project_id: projectId });
-      await onRefresh();
-      message.success("作业已提交");
-    } catch (error) {
-      message.error(explainError(error));
-    } finally {
-      setSubmittingTaskId(null);
-    }
-  };
-
   const openStudentVersions = async (submission: TaskSubmission) => {
     setStudentVersionSubmission(submission);
     setStudentVersionsLoading(true);
@@ -278,17 +242,33 @@ export function StudentWorkspace({
     setStudentPreviewAsset(null);
   };
 
+  const viewMeta: Record<StudentWorkspaceView, { title: string; description: string }> = {
+    notifications: { title: "课堂通知", description: "查看课堂安排、截止时间和已有作业反馈。" },
+    materials: { title: "课堂素材", description: "查看教师发布的课堂图片、视频和学习资料。" },
+    text: { title: "文字生成", description: "使用课堂开放的文字模型完成创作并保存到作品库。" },
+    image: { title: "图片生成", description: "使用文字或参考图片生成作品并保存到作品库。" },
+    video: { title: "视频生成", description: "创建视频任务并查看生成、重试和保存状态。" },
+  };
+  const isGenerationView = view === "text" || view === "image" || view === "video";
+  const currentToolAllowed = view === "text"
+    ? canUseText
+    : view === "image"
+      ? canUseImage
+      : view === "video"
+        ? canUseVideo
+        : true;
+
   return (
     <div className="page">
       <div className="pageTitle">
-        <Title level={2}>学生AI创作工作台</Title>
+        <Title level={2}>{viewMeta[view].title}</Title>
         <Text>
           {studentProfile
-            ? `${studentProfile.name} · ${studentProfile.classroom_name || "未分配班级"} · ${studentProfile.school_stage_label || schoolStageLabel(studentProfile.age_level)}`
-            : "文字、图片和编程创意都从这里开始。"}
+            ? `${viewMeta[view].description} ${studentProfile.name} · ${studentProfile.classroom_name || "未分配班级"} · ${studentProfile.school_stage_label || schoolStageLabel(studentProfile.age_level)}`
+            : viewMeta[view].description}
         </Text>
       </div>
-      {!provider.configured && (
+      {isGenerationView && !provider.configured && (
         <Alert
           type="warning"
           showIcon
@@ -296,11 +276,12 @@ export function StudentWorkspace({
           description="当前界面可浏览，但生成任务会提示先完成教师设置。"
         />
       )}
-      {classTasks.length > 0 && (
-        <Card className="mb16" title={<IconTitle icon={<ClipboardList size={18} />} text="课堂任务" />}>
+      {view === "notifications" && (
+        <Card className="mb16" title={<IconTitle icon={<ClipboardList size={18} />} text="课堂通知" />}>
           <List
-            dataSource={classTasks}
-            pagination={classTasks.length > 5 ? { pageSize: 5, showSizeChanger: false } : false}
+            dataSource={legacyTasks}
+            pagination={legacyTasks.length > 5 ? { pageSize: 5, showSizeChanger: false } : false}
+            locale={{ emptyText: <EmptyState title="暂无课堂通知" description="教师发布新的课堂安排后会显示在这里" /> }}
             renderItem={(task) => (
               <List.Item>
                 <List.Item.Meta
@@ -325,25 +306,6 @@ export function StudentWorkspace({
                         {task.due_at && <Tag color="gold">截止 {formatBeijingTime(task.due_at)}</Tag>}
                         <Text type="secondary">{formatBeijingTime(task.created_at)}</Text>
                       </Space>
-                      <Space wrap>
-                        <Select
-                          className="taskSubmitSelect"
-                          placeholder={projects.length ? "选择作品提交" : "先在作品库保存作品"}
-                          value={taskProjectMap[task.id]}
-                          disabled={!projects.length}
-                          onChange={(value) => setTaskProjectMap((current) => ({ ...current, [task.id]: value }))}
-                          options={projects.map((project) => ({ value: project.id, label: project.title }))}
-                        />
-                        <Button
-                          size="small"
-                          type="primary"
-                          onClick={() => submitTask(task.id)}
-                          loading={submittingTaskId === task.id}
-                          disabled={!projects.length}
-                        >
-                          提交作品
-                        </Button>
-                      </Space>
                       {submissionForTask(submissions, task.id)?.feedback && (
                         <Text type="secondary">教师反馈：{submissionForTask(submissions, task.id)?.feedback}</Text>
                       )}
@@ -360,12 +322,13 @@ export function StudentWorkspace({
           />
         </Card>
       )}
-      {assets.length > 0 && (
+      {view === "materials" && (
         <Card className="mb16" title={<IconTitle icon={<Library size={18} />} text="课堂素材" />}>
           <List
             size="small"
             dataSource={assets}
             pagination={assets.length > 6 ? { pageSize: 6, showSizeChanger: false } : false}
+            locale={{ emptyText: <EmptyState title="暂无课堂素材" description="教师发布素材后会显示在这里" /> }}
             renderItem={(asset) => (
               <List.Item actions={[<Button key="preview" size="small" icon={<Eye size={15} />} onClick={() => openStudentAsset(asset)}>预览</Button>]}> 
                 <Space direction="vertical" size={4} className="fullWidth">
@@ -391,7 +354,7 @@ export function StudentWorkspace({
           />
         </Card>
       )}
-      <Alert
+      {isGenerationView && <Alert
         className="mb16"
         type="info"
         showIcon
@@ -405,10 +368,10 @@ export function StudentWorkspace({
             ? "小学低龄：界面保留基础创作项，并隐藏任务类型、图片尺寸和参考图等高级参数。"
             : studentSchoolStage === "primary_upper"
               ? "小学高龄：已开放任务类型、参考图和更多创作参数。"
-              : "初中高中：已开放完整创作参数，文字助手会使用更准确的技术术语和验证方法。"
+              : "初中高中：已开放完整创作参数，生成结果会使用更准确的技术术语和验证方法。"
         }
-      />
-      {generationError && (
+      />}
+      {isGenerationView && generationError && (
         <Alert
           className="mb16"
           type="error"
@@ -420,10 +383,10 @@ export function StudentWorkspace({
           onClose={() => setGenerationError(null)}
         />
       )}
-      <PluginToolsPanel supportsText={supportsText} onRefresh={onRefresh} />
+      {view === "text" && canUseText && <PluginToolsPanel supportsText={supportsText} onRefresh={onRefresh} />}
       <Row gutter={[16, 16]}>
-        {canUseText && (
-        <Col xs={24} xl={12}>
+        {view === "text" && canUseText && (
+        <Col span={24}>
           <Card title={<IconTitle icon={<BookOpen size={18} />} text="AI文字生成" />}>
             {!supportsText && <Alert className="mb16" type="warning" showIcon message="当前 AI 服务未提供文字生成能力" />}
             <Form layout="vertical" onFinish={runText} initialValues={{ mode: "story", age_level: studentSchoolStage }}>
@@ -433,7 +396,6 @@ export function StudentWorkspace({
                     options={[
                       { value: "story", label: "故事创作" },
                       { value: "polish", label: "作文润色" },
-                      { value: "code_explain", label: "代码解释" },
                       { value: "prompt_refine", label: "提示词改写" }
                     ]}
                   />
@@ -450,27 +412,8 @@ export function StudentWorkspace({
           </Card>
         </Col>
         )}
-        {canUseText && (
-        <Col xs={24} xl={12}>
-          <Card title={<IconTitle icon={<Bot size={18} />} text="编程助手" />}>
-            {!supportsText && <Alert className="mb16" type="warning" showIcon message="编程助手需要文字模型，请联系教师调整 AI 服务" />}
-            <Form layout="vertical" onFinish={runCodeAssistant}>
-              <Form.Item name="prompt" label="代码或问题" rules={[{ required: true, message: "请输入代码或编程问题" }]}>
-                <Input.TextArea
-                  rows={7}
-                  placeholder={"粘贴 Scratch 思路、Python/JavaScript 代码，或描述遇到的报错。\n例如：帮我解释这段循环为什么只运行了一次。"}
-                />
-              </Form.Item>
-              <Button icon={<Bot size={16} />} type="primary" htmlType="submit" loading={loading === "code"} disabled={!supportsText}>
-                获取帮助
-              </Button>
-            </Form>
-            {codeResult && <pre className="resultText">{codeResult}</pre>}
-          </Card>
-        </Col>
-        )}
-        {canUseImage && (
-        <Col xs={24} xl={12}>
+        {view === "image" && canUseImage && (
+        <Col span={24}>
           <Card title={<IconTitle icon={<Image size={18} />} text="AI图片生成" />}>
             {!supportsImage && <Alert className="mb16" type="warning" showIcon message="当前 AI 服务未提供图片生成能力" />}
             <Form layout="vertical" onFinish={runImage} initialValues={{ style: "明亮卡通", size: "1024x1024" }}>
@@ -528,8 +471,8 @@ export function StudentWorkspace({
           </Card>
         </Col>
         )}
-        {canUseVideo && (
-        <Col xs={24} xl={12}>
+        {view === "video" && canUseVideo && (
+        <Col span={24}>
           <Card title={<IconTitle icon={<Video size={18} />} text="AI视频生成" />}>
             {!supportsVideo && <Alert className="mb16" type="warning" showIcon message="当前 AI 服务未提供视频生成能力" />}
             <Form layout="vertical" onFinish={runVideo} initialValues={{ duration_seconds: 5 }}>
@@ -649,9 +592,9 @@ export function StudentWorkspace({
           </Card>
         </Col>
         )}
-        {!canUseText && !canUseImage && !canUseVideo && (
+        {isGenerationView && !currentToolAllowed && (
           <Col span={24}>
-            <Alert type="warning" showIcon message="当前课堂任务没有开放生成工具，请查看任务说明或联系教师。" />
+            <Alert type="warning" showIcon message="当前课堂没有开放这个生成工具，请查看课堂通知或联系教师。" />
           </Col>
         )}
       </Row>

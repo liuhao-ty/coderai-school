@@ -1,6 +1,7 @@
 import {
-  Alert, App as AntApp, Button, Card, Col, Drawer, Image as AntImage, Input, List, Popconfirm, Row, Segmented, Select, Space, Spin, Statistic, Tabs, Tag, Typography
+  Alert, App as AntApp, Button, Card, Col, DatePicker, Drawer, Image as AntImage, Input, List, Popconfirm, Row, Segmented, Select, Space, Spin, Statistic, Tabs, Tag, Typography
 } from "antd";
+import dayjs, { type Dayjs } from "dayjs";
 import {
   Archive, Download, Edit3, Eye, FileText, Library, RotateCcw, Save, Trash2
 } from "lucide-react";
@@ -62,8 +63,9 @@ export function ProjectLibrary({
   const [draftSummary, setDraftSummary] = useState("");
   const [searchText, setSearchText] = useState("");
   const [typeFilter, setTypeFilter] = useState<string>("all");
-  const [studentFilter, setStudentFilter] = useState<number | "all">("all");
-  const [classroomFilter, setClassroomFilter] = useState<number | "all">("all");
+  const [studentFilter, setStudentFilter] = useState<number>();
+  const [classroomFilter, setClassroomFilter] = useState<number>();
+  const [submittedRange, setSubmittedRange] = useState<[Dayjs | null, Dayjs | null] | null>(null);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [downloading, setDownloading] = useState(false);
@@ -71,8 +73,11 @@ export function ProjectLibrary({
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState("");
   const previewObjectUrlRef = useRef("");
+  const projectRequestRef = useRef<AbortController | null>(null);
   const [projectScope, setProjectScope] = useState<"active" | "archived" | "trash">("active");
   const [libraryProjects, setLibraryProjects] = useState<Project[]>(projects);
+  const [libraryTotal, setLibraryTotal] = useState(projects.length);
+  const [libraryLoading, setLibraryLoading] = useState(false);
   const isTeacherView = audience !== "student";
   const archivedStudentReadOnly = audience === "teacher" && Boolean(selectedProject?.student_archived);
 
@@ -86,45 +91,91 @@ export function ProjectLibrary({
     setPreviewError("");
   };
 
-  const loadProjectScope = async (scope: "active" | "archived" | "trash") => {
-    const res = await api.get("/api/projects", { params: { scope } });
+  const loadProjectScope = async (scope: "active" | "archived" | "trash", signal?: AbortSignal) => {
+    const res = await api.get("/api/projects", {
+      signal,
+      params: {
+        scope,
+        ...(isTeacherView && searchText.trim() ? { q: searchText.trim() } : {}),
+        ...(isTeacherView && typeFilter !== "all" ? { project_type: typeFilter } : {}),
+        ...(isTeacherView && studentFilter ? { student_id: studentFilter } : {}),
+        ...(isTeacherView && classroomFilter ? { classroom_id: classroomFilter } : {}),
+        ...(isTeacherView && submittedRange?.[0]
+          ? { submitted_from: submittedRange[0].startOf("day").format() }
+          : {}),
+        ...(isTeacherView && submittedRange?.[1]
+          ? { submitted_to: submittedRange[1].endOf("day").format() }
+          : {}),
+      },
+    });
+    if (signal?.aborted) return;
     setLibraryProjects(res.data.projects || []);
+    setLibraryTotal(Number(res.data.total ?? res.data.projects?.length ?? 0));
   };
 
   const refreshLibrary = async () => {
     await onRefresh();
-    if (projectScope !== "active") await loadProjectScope(projectScope);
+    if (isTeacherView || projectScope !== "active") await loadProjectScope(projectScope);
   };
 
   useEffect(() => {
-    if (projectScope === "active") setLibraryProjects(projects);
-  }, [projectScope, projects]);
+    if (!isTeacherView && projectScope === "active") {
+      setLibraryProjects(projects);
+      setLibraryTotal(projects.length);
+    }
+  }, [isTeacherView, projectScope, projects]);
 
   useEffect(() => {
-    if (projectScope !== "active") void loadProjectScope(projectScope).catch(() => undefined);
     clearPreviewFile();
     setSelectedProject(null);
-  }, [projectScope]);
+    projectRequestRef.current?.abort();
+    const controller = new AbortController();
+    projectRequestRef.current = controller;
+    if (!isTeacherView && projectScope === "active") return () => controller.abort();
+    const timer = window.setTimeout(() => {
+      setLibraryLoading(true);
+      void loadProjectScope(projectScope, controller.signal)
+        .catch((error) => {
+          if (!controller.signal.aborted) message.error(`作品筛选失败：${explainError(error)}`);
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) setLibraryLoading(false);
+        });
+    }, isTeacherView ? 300 : 0);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [classroomFilter, isTeacherView, projectScope, searchText, studentFilter, submittedRange, typeFilter]);
 
   useEffect(() => () => {
+    projectRequestRef.current?.abort();
     if (previewObjectUrlRef.current) URL.revokeObjectURL(previewObjectUrlRef.current);
   }, []);
 
-  const projectTypes = useMemo(() => Array.from(new Set(libraryProjects.map((project) => project.project_type))).filter(Boolean), [libraryProjects]);
+  const projectTypes = useMemo(
+    () => Array.from(new Set([...projects, ...libraryProjects].map((project) => project.project_type))).filter(Boolean),
+    [libraryProjects, projects],
+  );
   const filteredProjects = useMemo(() => {
     const keyword = searchText.trim().toLowerCase();
     return libraryProjects.filter((project) => {
+      const student = students.find((item) => item.id === project.user_id);
       const matchesKeyword =
         !keyword ||
         project.title.toLowerCase().includes(keyword) ||
         project.owner_name.toLowerCase().includes(keyword) ||
-        project.summary.toLowerCase().includes(keyword);
+        project.summary.toLowerCase().includes(keyword) ||
+        student?.username.toLowerCase().includes(keyword);
       const matchesType = typeFilter === "all" || project.project_type === typeFilter;
-      const matchesStudent = studentFilter === "all" || project.user_id === studentFilter;
-      const matchesClassroom = classroomFilter === "all" || project.classroom_id === classroomFilter;
-      return matchesKeyword && matchesType && matchesStudent && matchesClassroom;
+      const matchesStudent = !studentFilter || project.user_id === studentFilter;
+      const matchesClassroom = !classroomFilter || project.classroom_id === classroomFilter;
+      const submittedAt = project.latest_submitted_at ? dayjs(project.latest_submitted_at) : null;
+      const matchesSubmittedFrom = !submittedRange?.[0] || Boolean(submittedAt?.isAfter(submittedRange[0].startOf("day")) || submittedAt?.isSame(submittedRange[0].startOf("day")));
+      const matchesSubmittedTo = !submittedRange?.[1] || Boolean(submittedAt?.isBefore(submittedRange[1].endOf("day")) || submittedAt?.isSame(submittedRange[1].endOf("day")));
+      return matchesKeyword && matchesType && matchesStudent && matchesClassroom && matchesSubmittedFrom && matchesSubmittedTo;
     });
-  }, [classroomFilter, libraryProjects, searchText, studentFilter, typeFilter]);
+  }, [classroomFilter, libraryProjects, searchText, studentFilter, students, submittedRange, typeFilter]);
 
   const classroomName = (classroomId?: number | null) =>
     classrooms.find((classroom) => classroom.id === classroomId)?.name || (classroomId ? "未命名班级" : "未分配班级");
@@ -408,7 +459,7 @@ export function ProjectLibrary({
           <Row gutter={[12, 12]}>
             <Col xs={12} md={6}>
               <Card className="teacherMetric">
-                <Statistic title="当前分区" value={libraryProjects.length} />
+                <Statistic title="当前分区" value={libraryTotal} />
               </Card>
             </Col>
             <Col xs={12} md={6}>
@@ -429,14 +480,14 @@ export function ProjectLibrary({
           </Row>
           <Card className="projectFilterPanel">
             <Row gutter={[12, 12]}>
-              <Col xs={24} xl={8}>
+              <Col xs={24} md={12} xl={8}>
                 <Input
                   placeholder="搜索标题、学生或内容"
                   value={searchText}
                   onChange={(event) => setSearchText(event.target.value)}
                 />
               </Col>
-              <Col xs={24} sm={8} xl={5}>
+              <Col xs={24} sm={12} xl={4}>
                 <Select
                   className="fullWidth"
                   value={typeFilter}
@@ -447,26 +498,42 @@ export function ProjectLibrary({
                   ]}
                 />
               </Col>
-              <Col xs={24} sm={8} xl={5}>
+              <Col xs={24} sm={12} xl={6}>
                 <Select
                   className="fullWidth"
+                  showSearch
+                  allowClear
+                  optionFilterProp="label"
+                  aria-label="按学生筛选作品"
+                  placeholder="全部学生"
                   value={studentFilter}
                   onChange={setStudentFilter}
-                  options={[
-                    { value: "all", label: "全部学生" },
-                    ...students.map((student) => ({ value: student.id, label: student.name }))
-                  ]}
+                  options={students.map((student) => ({
+                    value: student.id,
+                    label: `${student.name} · ${student.username}`,
+                  }))}
                 />
               </Col>
-              <Col xs={24} sm={8} xl={6}>
+              <Col xs={24} sm={12} xl={6}>
                 <Select
                   className="fullWidth"
+                  showSearch
+                  allowClear
+                  optionFilterProp="label"
+                  aria-label="按班级筛选作品"
+                  placeholder="全部班级"
                   value={classroomFilter}
                   onChange={setClassroomFilter}
-                  options={[
-                    { value: "all", label: "全部班级" },
-                    ...classrooms.map((classroom) => ({ value: classroom.id, label: classroom.name }))
-                  ]}
+                  options={classrooms.map((classroom) => ({ value: classroom.id, label: classroom.name }))}
+                />
+              </Col>
+              <Col xs={24} md={12} xl={10}>
+                <DatePicker.RangePicker
+                  className="fullWidth"
+                  value={submittedRange}
+                  onChange={(dates) => setSubmittedRange(dates)}
+                  placeholder={["提交开始日期", "提交结束日期"]}
+                  allowClear
                 />
               </Col>
             </Row>
@@ -474,6 +541,7 @@ export function ProjectLibrary({
         </Space>
       )}
       <List
+        loading={libraryLoading}
         grid={{ gutter: 16, xs: 1, sm: 2, lg: 3 }}
         dataSource={filteredProjects}
         locale={{
@@ -504,6 +572,11 @@ export function ProjectLibrary({
                   {isTeacherView && <Tag>{classroomName(project.classroom_id)}</Tag>}
                 </Space>
                 <Paragraph ellipsis={{ rows: 4 }}>{project.summary || "暂无摘要"}</Paragraph>
+                {isTeacherView && (
+                  <Text type="secondary">
+                    {project.latest_submitted_at ? `最近提交：${formatBeijingTime(project.latest_submitted_at)}` : "尚未提交"}
+                  </Text>
+                )}
                 <Text type="secondary">{lifecycleTime(project)}</Text>
                 <ProjectFileStatus project={project} compact />
               </Space>

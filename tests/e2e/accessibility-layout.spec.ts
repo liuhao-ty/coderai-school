@@ -151,7 +151,8 @@ async function setStudentAuth(page: Page, studentAuth: Record<string, unknown>) 
     localStorage.setItem("coderai_student_password_change_required", auth.password_change_required ? "true" : "false");
   }, studentAuth);
   await page.goto("/#/student/workspace");
-  await expect(page.getByRole("heading", { name: "学生AI创作工作台" })).toBeVisible();
+  await expect(page).toHaveURL(/#\/student\/workspace\/notifications$/);
+  await expect(page.getByRole("heading", { name: "课堂通知" })).toBeVisible();
 }
 
 async function setTeacherAuth(page: Page, teacherAuth: Record<string, unknown>) {
@@ -243,9 +244,9 @@ test("管理员单独和批量创建学生，学生端不提供自行注册", as
   await page.getByLabel("密码", { exact: true }).fill("bcm123456");
   await expect(page.getByRole("button", { name: "首次注册" })).toHaveCount(0);
   await page.getByRole("button", { name: "登录", exact: true }).click();
-  await expect(page).toHaveURL(/#\/student\/workspace$/);
-  await expect(page.getByRole("heading", { name: "学生AI创作工作台" })).toBeVisible();
-  await expect(page.getByText(new RegExp(`管理员创建学生 · ${username.replaceAll(".", "\\.")}`))).toBeVisible();
+  await expect(page).toHaveURL(/#\/student\/workspace\/notifications$/);
+  await expect(page.getByRole("heading", { name: "课堂通知" })).toBeVisible();
+  await expect(page.getByText(/管理员创建学生/).first()).toBeVisible();
 
   const disabled = await request.post(`${API_URL}/api/auth/student-register`, {
     data: { invitation_code: "DISABLED", username: "disabled.self", password: "Student2026" }
@@ -649,6 +650,7 @@ test("图片作品支持本地与云端预览下载且不显示云端地址", as
     moderation_log_id: null,
     archived_at: null,
     trashed_at: null,
+    latest_submitted_at: createdAt,
     created_at: createdAt,
     updated_at: createdAt,
   };
@@ -671,7 +673,7 @@ test("图片作品支持本地与云端预览下载且不显示云端地址", as
       return;
     }
     if (requestUrl.pathname === "/api/projects") {
-      await route.fulfill({ status: 200, headers: corsHeaders, contentType: "application/json", body: JSON.stringify({ projects }) });
+      await route.fulfill({ status: 200, headers: corsHeaders, contentType: "application/json", body: JSON.stringify({ projects, total: projects.length }) });
       return;
     }
     const fileMatch = requestUrl.pathname.match(/^\/api\/projects\/(\d+)\/file$/);
@@ -700,6 +702,26 @@ test("图片作品支持本地与云端预览下载且不显示云端地址", as
   await setTeacherAuth(page, teacherAuth);
   await page.getByRole("menuitem", { name: "学员作品" }).click();
   await expect(page.getByRole("heading", { name: "作品管理" })).toBeVisible();
+  await expect(page.getByText(/最近提交：/).first()).toBeVisible();
+  const studentFilter = page.getByRole("combobox", { name: "按学生筛选作品" });
+  await studentFilter.fill("默认");
+  await page.locator(".ant-select-item-option").filter({ hasText: "默认学生" }).click();
+  const studentSelect = studentFilter.locator("xpath=ancestor::div[contains(concat(' ',normalize-space(@class),' '),' ant-select ')][1]");
+  await studentSelect.hover();
+  await studentSelect.locator(".ant-select-clear").click();
+  await expect(page.locator(".projectCard")).toHaveCount(projects.length);
+  const classroomFilter = page.getByRole("combobox", { name: "按班级筛选作品" });
+  await classroomFilter.fill("默认");
+  await page.locator(".ant-select-item-option").filter({ hasText: "默认班级" }).click();
+  const classroomSelect = classroomFilter.locator("xpath=ancestor::div[contains(concat(' ',normalize-space(@class),' '),' ant-select ')][1]");
+  await classroomSelect.hover();
+  await classroomSelect.locator(".ant-select-clear").click();
+  await expect(page.locator(".projectCard")).toHaveCount(projects.length);
+  await page.getByPlaceholder("提交开始日期").fill("2026-07-16");
+  await page.getByPlaceholder("提交开始日期").press("Enter");
+  await page.getByPlaceholder("提交结束日期").fill("2026-07-16");
+  await page.getByPlaceholder("提交结束日期").press("Enter");
+  await expect(page.locator(".projectCard")).toHaveCount(projects.length);
 
   await page.locator(".projectCard").filter({ hasText: "E2E 本地图片" }).click();
   let drawer = page.locator(".ant-drawer-content").last();
@@ -901,19 +923,47 @@ test("键盘可以完成学生登录、跳过导航和页面切换", async ({ pa
   await page.keyboard.press("Tab");
   await expect(page.getByRole("button", { name: "登录", exact: true })).toBeFocused();
   await page.keyboard.press("Enter");
-  await expect(page.getByRole("heading", { name: "学生AI创作工作台" })).toBeFocused();
+  await expect(page.getByRole("heading", { name: "课堂通知" })).toBeFocused();
 
   const skipLink = page.getByRole("link", { name: "跳到主要内容" });
   await skipLink.focus();
   await page.keyboard.press("Enter");
   await expect(page.locator("#main-content")).toBeFocused();
-  await expect(page).toHaveURL(/#\/student\/workspace$/);
+  await expect(page).toHaveURL(/#\/student\/workspace\/notifications$/);
 
   const courseMenuItem = page.getByRole("menuitem", { name: "课程学习" });
   await courseMenuItem.focus();
   await page.keyboard.press("Enter");
   await expect(page).toHaveURL(/#\/student\/courses$/);
   await expect(page.getByRole("heading", { name: "课程学习" })).toBeFocused();
+});
+
+test("学生学习工作台使用二级导航并兼容旧工作流地址", async ({ page, request }) => {
+  const { studentAuth } = await loginData(request);
+  await page.route("**/api/classes/tasks", (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({ tasks: [] }),
+  }));
+  await setStudentAuth(page, studentAuth);
+  for (const label of ["课堂通知", "课堂素材", "文字生成", "图片生成", "视频生成", "工作流生成"]) {
+    await expect(page.getByRole("menuitem", { name: label })).toBeVisible();
+  }
+  await expect(page.getByText("编程助手", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "提交作品" })).toHaveCount(0);
+
+  await page.getByRole("menuitem", { name: "课堂素材" }).click();
+  await expect(page).toHaveURL(/#\/student\/workspace\/materials$/);
+  await expect(page.getByRole("heading", { name: "课堂素材" })).toBeVisible();
+  await page.getByRole("menuitem", { name: "文字生成" }).click();
+  await expect(page).toHaveURL(/#\/student\/workspace\/text$/);
+  await expect(page.getByRole("heading", { name: "文字生成" })).toBeVisible();
+  await expect(page.getByText("代码解释", { exact: true })).toHaveCount(0);
+
+  await page.goto("/#/student/workflows");
+  await expect(page).toHaveURL(/#\/student\/workspace\/workflow$/);
+  await expect(page.getByRole("heading", { name: "工作流制作" })).toBeVisible();
+  await expect(page.getByText("代码解释", { exact: true })).toHaveCount(0);
 });
 
 test("学生端和管理员端适配目标 Windows 分辨率及高 DPI", async ({ browser, request }) => {

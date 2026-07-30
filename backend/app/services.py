@@ -1991,7 +1991,7 @@ def provider_status_payload(db: Session) -> dict[str, Any]:
     }
 
 
-def to_project_dict(project: Project) -> dict[str, Any]:
+def to_project_dict(project: Project, latest_submitted_at: datetime | None = None) -> dict[str, Any]:
     file_exists, file_status = project_file_status(project.file_path)
     return {
         "id": project.id,
@@ -2013,6 +2013,7 @@ def to_project_dict(project: Project) -> dict[str, Any]:
         "trashed_at": format_optional_beijing_datetime(project.trashed_at),
         "file_exists": file_exists,
         "file_status": file_status,
+        "latest_submitted_at": format_beijing_datetime(latest_submitted_at) if latest_submitted_at else None,
         "created_at": format_beijing_datetime(project.created_at),
         "updated_at": format_beijing_datetime(project.updated_at),
     }
