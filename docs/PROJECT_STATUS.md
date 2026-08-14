@@ -1,12 +1,12 @@
 # CoderAI 学堂项目状态
 
-更新时间：2026-07-30（北京时间）
-目标版本：Windows 客户端 `0.2.0-beta.5`，云端 API `0.2.0-beta.3`
+更新时间：2026-08-14（北京时间）
+目标版本：Windows 客户端 `0.2.0-beta.6`，云端 API `0.2.0-beta.4`
 发布范围：单机构、免费封闭内测、最多 50 人同时在线、Windows、必须联网
 
 ## 结论
 
-云端内测所需的主体代码已经完成，并已部署 beta 更新：机构租户、PostgreSQL/Alembic、S3 对象存储、Redis/Celery、服务器密钥保护、Tauri 桌面工程、CI、监控、备份、迁移、隐私保留和灰度更新均已落入仓库；2026-07-30 发布云端 API `0.2.0-beta.3` 和客户端 `0.2.0-beta.5`，补充课程简介折叠预览、学员作品提交时间筛选、学生工作台二级导航和课程搜索分页。
+云端内测所需的主体代码已经完成，并已部署 beta 更新：机构租户、PostgreSQL/Alembic、S3 对象存储、Redis/Celery、服务器密钥保护、Tauri 桌面工程、CI、监控、备份、迁移、隐私保留和灰度更新均已落入仓库；2026-08-14 发布云端 API `0.2.0-beta.4` 和客户端 `0.2.0-beta.6`，增加服务端只读请求并发闸门、客户端版本追踪和 Caddy 敏感请求头脱敏。
 
 阿里云单机构技术内测环境已经部署并可由 Windows 客户端访问，但这不等于完成 50 人上线验收。当前主机低于计划规格，且独立备份、Windows 代码签名、机构真实 AI 密钥、50 人压测和合规确认尚未完成；在这些问题解决前不得将该环境描述为生产安全环境。
 
@@ -16,13 +16,16 @@
 
 - 公网入口：`https://39.108.109.94`，机构代码 `coderai-pilot`，机构名称 `CoderAI`
 - 数据方式：全新初始化；PostgreSQL、Redis、MinIO、FastAPI、Celery、Caddy 和监控容器均已运行
-- 服务端发布：`0.2.0-beta.3`，构建标识 `95e2652d9e3c`；Alembic 已升级至 `20260727_0003`
+- 服务端发布：`0.2.0-beta.4`，构建标识 `f9db63b8800a5ff732b3255e72d61a71f6bb6b08`；Alembic 已升级至 `20260727_0003`
 - 上一版快照：服务器 `/srv/coderai/release-backups/pre-beta2-20260726T104726Z`
-- HTTPS：Let's Encrypt IP SAN 证书已签发，ACME Webroot 路径与强制证书重载已修复；2026-07-26 真实续期成功，12 小时定时器继续启用
+- HTTPS：Let's Encrypt IP SAN 证书已签发，ACME Webroot 路径与强制证书重载已修复；2026-08-14 自动续期成功，12 小时定时器继续启用
 - 发布前快照：服务器 `/srv/coderai/release-backups/pre-beta3-20260730T034851Z`，包含 PostgreSQL、MinIO 对象、旧源码和生产配置
 - 本轮发布前快照：服务器 `/srv/coderai/release-backups/pre-567800f-20260730T114459Z`，包含 PostgreSQL、MinIO 对象、旧源码和生产配置
-- 桌面端：`0.2.0-beta.5` 已注入正式 API、机构代码和更新地址；包含课程简介折叠预览、作品提交时间筛选、学生工作台二级导航和课程搜索分页
-- 更新服务：beta.5 安装包、`.sig` 和 `latest.json` 已由 `/desktop-updates/` 提供，公开安装包 SHA-256 为 `4fd8e9b2fc07882c22309300489cdae020fc7dfca61057505ed291296ccedfd9`
+- 稳定性修复前快照：服务器 `/srv/coderai/release-backups/pre-f9db63b-20260814T153842Z`，包含 PostgreSQL、MinIO 对象、旧源码和生产配置；更新文件备份位于 `/srv/coderai/release-backups/pre-beta6-updater-20260814T154952Z`
+- 桌面端：`0.2.0-beta.6` 已注入正式 API、机构代码、客户端版本标识和更新地址
+- 更新服务：beta.6 安装包、`.sig` 和 `latest.json` 已由 `/desktop-updates/` 提供，公开安装包 SHA-256 为 `8093a529b4fd286ea11b5ec731b162e168f8d5425ab70568200e0176af627f6f`
+- 稳定性验证：20 个并发就绪检查全部返回 200，发布后连接池超时计数为 0，API、Worker、Beat、Backup 和 Caddy 重启计数均为 0
+- 安全处置：Caddy 已删除访问日志中的 Authorization、Cookie、教师令牌和学生令牌；上线后撤销 8 个教师会话及 5 个学生会话
 - 资源限制：当前 ECS 为 2 核、约 1.6 GB 内存、40 GB 系统盘和 4 GB Swap，不满足 4 核、8 GB、100 GB 的 50 人目标规格
 - 灾备限制：`CODERAI_BACKUP_ENABLED=false`，暂无独立 OSS/S3 备份；监控持续上报 `coderai_backup_enabled 0`
 - 发布限制：安装包没有 Authenticode 签名，仅限知情的内部技术测试
@@ -147,7 +150,7 @@ python -m pip_audit --requirement requirements.lock
 - [x] 已在真实 ECS 验证 Let's Encrypt IP 证书首次签发、12 小时续期和 Caddy 重载
 - [ ] 准备与生产数据盘独立的对象备份存储
 - [ ] 采购 Windows Authenticode 代码签名证书
-- [x] 已在仓库外提供 Tauri updater 私钥和密码；CI secret 仍需在建立私有远端后配置
+- [x] 已在仓库外提供 Tauri updater 私钥和密码；GitHub 远端已建立，CI secret 仍需配置
 - [x] 已配置公网 IP 下的 Tauri 签名更新产物存储
 - [ ] 配置 Alertmanager 邮件或 Webhook 告警接收端
 - [ ] 提供机构真实 AI 服务商密钥并确认数据流向
@@ -160,7 +163,7 @@ python -m pip_audit --requirement requirements.lock
 2. 使用迁移副本演练 SQLite -> PostgreSQL/S3，核对数量和哈希。
 3. 创建唯一强密码管理员并重新录入机构 AI 密钥。
 4. 执行 50 账号压测、真实 AI 成功/失败测试和恢复演练。
-5. 对 `0.2.0-beta.5` 继续完成 Windows 10/11、高 DPI、自动更新和回滚矩阵验证。
+5. 对 `0.2.0-beta.6` 继续完成 Windows 10/11、高 DPI、自动更新和回滚矩阵验证。
 6. 依次进行内部管理员、5 至 10 人、单班和全机构灰度，每阶段稳定 3 个教学日。
 7. 正式迁移时冻结本地写入；云端验收失败则恢复原本地版本，不做双向同步。
 

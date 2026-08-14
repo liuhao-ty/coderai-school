@@ -1,7 +1,7 @@
 # CoderAI 学堂架构
 
-更新时间：2026-07-30（北京时间）
-目标版本：Windows 客户端 `0.2.0-beta.5`，云端 API `0.2.0-beta.3`
+更新时间：2026-08-14（北京时间）
+目标版本：Windows 客户端 `0.2.0-beta.6`，云端 API `0.2.0-beta.4`
 
 ## 1. 部署边界
 
@@ -134,6 +134,8 @@ Operations: Prometheus + Alertmanager + independent backup storage
 - `/api/health/live` 检查进程，`/api/health/ready` 检查数据库、Redis、对象存储和机构
 - `/api/version` 返回版本、最低客户端版本、渠道、提交和部署模式
 - `/metrics` 只在内部网络由 Prometheus 抓取，Caddy 对公网返回 404
+- 每个 API worker 通过可配置并发闸门限制 GET/HEAD 请求，避免旧客户端突发读取耗尽数据库连接池
+- 桌面请求携带客户端版本；API 结构化日志记录版本，Caddy 访问日志删除授权、Cookie 和师生会话令牌
 - Alertmanager 可通过 `CODERAI_ALERT_WEBHOOK_URL` 接入 HTTPS Webhook
 - 无域名部署使用固定公网 IPv4 和 Let's Encrypt `shortlived` IP 证书；systemd 每 12 小时续期并让 Caddy 重载
 - Caddy 在同一 HTTPS IP 的 `/desktop-updates/` 提供 Tauri 签名更新文件
@@ -141,7 +143,7 @@ Operations: Prometheus + Alertmanager + independent backup storage
 ## 10. 发布与回滚
 
 - `main` 的 `1a3848a` 是云端改造前回滚基线
-- 云端版本在 `release/0.2.0-beta.3` 上形成可审查发布快照
+- 云端 API `0.2.0-beta.4` 和 Windows 客户端 `0.2.0-beta.6` 以提交 `f9db63b` 形成可审查发布快照
 - GitHub Actions 执行 Ruff、依赖审计、后端测试、前端构建、Tauri 测试、E2E、容器集成和 Windows 冒烟构建
 - 正式工作流从 GitHub Secrets 导入 Authenticode PFX 和 Tauri 更新签名私钥
 - 回滚数据库前先停止写入并执行恢复演练；客户端问题通过从回滚提交构建更高补丁版本发布，避免签名更新降级问题

@@ -1,6 +1,6 @@
 # 单机构公网 IP 云端部署手册
 
-适用版本：`0.2.0-beta.3`
+适用版本：`0.2.0-beta.4`
 目标：境内 Linux x64、单机构、最多 50 人同时在线
 
 ## 1. 上线前条件
@@ -57,6 +57,8 @@ python -m backend.app.cli generate-secret-key
 - `CODERAI_BUILD_COMMIT` 填写发布提交 SHA
 - `CODERAI_APT_MIRROR` 仅用于服务器构建时替换 Debian 镜像主机；网络正常时留空，阿里云境内构建可设为 `https://mirrors.aliyun.com`
 - `CODERAI_PIP_INDEX_URL` 仅用于服务器构建 Python 依赖；网络正常时留空，阿里云境内构建可设为 `https://mirrors.aliyun.com/pypi/simple/`
+- `CODERAI_MAX_CONCURRENT_READS_PER_WORKER` 按单 worker 数据库容量设置；当前低配试点使用 `6`
+- `CODERAI_MINIMUM_CLIENT_VERSION` 使用已发布且可更新的最低客户端版本，禁止填写尚未上传的版本
 
 检查 Compose 展开结果，确认没有空变量或占位值：
 
@@ -143,7 +145,7 @@ curl -fsS "https://$CODERAI_PUBLIC_IP/desktop-updates/latest.json" || true
 
 - `live` 返回 `ok`
 - `ready` 返回 HTTP 200 且数据库、队列和对象存储全部 `ready`
-- `version` 为 `0.2.0-beta.3`，`deployment_mode` 为 `cloud`
+- `version` 为 `0.2.0-beta.4`，`deployment_mode` 为 `cloud`
 - 公网访问 `https://<公网IP>/metrics` 返回 404
 - TLS 证书 SAN 包含当前公网 IP，系统和 WebView 均能建立受信任连接
 - `coderai-cert-renew.timer` 已启用，且 `coderai_tls_certificate_valid_beyond_48h` 为 `1`
