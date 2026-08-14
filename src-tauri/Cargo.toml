@@ -1,6 +1,6 @@
 [package]
 name = "coderai-school"
-version = "0.2.0-beta.5"
+version = "0.2.0-beta.6"
 description = "CoderAI 学堂 Windows 桌面客户端"
 authors = ["CoderAI 学堂"]
 edition = "2021"

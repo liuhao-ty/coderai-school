@@ -20,7 +20,7 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
         }
-        for key in ("request_id", "method", "path", "status_code", "duration_ms", "organization_code"):
+        for key in ("request_id", "method", "path", "status_code", "duration_ms", "organization_code", "client_version"):
             value = getattr(record, key, None)
             if value not in (None, ""):
                 payload[key] = value
@@ -204,6 +204,7 @@ def configure_observability(app: FastAPI) -> None:
                 "status_code": response.status_code,
                 "duration_ms": duration_ms,
                 "organization_code": request.headers.get("X-CoderAI-Organization-Code", ""),
+                "client_version": request.headers.get("X-CoderAI-Client-Version", "")[:40],
             },
         )
         return response

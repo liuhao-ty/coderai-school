@@ -103,7 +103,7 @@ services:
       args:
         CODERAI_APT_MIRROR: ${CODERAI_APT_MIRROR:-}
         CODERAI_PIP_INDEX_URL: ${CODERAI_PIP_INDEX_URL:-}
-    image: coderai-api:0.2.0-beta.3
+    image: coderai-api:0.2.0-beta.4
     restart: "no"
     command: ["migrate"]
     environment: *app-environment
@@ -116,12 +116,13 @@ services:
         condition: service_completed_successfully
 
   api:
-    image: coderai-api:0.2.0-beta.3
+    image: coderai-api:0.2.0-beta.4
     restart: unless-stopped
     command: ["api"]
     environment:
       <<: *app-environment
       CODERAI_API_WORKERS: ${CODERAI_API_WORKERS:-2}
+      CODERAI_MAX_CONCURRENT_READS_PER_WORKER: ${CODERAI_MAX_CONCURRENT_READS_PER_WORKER:-6}
     volumes:
       - app_runtime:/app/runtime
     depends_on:
@@ -136,7 +137,7 @@ services:
       - no-new-privileges:true
 
   worker:
-    image: coderai-api:0.2.0-beta.3
+    image: coderai-api:0.2.0-beta.4
     restart: unless-stopped
     command: ["worker"]
     environment:
@@ -151,7 +152,7 @@ services:
       - no-new-privileges:true
 
   beat:
-    image: coderai-api:0.2.0-beta.3
+    image: coderai-api:0.2.0-beta.4
     restart: unless-stopped
     command: ["beat"]
     environment: *app-environment
@@ -185,7 +186,7 @@ services:
       - no-new-privileges:true
 
   backup:
-    image: coderai-api:0.2.0-beta.3
+    image: coderai-api:0.2.0-beta.4
     restart: unless-stopped
     command: ["backup", "--loop"]
     environment:

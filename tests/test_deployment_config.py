@@ -17,6 +17,11 @@ class PublicIpDeploymentConfigTests(unittest.TestCase):
         self.assertNotIn("handle_path /.well-known/acme-challenge/*", caddyfile)
         self.assertIn("handle_path /desktop-updates/*", caddyfile)
         self.assertIn("health_interval 2s", caddyfile)
+        self.assertIn("format filter", caddyfile)
+        self.assertIn("request>headers>X-Coderai-Teacher-Token delete", caddyfile)
+        self.assertIn("request>headers>X-Coderai-Student-Token delete", caddyfile)
+        self.assertIn("request>headers>Authorization delete", caddyfile)
+        self.assertIn("request>headers>Cookie delete", caddyfile)
         self.assertNotIn("CODERAI_DOMAIN", caddyfile)
 
     def test_compose_mounts_certificate_webroot_and_update_files(self):
@@ -37,6 +42,7 @@ class PublicIpDeploymentConfigTests(unittest.TestCase):
         self.assertIn("ARG CODERAI_PIP_INDEX_URL=", dockerfile)
         self.assertIn("--index-url \"$CODERAI_PIP_INDEX_URL\"", dockerfile)
         self.assertIn("CODERAI_PIP_INDEX_URL: ${CODERAI_PIP_INDEX_URL:-}", compose)
+        self.assertIn("CODERAI_MAX_CONCURRENT_READS_PER_WORKER", compose)
 
     def test_ip_certificate_scripts_use_shortlived_profile_and_webroot_renewal(self):
         bootstrap = (ROOT / "deploy" / "bootstrap-ip-certificate.sh").read_text(encoding="utf-8")
@@ -72,6 +78,12 @@ class PublicIpDeploymentConfigTests(unittest.TestCase):
     def test_windows_build_trims_the_encrypted_updater_password(self):
         build_script = (ROOT / "tools" / "build-tauri.ps1").read_text(encoding="utf-8")
         self.assertIn("(Get-Content -LiteralPath $passwordPath -Raw).Trim() | ConvertTo-SecureString", build_script)
+
+    def test_desktop_requests_declare_the_client_version(self):
+        api_client = (ROOT / "src" / "lib" / "api.ts").read_text(encoding="utf-8")
+        vite_config = (ROOT / "vite.config.ts").read_text(encoding="utf-8")
+        self.assertIn('"X-CoderAI-Client-Version": CLIENT_VERSION', api_client)
+        self.assertIn('"import.meta.env.VITE_APP_VERSION"', vite_config)
 
     def test_windows_desktop_uses_gui_subsystem_and_native_file_save_plugins(self):
         main = (ROOT / "src-tauri" / "src" / "main.rs").read_text(encoding="utf-8")

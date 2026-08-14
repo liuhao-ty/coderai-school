@@ -41,6 +41,14 @@ http://{$CODERAI_PUBLIC_IP} {
 
 	log {
 		output stdout
-		format json
+		format filter {
+			wrap json
+			fields {
+				request>headers>Authorization delete
+				request>headers>Cookie delete
+				request>headers>X-Coderai-Student-Token delete
+				request>headers>X-Coderai-Teacher-Token delete
+			}
+		}
 	}
 }

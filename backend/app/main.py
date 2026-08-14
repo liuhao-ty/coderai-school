@@ -68,6 +68,7 @@ from backend.app.operations import router as operations_router
 from backend.app.backup import router as backup_router
 from backend.app.privacy import ensure_student_ai_consent, router as privacy_router
 from backend.app.provider_presets import list_provider_presets
+from backend.app.request_limits import ReadConcurrencyMiddleware
 from backend.app.school_stages import (
     infer_school_stages,
     normalize_school_stage,
@@ -185,7 +186,7 @@ from backend.app.services import (
 )
 
 
-APP_VERSION = "0.2.0-beta.3"
+APP_VERSION = "0.2.0-beta.4"
 
 app = FastAPI(title="CoderAI 学堂 API", version=APP_VERSION)
 app.include_router(operations_router)
@@ -212,6 +213,11 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+app.add_middleware(
+    ReadConcurrencyMiddleware,
+    max_concurrent=max(1, int(os.environ.get("CODERAI_MAX_CONCURRENT_READS_PER_WORKER", "6"))),
+    exempt_paths={"/api/health/live", "/metrics"},
 )
 
 

@@ -22,6 +22,7 @@ export const STUDENT_PROFILE_KEY = "coderai_student_profile";
 export const STUDENT_PASSWORD_CHANGE_REQUIRED_KEY = "coderai_student_password_change_required";
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || "";
+const CLIENT_VERSION = import.meta.env.VITE_APP_VERSION || "dev";
 const TRANSIENT_HTTP_STATUSES = new Set([502, 503, 504]);
 const RECOVERY_DELAYS_MS = [300, 700, 1500, 2500, 4000];
 
@@ -108,7 +109,10 @@ async function probeApiUntilAvailable() {
     try {
       await axios.get("/api/health/live", {
         baseURL: API_BASE_URL,
-        headers: { "X-CoderAI-Organization-Code": ORGANIZATION_CODE },
+        headers: {
+          "X-CoderAI-Organization-Code": ORGANIZATION_CODE,
+          "X-CoderAI-Client-Version": CLIENT_VERSION,
+        },
         timeout: 2500,
       });
       return true;
@@ -131,7 +135,10 @@ function waitForApiRecovery() {
 export const api = axios.create({
   baseURL: API_BASE_URL,
   timeout: 120_000,
-  headers: { "X-CoderAI-Organization-Code": ORGANIZATION_CODE },
+  headers: {
+    "X-CoderAI-Organization-Code": ORGANIZATION_CODE,
+    "X-CoderAI-Client-Version": CLIENT_VERSION,
+  },
 });
 
 api.interceptors.request.use(async (config) => {
