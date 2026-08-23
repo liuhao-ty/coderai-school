@@ -44,7 +44,7 @@ export function LaunchScreen({
             </button>
           </Col>
         </Row>
-        <Button type="link" icon={<ShieldCheck size={16} />} onClick={onPrivacy}>
+        <Button className="privacyPolicyLink" type="link" icon={<ShieldCheck size={16} />} onClick={onPrivacy}>
           隐私与未成年人数据保护政策
         </Button>
       </div>

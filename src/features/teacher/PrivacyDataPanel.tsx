@@ -416,7 +416,7 @@ export function PrivacyDataPanel({ onRefresh }: { onRefresh: () => Promise<void>
         confirmLoading={loading === "consent"}
         onCancel={() => setConsentModalOpen(false)}
         onOk={() => void consentForm.validateFields().then(grantConsent)}
-        destroyOnClose
+        destroyOnHidden
       >
         <Form form={consentForm} layout="vertical">
           <Row gutter={12}>

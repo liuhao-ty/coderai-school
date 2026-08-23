@@ -12,6 +12,9 @@ export type Project = {
   owner_name: string;
   summary: string;
   file_path: string;
+  original_file_name?: string;
+  mime_type?: string;
+  file_size?: number;
   file_exists: boolean;
   file_status: string;
   latest_submitted_at?: string | null;
@@ -122,7 +125,8 @@ export type TaskSubmission = {
   owner_teacher_id?: number | null;
   task_id: number;
   task_title: string;
-  project_id: number;
+  project_id: number | null;
+  source_type?: "project" | "attachment";
   project_title: string;
   user_id: number;
   student_name: string;
@@ -173,6 +177,8 @@ export type CurriculumCourseItem = {
   assignment_instructions: string;
   tool_scope: string;
   rubric: Array<{ criterion: string; max_score: number }>;
+  submission_extensions: string[];
+  submission_max_bytes: number;
   materials: Record<CourseMaterialKind, CourseMaterialState>;
   schedule_ids: number[];
   created_at: string;
@@ -242,11 +248,91 @@ export type SubmissionVersion = {
   id: number;
   submission_id: number;
   version_number: number;
-  project_id: number;
+  project_id: number | null;
+  source_type: "project" | "attachment";
   project_title: string;
   project_summary: string;
-  project_file_path: string;
+    project_file_path: string;
+    file_available: boolean;
+    file?: {
+      original_file_name: string;
+      mime_type: string;
+      file_size: number;
+      safety_status: "approved" | "pending" | "rejected";
+      source_type: "project" | "attachment";
+    } | null;
+  attachment?: {
+    id: number;
+    original_file_name: string;
+    mime_type: string;
+    file_size: number;
+    safety_status: "approved" | "pending" | "rejected";
+  } | null;
   is_late: boolean;
+  review_status: string;
+  feedback: string;
+  score?: number | null;
+  max_score: number;
+  created_at: string;
+};
+
+export type AIGenerationJob = {
+  id: number;
+  client_request_id: string;
+  capability: "text" | "image" | "video" | "workflow";
+  operation: string;
+  provider_id?: number | null;
+  model: string;
+  status: "queued" | "running" | "succeeded" | "failed" | "timed_out" | "canceled";
+  result: Record<string, unknown> & { text?: string; artifact_id?: number; video_task_id?: number; file_available?: boolean };
+  error_code: string;
+  error_message: string;
+  retry_count: number;
+  cancel_requested: boolean;
+  project_id?: number | null;
+  conversation_id?: number | null;
+  created_at: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  updated_at: string;
+};
+
+export type AgentConversation = {
+  id: number;
+  title: string;
+  selected_provider_id?: number | null;
+  status: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type AgentMessage = {
+  id: number;
+  conversation_id: number;
+  role: "user" | "assistant";
+  content: string;
+  status: "pending" | "completed" | "failed";
+  provider_id?: number | null;
+  model: string;
+  sequence: number;
+  tool_suggestion?: { capability?: "image" | "video" | "workflow"; prompt?: string };
+  created_at: string;
+};
+
+export type AgentArtifact = {
+  id: number;
+  conversation_id: number;
+  message_id?: number | null;
+  generation_job_id?: number | null;
+  saved_project_id?: number | null;
+  artifact_type: "image" | "video";
+  title: string;
+  original_file_name: string;
+  mime_type: string;
+  file_size: number;
+  status: "available" | "pending_review" | "rejected" | "saved" | "expired";
+  file_available: boolean;
+  expires_at?: string | null;
   created_at: string;
 };
 
@@ -397,6 +483,7 @@ export type ProviderState = {
   api_key_masked?: string;
   api_key_error?: string;
   enabled?: boolean;
+  student_selectable?: boolean;
   last_test_status?: "untested" | "success" | "failed";
   last_test_message?: string;
   last_tested_at?: string | null;
@@ -405,6 +492,7 @@ export type ProviderState = {
   usage_count?: number;
   routed_capabilities?: ProviderCapability[];
   provider_count?: number;
+  requires_api_key?: boolean;
 };
 
 export type ProviderCapability = "text" | "image" | "video";
@@ -414,6 +502,8 @@ export type ProviderRouteMap = Record<ProviderCapability, number[]>;
 export type ProviderModelOption = {
   id: string;
   name: string;
+  durations?: number[];
+  supports_image?: boolean;
 };
 
 export type ProviderPreset = {
@@ -425,6 +515,7 @@ export type ProviderPreset = {
   image_model: string;
   video_model: string;
   capabilities: string[];
+  requires_api_key?: boolean;
   models: Record<ProviderCapability, ProviderModelOption[]>;
   description: string;
 };
@@ -440,6 +531,8 @@ export type SystemModelOption = {
   display_name: string;
   configured: boolean;
   available: boolean;
+  student_selectable?: boolean;
+  parameters?: { durations?: number[]; supports_image?: boolean };
   reason: string;
 };
 
@@ -522,6 +615,7 @@ export type ProviderFormValues = {
   image_model: string;
   video_model: string;
   enabled: boolean;
+  student_selectable: boolean;
 };
 
 export type AppMode = "launch" | "student-login" | "student-password-change" | "student" | "teacher-login" | "teacher-password-change" | "teacher" | "admin";

@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import os
 import mimetypes
 from dataclasses import dataclass
 from time import perf_counter
@@ -15,8 +16,13 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from backend.app.db import DATA_DIR
-from backend.app.models import AIProvider, AIProviderRoute, AppSetting, Asset, Classroom, Course, Lesson, ModerationLog, Project, SubmissionVersion, Task, TaskSubmission, UsageLog, User, VideoTask, now
-from backend.app.provider_presets import get_provider_preset, list_provider_presets, provider_capabilities
+from backend.app.models import AIGenerationJob, AIProvider, AIProviderRoute, AgentArtifact, AppSetting, Asset, Classroom, Course, Lesson, ModerationLog, Project, SubmissionVersion, Task, TaskSubmission, UsageLog, User, VideoTask, now
+from backend.app.provider_presets import (
+    get_provider_preset,
+    list_provider_presets,
+    provider_capabilities,
+    provider_requires_api_key,
+)
 from backend.app.school_stages import SCHOOL_STAGES, normalize_school_stage, school_stage_label
 from backend.app.secrets import SecretProtectionError, decrypt_secret
 from backend.app.storage import object_exists, put_bytes, read_bytes as read_stored_bytes, reference_name
@@ -36,6 +42,7 @@ VIDEO_RETRYABLE_STATUSES = frozenset({"failed", "timed_out", "download_failed", 
 VIDEO_EXPIRED_HTTP_STATUSES = frozenset({401, 403, 404, 410})
 QWEN_IMAGE_TIMEOUT_SECONDS = 180
 QWEN_IMAGE_POLL_SECONDS = 2
+IMAGE_PROVIDER_TIMEOUT_SECONDS = max(30, int(os.environ.get("CODERAI_IMAGE_PROVIDER_TIMEOUT_SECONDS", "180")))
 
 for directory in [OUTPUT_DIR, PROJECT_DIR, ASSET_DIR, CACHE_DIR, LOG_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
@@ -76,6 +83,7 @@ class ProviderRuntimeConfig:
     image_model: str
     video_model: str
     enabled: bool
+    student_selectable: bool
     last_test_status: str
     last_test_message: str
     last_tested_at: datetime | None
@@ -94,6 +102,7 @@ def provider_runtime_config(provider: AIProvider) -> ProviderRuntimeConfig:
         image_model=provider.image_model,
         video_model=provider.video_model,
         enabled=provider.enabled,
+        student_selectable=provider.student_selectable,
         last_test_status=provider.last_test_status,
         last_test_message=provider.last_test_message,
         last_tested_at=provider.last_tested_at,
@@ -110,6 +119,10 @@ def release_provider_lookup_connection(db: Session) -> None:
 
 def provider_model(provider: AIProvider | ProviderRuntimeConfig, capability: str) -> str:
     return str(getattr(provider, f"{capability}_model", "") or "").strip()
+
+
+def provider_credentials_configured(provider: AIProvider | ProviderRuntimeConfig) -> bool:
+    return bool(str(provider.api_key or "").strip()) or not provider_requires_api_key(provider.provider_type)
 
 
 def _route_provider_ids(route: AIProviderRoute | None) -> list[int]:
@@ -139,7 +152,7 @@ def ensure_default_provider_routes(db: Session) -> None:
             (
                 item
                 for item in providers
-                if item.api_key.strip()
+                if provider_credentials_configured(item)
                 and capability in provider_capabilities(item.provider_type)
                 and provider_model(item, capability)
             ),
@@ -176,7 +189,7 @@ def provider_candidates(db: Session, capability: str) -> list[AIProvider]:
         for provider_id in ids
         if provider_id in by_id
         and by_id[provider_id].enabled
-        and by_id[provider_id].api_key.strip()
+        and provider_credentials_configured(by_id[provider_id])
         and capability in provider_capabilities(by_id[provider_id].provider_type)
     ]
     if not candidates:
@@ -184,7 +197,7 @@ def provider_candidates(db: Session, capability: str) -> list[AIProvider]:
             status_code=400,
             detail={
                 "code": "PROVIDER_REQUIRED",
-                "message": f"{capability} 路由中没有已启用且配置密钥的模型服务，请教师检查服务商状态。",
+                "message": f"{capability} 路由中没有已启用且连接配置完整的模型服务，请教师检查服务商状态。",
             },
         )
     return candidates
@@ -206,10 +219,10 @@ def active_provider(
         return provider_candidates(db, capability)[0]
     else:
         provider = db.query(AIProvider).filter(AIProvider.enabled.is_(True)).order_by(AIProvider.id.desc()).first()
-    if not provider or not provider.api_key.strip():
+    if not provider or not provider_credentials_configured(provider):
         raise HTTPException(
             status_code=400,
-            detail={"code": "PROVIDER_REQUIRED", "message": "教师端还没有配置可用的云端AI API密钥。请先进入教师设置完成配置。"},
+            detail={"code": "PROVIDER_REQUIRED", "message": "教师端还没有配置可用的 AI 模型服务。请先进入教师设置完成配置。"},
         )
     if capability:
         ensure_provider_capability(provider, capability)
@@ -217,6 +230,8 @@ def active_provider(
 
 
 def provider_api_key(provider: AIProvider | ProviderRuntimeConfig) -> str:
+    if not str(provider.api_key or "").strip() and not provider_requires_api_key(provider.provider_type):
+        return ""
     try:
         return decrypt_secret(provider.api_key)
     except SecretProtectionError as exc:
@@ -681,6 +696,15 @@ def save_project(
     return project
 
 
+def project_title_from_prompt(prefix: str, prompt: str) -> str:
+    first_line = next((line.strip() for line in prompt.splitlines() if line.strip()), "AI 创作")
+    normalized = " ".join(first_line.split())
+    available = max(1, 160 - len(prefix))
+    if len(normalized) > available:
+        normalized = normalized[: max(1, available - 1)].rstrip() + "…"
+    return f"{prefix}{normalized}"
+
+
 async def _generate_text_with_provider(
     db: Session,
     provider: AIProvider,
@@ -688,6 +712,7 @@ async def _generate_text_with_provider(
     mode: str,
     age_level: str,
     user_id: int | None = None,
+    output_content_stage: str = "output",
 ) -> str:
     ensure_provider_capability(provider, "text")
     if not provider.text_model.strip():
@@ -699,9 +724,18 @@ async def _generate_text_with_provider(
             },
         )
     policy = age_generation_policy(age_level)
+    mode_instructions = {
+        "general": "按学生要求完成常规生成，不要擅自改写成故事。",
+        "story": "围绕学生主题创作结构清晰、适龄的故事。",
+        "polish": "保留原意并润色表达，同时指出最重要的修改。",
+        "prompt_refine": "把输入整理成明确、可执行的 AI 提示词。",
+        "code_explain": "解释代码或报错，优先给出理解路径和验证步骤。",
+    }
+    mode = mode if mode in mode_instructions else "general"
     system_prompt = (
         "你是少儿AI课程助手。输出必须适合课堂，语言清晰，鼓励学生自己思考，"
         f"不要提供危险、成人或不适龄内容。{policy['instruction']}"
+        f"{mode_instructions[mode]}"
     )
     user_prompt = f"模式：{mode}\n学龄分类：{policy['label']}\n任务：{prompt}"
     url = provider.base_url.rstrip("/") + "/chat/completions"
@@ -715,12 +749,12 @@ async def _generate_text_with_provider(
         "max_tokens": policy["max_tokens"],
     }
     try:
-        async with httpx.AsyncClient(timeout=45) as client:
+        async with httpx.AsyncClient(timeout=max(30, int(os.environ.get("CODERAI_TEXT_PROVIDER_TIMEOUT_SECONDS", "120")))) as client:
             response = await client.post(url, headers=_headers(provider_api_key(provider)), json=payload)
             response.raise_for_status()
         data = response.json()
         text = data["choices"][0]["message"]["content"]
-        run_moderation(db, text, "output", user_id)
+        run_moderation(db, text, output_content_stage, user_id)
         log_usage(db, "text", provider.text_model, "success", user_id=user_id, provider=provider)
         return text
     except HTTPException as exc:
@@ -745,15 +779,32 @@ async def generate_text(
     age_level: str,
     user_id: int | None = None,
     provider_id: int | None = None,
+    output_content_stage: str = "output",
 ) -> str:
     if provider_id is not None:
         provider = provider_runtime_config(active_provider(db, "text", provider_id))
         release_provider_lookup_connection(db)
-        return await _generate_text_with_provider(db, provider, prompt, mode, age_level, user_id)
+        return await _generate_text_with_provider(
+            db,
+            provider,
+            prompt,
+            mode,
+            age_level,
+            user_id,
+            output_content_stage,
+        )
     return await run_with_provider_fallback(
         db,
         "text",
-        lambda provider: _generate_text_with_provider(db, provider, prompt, mode, age_level, user_id),
+        lambda provider: _generate_text_with_provider(
+            db,
+            provider,
+            prompt,
+            mode,
+            age_level,
+            user_id,
+            output_content_stage,
+        ),
     )
 
 
@@ -873,7 +924,7 @@ async def generate_openai_image(
     url = provider.base_url.rstrip("/") + "/images/generations"
     payload = {"model": provider.image_model, "prompt": _classroom_image_prompt(prompt, style), "size": size}
     try:
-        async with httpx.AsyncClient(timeout=90) as client:
+        async with httpx.AsyncClient(timeout=IMAGE_PROVIDER_TIMEOUT_SECONDS) as client:
             response = await client.post(url, headers=_headers(provider_api_key(provider)), json=payload)
             response.raise_for_status()
         data = response.json()
@@ -910,7 +961,7 @@ async def generate_volcengine_image(
         "watermark": False,
     }
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=IMAGE_PROVIDER_TIMEOUT_SECONDS) as client:
             response = await client.post(url, headers=_headers(provider_api_key(provider)), json=payload)
             response.raise_for_status()
         data = response.json()
@@ -1021,7 +1072,7 @@ async def generate_zhipu_image(
         "size": size,
     }
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=IMAGE_PROVIDER_TIMEOUT_SECONDS) as client:
             response = await client.post(url, headers=_headers(provider_api_key(provider)), json=payload)
             response.raise_for_status()
         data = response.json()
@@ -1061,7 +1112,7 @@ async def generate_openai_image_edit(
     classroom_prompt = f"{prompt}\n风格：{style}。适合少儿编程课堂，明亮、清晰、无危险内容。"
     content_type = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}.get(Path(image_name).suffix.lower(), "application/octet-stream")
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=IMAGE_PROVIDER_TIMEOUT_SECONDS) as client:
             response = await client.post(
                 url,
                 headers={"Authorization": f"Bearer {provider_api_key(provider)}"},
@@ -1105,7 +1156,7 @@ async def generate_minimax_image(
         "n": 1,
     }
     try:
-        async with httpx.AsyncClient(timeout=90) as client:
+        async with httpx.AsyncClient(timeout=IMAGE_PROVIDER_TIMEOUT_SECONDS) as client:
             response = await client.post(url, headers=_headers(provider_api_key(provider)), json=payload)
             response.raise_for_status()
         data = response.json()
@@ -1205,6 +1256,80 @@ async def _query_minimax_video(provider: AIProvider, provider_task_id: str) -> d
     return data
 
 
+def _jimeng_video_content(prompt: str, source_image_path: str | None, duration_seconds: int) -> list[dict[str, Any]]:
+    duration = 10 if int(duration_seconds) >= 10 else 5
+    safe_prompt = (
+        f"{prompt}\n适合少儿编程课堂，画面明亮、清晰、安全，无危险内容。"
+        f" --duration {duration} --watermark false"
+    )
+    content: list[dict[str, Any]] = [{"type": "text", "text": safe_prompt}]
+    if source_image_path:
+        image_url = source_image_path if source_image_path.startswith(("http://", "https://", "data:")) else local_image_data_url(source_image_path)
+        content.append({"type": "image_url", "image_url": {"url": image_url}})
+    return content
+
+
+async def _submit_jimeng_video(
+    provider: AIProvider,
+    prompt: str,
+    source_image_path: str | None,
+    duration_seconds: int,
+) -> str:
+    url = provider.base_url.rstrip("/") + "/contents/generations/tasks"
+    payload = {
+        "model": provider.video_model,
+        "content": _jimeng_video_content(prompt, source_image_path, duration_seconds),
+    }
+    async with httpx.AsyncClient(timeout=120) as client:
+        response = await client.post(url, headers=_headers(provider_api_key(provider)), json=payload)
+        response.raise_for_status()
+    data = response.json()
+    if isinstance(data.get("error"), dict):
+        raise _provider_business_error(data, "即梦视频任务提交失败。")
+    provider_task_id = _pick_first_string(data, ["id", "task_id"], ["data.id", "data.task_id"])
+    if not provider_task_id:
+        raise HTTPException(status_code=502, detail={"code": "AI_RESPONSE_INVALID", "message": "即梦视频服务未返回任务 ID。"})
+    return provider_task_id
+
+
+async def _query_jimeng_video(provider: AIProvider, provider_task_id: str) -> dict[str, Any]:
+    url = provider.base_url.rstrip("/") + f"/contents/generations/tasks/{provider_task_id}"
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.get(url, headers=_headers(provider_api_key(provider)))
+        response.raise_for_status()
+    data = response.json()
+    if isinstance(data.get("error"), dict):
+        raise _provider_business_error(data, "即梦视频任务查询失败。")
+    return data
+
+
+async def _submit_video_provider(
+    provider: AIProvider,
+    prompt: str,
+    source_image_path: str | None,
+    duration_seconds: int,
+) -> str:
+    if provider.provider_type == "minimax":
+        return await _submit_minimax_video(provider, prompt, source_image_path, duration_seconds)
+    if provider.provider_type == "volcengine_jimeng":
+        return await _submit_jimeng_video(provider, prompt, source_image_path, duration_seconds)
+    raise HTTPException(
+        status_code=501,
+        detail={"code": "VIDEO_ADAPTER_UNAVAILABLE", "message": f"{provider.name} 的视频运行适配器尚未接入。"},
+    )
+
+
+async def _query_video_provider(provider: AIProvider, provider_task_id: str) -> dict[str, Any]:
+    if provider.provider_type == "minimax":
+        return await _query_minimax_video(provider, provider_task_id)
+    if provider.provider_type == "volcengine_jimeng":
+        return await _query_jimeng_video(provider, provider_task_id)
+    raise HTTPException(
+        status_code=501,
+        detail={"code": "VIDEO_ADAPTER_UNAVAILABLE", "message": f"{provider.name} 的视频运行适配器尚未接入。"},
+    )
+
+
 def _video_provider_for_task(db: Session, task: VideoTask) -> AIProvider:
     if task.provider_id:
         provider = db.query(AIProvider).filter(AIProvider.id == task.provider_id).first()
@@ -1224,7 +1349,7 @@ def _video_provider_for_task(db: Session, task: VideoTask) -> AIProvider:
         raise HTTPException(status_code=409, detail={"code": "VIDEO_PROVIDER_MISMATCH", "message": "视频任务绑定的服务商信息不一致。"})
     if not provider.api_key.strip():
         raise HTTPException(status_code=400, detail={"code": "PROVIDER_REQUIRED", "message": "该视频任务使用的服务商缺少 API Key。"})
-    if task.provider_type != "minimax":
+    if task.provider_type not in {"minimax", "volcengine_jimeng"}:
         raise HTTPException(status_code=501, detail={"code": "VIDEO_ADAPTER_UNAVAILABLE", "message": "当前任务的视频服务商适配器尚未接入。"})
     ensure_provider_capability(provider, "video")
     if not provider.video_model.strip():
@@ -1251,16 +1376,11 @@ async def generate_video_task(
                 status_code=400,
                 detail={"code": "VIDEO_MODEL_REQUIRED", "message": "当前服务没有配置视频模型，请在教师设置中填写视频模型。"},
             )
-        if provider.provider_type != "minimax":
-            raise HTTPException(
-                status_code=501,
-                detail={"code": "VIDEO_ADAPTER_UNAVAILABLE", "message": f"{provider.name} 的视频运行适配器尚未接入。当前支持 MiniMax。"},
-            )
         try:
-            task_id = await _submit_minimax_video(provider, prompt, source_image_path, duration_seconds)
+            task_id = await _submit_video_provider(provider, prompt, source_image_path, duration_seconds)
             return provider, task_id
         except HTTPException:
-            log_usage(db, "video", provider.video_model, "failed", "MiniMax video submission failed", user_id, provider)
+            log_usage(db, "video", provider.video_model, "failed", f"{provider.provider_type} video submission failed", user_id, provider)
             raise
         except httpx.HTTPStatusError as exc:
             mapped = provider_http_exception(exc)
@@ -1320,6 +1440,7 @@ async def refresh_video_task(db: Session, task: VideoTask) -> VideoTask:
             task.last_checked_at = checked_at
             task.error_message = "视频任务超过 30 分钟仍未完成，已停止自动查询。可以重试生成。"
             _sync_video_project(task)
+            sync_agent_video_job(db, task)
             db.commit()
             db.refresh(task)
             log_usage(db, "video", task.model, "timed_out", task.error_message, task.user_id)
@@ -1327,6 +1448,7 @@ async def refresh_video_task(db: Session, task: VideoTask) -> VideoTask:
 
     if task.status in {"canceled", "failed", "timed_out"}:
         task.last_checked_at = checked_at
+        sync_agent_video_job(db, task)
         db.commit()
         db.refresh(task)
         return task
@@ -1334,12 +1456,14 @@ async def refresh_video_task(db: Session, task: VideoTask) -> VideoTask:
     if task.status in {"success", "download_failed", "expired"}:
         if task.status == "expired" and not task.file_id:
             task.last_checked_at = checked_at
+            sync_agent_video_job(db, task)
             db.commit()
             db.refresh(task)
             return task
         await _ensure_video_result(db, task)
         task.last_checked_at = checked_at
         _sync_video_project(task)
+        sync_agent_video_job(db, task)
         db.commit()
         db.refresh(task)
         log_usage(db, "video_download", task.model, "success" if task.status == "success" else task.status, task.error_message, task.user_id)
@@ -1347,11 +1471,15 @@ async def refresh_video_task(db: Session, task: VideoTask) -> VideoTask:
 
     provider = _video_provider_for_task(db, task)
     try:
-        data = await _query_minimax_video(provider, task.provider_task_id)
+        data = await _query_video_provider(provider, task.provider_task_id)
         task.status = _normalise_video_status(_pick_first_string(data, ["status", "task_status"], ["data.status", "data.task_status"])) or task.status
         task.last_checked_at = checked_at
         file_id = _pick_first_string(data, ["file_id"], ["data.file_id", "file.file_id"])
-        direct_url = _pick_first_string(data, ["download_url", "url"], ["data.download_url", "data.url", "file.download_url", "file.url"])
+        direct_url = _pick_first_string(
+            data,
+            ["download_url", "video_url", "url"],
+            ["content.video_url", "data.content.video_url", "data.download_url", "data.video_url", "data.url", "file.download_url", "file.url"],
+        )
         if file_id:
             task.file_id = file_id
         if direct_url:
@@ -1363,12 +1491,13 @@ async def refresh_video_task(db: Session, task: VideoTask) -> VideoTask:
             task.error_message = ""
             await _ensure_video_result(db, task, provider)
         _sync_video_project(task)
+        sync_agent_video_job(db, task)
         db.commit()
         db.refresh(task)
         log_usage(db, "video", task.model, "success" if task.status == "success" else "query", user_id=task.user_id)
         return task
     except HTTPException:
-        log_usage(db, "video", task.model, "failed", "MiniMax video query failed", task.user_id)
+        log_usage(db, "video", task.model, "failed", f"{task.provider_type} video query failed", task.user_id)
         raise
     except httpx.HTTPStatusError as exc:
         mapped = provider_http_exception(exc)
@@ -1407,6 +1536,7 @@ async def retry_video_task(db: Session, task: VideoTask) -> VideoTask:
         await _ensure_video_result(db, task, provider)
         task.last_checked_at = now()
         _sync_video_project(task)
+        sync_agent_video_job(db, task)
         db.commit()
         db.refresh(task)
         log_usage(db, "video_retry", task.model, task.status, task.error_message, task.user_id)
@@ -1414,7 +1544,7 @@ async def retry_video_task(db: Session, task: VideoTask) -> VideoTask:
 
     provider = _video_provider_for_task(db, task)
     try:
-        provider_task_id = await _submit_minimax_video(
+        provider_task_id = await _submit_video_provider(
             provider,
             task.prompt,
             task.source_image_path or None,
@@ -1433,12 +1563,13 @@ async def retry_video_task(db: Session, task: VideoTask) -> VideoTask:
         task.last_checked_at = None
         task.download_url_expires_at = None
         _sync_video_project(task)
+        sync_agent_video_job(db, task)
         db.commit()
         db.refresh(task)
         log_usage(db, "video_retry", task.model, "submitted", user_id=task.user_id)
         return task
     except HTTPException:
-        log_usage(db, "video_retry", task.model, "failed", "MiniMax video retry submission failed", task.user_id)
+        log_usage(db, "video_retry", task.model, "failed", f"{task.provider_type} video retry submission failed", task.user_id)
         raise
     except httpx.HTTPStatusError as exc:
         mapped = provider_http_exception(exc)
@@ -1493,7 +1624,10 @@ def workflow_templates():
 
 
 def _headers(api_key: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
 
 
 def _write_bytes(target: Path, data: bytes) -> str:
@@ -1653,6 +1787,58 @@ async def _refresh_video_download_link(
         return False
 
 
+def sync_agent_video_job(db: Session, task: VideoTask) -> None:
+    if not task.generation_job_id:
+        return
+    job = db.get(AIGenerationJob, task.generation_job_id)
+    if not job or not job.conversation_id or not job.user_id:
+        return
+    artifact = None
+    if _video_file_available(task):
+        artifact = db.query(AgentArtifact).filter(AgentArtifact.generation_job_id == job.id).first()
+        if not artifact:
+            try:
+                file_size = len(read_stored_bytes(task.file_path, maximum_bytes=200 * 1024 * 1024))
+            except (FileNotFoundError, OSError, ValueError):
+                file_size = 0
+            artifact = AgentArtifact(
+                conversation_id=job.conversation_id,
+                generation_job_id=job.id,
+                user_id=job.user_id,
+                artifact_type="video",
+                title=project_title_from_prompt("Agent 视频：", task.prompt),
+                file_path=task.file_path,
+                original_file_name=f"agent-video-{task.id}.mp4",
+                mime_type="video/mp4",
+                file_size=file_size,
+                status="available",
+                expires_at=now() + timedelta(days=7),
+            )
+            db.add(artifact)
+            db.flush()
+    result = safe_json_value(job.result_json, {})
+    if isinstance(result, dict):
+        if artifact:
+            result["artifact_id"] = artifact.id
+        result["video_task_id"] = task.id
+        job.result_json = json_dumps(result)
+    if task.status == "success" and artifact:
+        job.status = "succeeded"
+        job.error_code = ""
+        job.error_message = ""
+        job.completed_at = now()
+    elif task.status in {"failed", "timed_out", "download_failed", "expired", "canceled"}:
+        job.status = task.status if task.status in {"timed_out", "canceled"} else "failed"
+        job.error_code = f"VIDEO_{task.status.upper()}"[:80]
+        job.error_message = (task.error_message or "视频任务未成功完成。")[:2_000]
+        job.completed_at = now()
+    else:
+        job.status = "running"
+        job.error_code = ""
+        job.error_message = ""
+        job.completed_at = None
+
+
 async def _ensure_video_result(
     db: Session,
     task: VideoTask,
@@ -1661,6 +1847,7 @@ async def _ensure_video_result(
     if _video_file_available(task):
         task.status = "success"
         task.error_message = ""
+        sync_agent_video_job(db, task)
         return
     task.file_path = ""
 
@@ -1694,6 +1881,7 @@ async def _ensure_video_result(
 
     task.status = "success"
     task.error_message = ""
+    sync_agent_video_job(db, task)
 
 
 def _size_to_aspect_ratio(size: str) -> str:
@@ -1803,8 +1991,11 @@ def provider_payload(provider: AIProvider | None) -> dict[str, Any]:
         }
     preset = get_provider_preset(provider.provider_type)
     secret_error = ""
+    requires_api_key = provider_requires_api_key(provider.provider_type)
     try:
-        configured = bool(provider_api_key(provider).strip())
+        configured = provider_credentials_configured(provider)
+        if provider.api_key.strip():
+            provider_api_key(provider)
     except HTTPException:
         configured = False
         secret_error = "已保存的密钥无法解密，请重新输入。"
@@ -1818,9 +2009,13 @@ def provider_payload(provider: AIProvider | None) -> dict[str, Any]:
         "image_model": provider.image_model,
         "video_model": provider.video_model,
         "capabilities": preset["capabilities"],
+        "requires_api_key": requires_api_key,
         "description": preset["description"],
         "enabled": provider.enabled,
-        "api_key_masked": "配置损坏" if secret_error else ("已配置" if configured else "未配置"),
+        "student_selectable": provider.student_selectable,
+        "api_key_masked": "配置损坏" if secret_error else (
+            "已配置" if provider.api_key.strip() else ("无需配置" if not requires_api_key else "未配置")
+        ),
         "api_key_error": secret_error,
         "last_test_status": provider.last_test_status or "untested",
         "last_test_message": provider.last_test_message or "",
@@ -1848,8 +2043,8 @@ def save_provider_routes(db: Session, routes: dict[str, list[int]]) -> dict[str,
                 raise HTTPException(status_code=404, detail={"code": "PROVIDER_NOT_FOUND", "message": f"路由中的服务商 {provider_id} 不存在。"})
             if not provider.enabled:
                 raise HTTPException(status_code=400, detail={"code": "PROVIDER_DISABLED", "message": f"{provider.name} 已停用，不能加入运行路由。"})
-            if not provider.api_key.strip():
-                raise HTTPException(status_code=400, detail={"code": "PROVIDER_REQUIRED", "message": f"{provider.name} 尚未配置 API Key。"})
+            if not provider_credentials_configured(provider):
+                raise HTTPException(status_code=400, detail={"code": "PROVIDER_REQUIRED", "message": f"{provider.name} 尚未完成连接凭据配置。"})
             provider_api_key(provider)
             ensure_provider_capability(provider, capability)
             if not provider_model(provider, capability):
@@ -1907,10 +2102,16 @@ def provider_model_catalog_payload(db: Session) -> dict[str, Any]:
     items: list[dict[str, Any]] = []
     represented: set[tuple[int, str, str]] = set()
 
-    def append_configured(provider: AIProvider, capability: str, model: str, display_name: str) -> None:
+    def append_configured(
+        provider: AIProvider,
+        capability: str,
+        model: str,
+        display_name: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         state = provider_states[provider.id]
         available = bool(provider.enabled and state.get("configured"))
-        reason = "" if available else ("服务已停用" if not provider.enabled else "API Key 未配置或不可用")
+        reason = "" if available else ("服务已停用" if not provider.enabled else "连接凭据未配置或不可用")
         items.append({
             "key": f"provider:{provider.id}:{capability}:{model}",
             "provider_id": provider.id,
@@ -1922,6 +2123,12 @@ def provider_model_catalog_payload(db: Session) -> dict[str, Any]:
             "display_name": display_name,
             "configured": True,
             "available": available,
+            "student_selectable": bool(provider.student_selectable and capability == "text"),
+            "parameters": {
+                key: value
+                for key, value in (metadata or {}).items()
+                if key not in {"id", "name"}
+            },
             "reason": reason,
         })
         represented.add((provider.id, capability, model))
@@ -1937,7 +2144,13 @@ def provider_model_catalog_payload(db: Session) -> dict[str, Any]:
                 matches = [provider for provider in preset_providers if provider_model(provider, capability) == model]
                 if matches:
                     for provider in matches:
-                        append_configured(provider, capability, model, str(catalog_model.get("name") or model))
+                        append_configured(
+                            provider,
+                            capability,
+                            model,
+                            str(catalog_model.get("name") or model),
+                            catalog_model,
+                        )
                     continue
                 items.append({
                     "key": f"catalog:{preset['provider_type']}:{capability}:{model}",
@@ -1950,6 +2163,11 @@ def provider_model_catalog_payload(db: Session) -> dict[str, Any]:
                     "display_name": str(catalog_model.get("name") or model),
                     "configured": False,
                     "available": False,
+                    "parameters": {
+                        key: value
+                        for key, value in catalog_model.items()
+                        if key not in {"id", "name"}
+                    },
                     "reason": "尚未在系统中配置",
                 })
 
@@ -1973,7 +2191,8 @@ def provider_status_payload(db: Session) -> dict[str, Any]:
         valid = []
         for provider in candidates:
             try:
-                if provider_api_key(provider).strip() and provider_model(provider, capability):
+                provider_api_key(provider)
+                if provider_credentials_configured(provider) and provider_model(provider, capability):
                     valid.append(provider)
             except HTTPException:
                 continue
@@ -2005,6 +2224,9 @@ def to_project_dict(project: Project, latest_submitted_at: datetime | None = Non
         "owner_name": project.owner_name,
         "summary": project.summary,
         "file_path": project.file_path,
+        "original_file_name": project.original_file_name,
+        "mime_type": project.mime_type,
+        "file_size": project.file_size,
         "lifecycle_status": project.lifecycle_status,
         "moderation_status": project.moderation_status,
         "moderation_reason": project.moderation_reason,
@@ -2158,13 +2380,15 @@ def to_task_dict(task: Task) -> dict[str, Any]:
 
 
 def to_submission_dict(submission: TaskSubmission) -> dict[str, Any]:
+    latest_version = submission.versions[-1] if submission.versions else None
     return {
         "id": submission.id,
         "owner_teacher_id": submission.owner_teacher_id,
         "task_id": submission.task_id,
         "task_title": submission.task.title if submission.task else "",
         "project_id": submission.project_id,
-        "project_title": submission.project.title if submission.project else "",
+        "source_type": submission.source_type or "project",
+        "project_title": submission.project.title if submission.project else (latest_version.project_title if latest_version else ""),
         "user_id": submission.user_id,
         "student_name": submission.user.name if submission.user else "",
         "student_archived": bool(submission.user and submission.user.archived_at),
@@ -2185,15 +2409,45 @@ def to_submission_dict(submission: TaskSubmission) -> dict[str, Any]:
 
 
 def to_submission_version_dict(version: SubmissionVersion) -> dict[str, Any]:
+    attachment = version.attachment
+    file_reference = attachment.file_path if attachment else version.project_file_path
+    file_name = attachment.original_file_name if attachment else version.file_name_snapshot
+    if not file_name and file_reference:
+        file_name = reference_name(file_reference)
+    mime_type = attachment.mime_type if attachment else version.mime_type_snapshot
+    if not mime_type and file_name:
+        mime_type = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+    file_size = attachment.file_size if attachment else version.file_size_snapshot
+    safety_status = attachment.safety_status if attachment else "approved"
     return {
         "id": version.id,
         "submission_id": version.submission_id,
         "version_number": version.version_number,
         "project_id": version.project_id,
+        "source_type": version.source_type or "project",
         "project_title": version.project_title,
         "project_summary": version.project_summary,
-        "project_file_path": version.project_file_path,
+        "project_file_path": "",
+        "file_available": bool(file_reference),
+        "file": ({
+            "original_file_name": file_name or f"submission-version-{version.id}",
+            "mime_type": mime_type or "application/octet-stream",
+            "file_size": file_size or 0,
+            "safety_status": safety_status,
+            "source_type": version.source_type or "project",
+        } if file_reference else None),
+        "attachment": ({
+            "id": attachment.id,
+            "original_file_name": attachment.original_file_name,
+            "mime_type": attachment.mime_type,
+            "file_size": attachment.file_size,
+            "safety_status": attachment.safety_status,
+        } if attachment else None),
         "is_late": version.is_late,
+        "review_status": version.review_status,
+        "feedback": version.feedback_snapshot,
+        "score": version.score_snapshot,
+        "max_score": version.max_score_snapshot or 100,
         "created_at": format_beijing_datetime(version.created_at),
     }
 

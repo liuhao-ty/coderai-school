@@ -103,7 +103,7 @@ services:
       args:
         CODERAI_APT_MIRROR: ${CODERAI_APT_MIRROR:-}
         CODERAI_PIP_INDEX_URL: ${CODERAI_PIP_INDEX_URL:-}
-    image: coderai-api:0.2.0-beta.4
+    image: coderai-api:0.2.0-beta.5
     restart: "no"
     command: ["migrate"]
     environment: *app-environment
@@ -116,7 +116,7 @@ services:
         condition: service_completed_successfully
 
   api:
-    image: coderai-api:0.2.0-beta.4
+    image: coderai-api:0.2.0-beta.5
     restart: unless-stopped
     command: ["api"]
     environment:
@@ -125,6 +125,8 @@ services:
       CODERAI_MAX_CONCURRENT_READS_PER_WORKER: ${CODERAI_MAX_CONCURRENT_READS_PER_WORKER:-6}
     volumes:
       - app_runtime:/app/runtime
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -137,7 +139,7 @@ services:
       - no-new-privileges:true
 
   worker:
-    image: coderai-api:0.2.0-beta.4
+    image: coderai-api:0.2.0-beta.5
     restart: unless-stopped
     command: ["worker"]
     environment:
@@ -145,6 +147,8 @@ services:
       CODERAI_CELERY_CONCURRENCY: ${CODERAI_CELERY_CONCURRENCY:-2}
     volumes:
       - app_runtime:/app/runtime
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       api:
         condition: service_healthy
@@ -152,7 +156,7 @@ services:
       - no-new-privileges:true
 
   beat:
-    image: coderai-api:0.2.0-beta.4
+    image: coderai-api:0.2.0-beta.5
     restart: unless-stopped
     command: ["beat"]
     environment: *app-environment
@@ -186,7 +190,7 @@ services:
       - no-new-privileges:true
 
   backup:
-    image: coderai-api:0.2.0-beta.4
+    image: coderai-api:0.2.0-beta.5
     restart: unless-stopped
     command: ["backup", "--loop"]
     environment:

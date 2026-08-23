@@ -16,6 +16,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPE
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, or_, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from pydantic import ValidationError
 
@@ -55,7 +56,7 @@ from backend.app.auth import (
 )
 from backend.app.db import CLOUD_MODE, DATA_DIR, DATABASE_URL, SessionLocal, default_organization_code, get_db, init_db
 from backend.app.audit import record_teacher_audit, teacher_audit_payload
-from backend.app.models import AIProvider, Asset, Classroom, ClassroomTeacher, Course, CourseMaterial, CoursePackage, CoursePackageTeacher, CourseSchedule, CurriculumCourse, FeedbackTemplate, Lesson, ModerationLog, Organization, Project, SubmissionVersion, Task, TaskSubmission, TeacherAuditLog, TeacherSession, UsageLog, User, VideoTask, Workflow, WorkflowRun, now
+from backend.app.models import AIProvider, AgentArtifact, Asset, Classroom, ClassroomTeacher, Course, CourseMaterial, CoursePackage, CoursePackageTeacher, CourseSchedule, CurriculumCourse, FeedbackTemplate, Lesson, ModerationLog, Organization, Project, SubmissionAttachment, SubmissionVersion, Task, TaskSubmission, TeacherAuditLog, TeacherSession, UsageLog, User, VideoTask, Workflow, WorkflowRun, now
 from backend.app.curriculum import CURRICULUM_DIR, MATERIAL_KINDS, convert_slides_material, libreoffice_status, materialize_curriculum, store_curriculum_bytes, validate_course_material
 from backend.app.course_fields import (
     CourseFieldValidationError,
@@ -84,11 +85,20 @@ from backend.app.storage import (
     is_object_reference,
     object_exists,
     put_bytes as put_stored_bytes,
+    put_file as put_stored_file,
     read_bytes as read_stored_bytes,
     reference_in_category,
     reference_name,
     storage_response,
     ensure_storage_ready,
+)
+from backend.app.submission_files import (
+    DEFAULT_SUBMISSION_EXTENSIONS,
+    IMAGE_SUBMISSION_EXTENSIONS,
+    MAX_SUBMISSION_FILE_BYTES,
+    SubmissionFileValidationError,
+    normalize_submission_extensions,
+    validate_submission_file,
 )
 from backend.app.task_queue import enqueue_slides_conversion, enqueue_video_poll, enqueue_workflow_run, queue_health
 from backend.app.package_security import MAX_COURSE_PACKAGE_BYTES, validate_course_package
@@ -97,6 +107,7 @@ from backend.app.licensing import ensure_student_seat_capacity, get_license_stat
 from backend.app.plugins import router as plugins_router
 from backend.app.readiness import router as readiness_router
 from backend.app.retention import router as retention_router
+from backend.app.learning_agent import router as learning_agent_router
 from backend.app.observability import configure_observability
 from backend.app.schemas import (
     ClassTaskRequest,
@@ -163,6 +174,7 @@ from backend.app.services import (
     provider_management_payload,
     provider_model_catalog_payload,
     provider_status_payload,
+    project_title_from_prompt,
     remove_provider_from_routes,
     run_moderation,
     save_project,
@@ -171,6 +183,7 @@ from backend.app.services import (
     test_provider_connection,
     refresh_video_task,
     retry_video_task,
+    sync_agent_video_job,
     to_classroom_dict,
     to_course_dict,
     to_asset_dict,
@@ -186,7 +199,7 @@ from backend.app.services import (
 )
 
 
-APP_VERSION = "0.2.0-beta.4"
+APP_VERSION = "0.2.0-beta.5"
 
 app = FastAPI(title="CoderAI 学堂 API", version=APP_VERSION)
 app.include_router(operations_router)
@@ -195,6 +208,7 @@ app.include_router(privacy_router)
 app.include_router(plugins_router)
 app.include_router(readiness_router)
 app.include_router(retention_router)
+app.include_router(learning_agent_router)
 configure_observability(app)
 
 _configured_origins = [
@@ -357,8 +371,14 @@ def safe_image_output(value: Any, identity: dict) -> Any:
     return sanitized
 
 
-def project_payload_for_identity(project: Project, identity: dict) -> dict:
-    payload = to_project_dict(project)
+def project_payload_for_identity(
+    project: Project,
+    identity: dict,
+    latest_submitted_at: datetime | None = None,
+) -> dict:
+    payload = to_project_dict(project, latest_submitted_at)
+    if project.file_path and not project.file_path.startswith(("http://", "https://")):
+        payload["file_path"] = ""
     if identity.get("role") == "student" and project.moderation_status != "approved":
         payload.update({"file_path": "", "file_exists": False, "file_status": "moderation_hidden"})
     return payload
@@ -693,6 +713,10 @@ def curriculum_material_payload(db: Session, course: CurriculumCourse, kind: str
 def curriculum_course_payload(db: Session, course: CurriculumCourse, identity: dict) -> dict:
     schedules = student_course_schedules(db, identity["student"], course.id, include_canceled=True) if identity["role"] == "student" else []
     material_kinds = ("starter_markdown",) if identity["role"] == "student" else tuple(COURSE_MATERIAL_LABELS)
+    try:
+        submission_extensions = normalize_submission_extensions(json.loads(course.submission_extensions_json or "[]"))
+    except (TypeError, json.JSONDecodeError, SubmissionFileValidationError):
+        submission_extensions = list(DEFAULT_SUBMISSION_EXTENSIONS)
     return {
         "id": course.id,
         "package_id": course.package_id,
@@ -703,6 +727,11 @@ def curriculum_course_payload(db: Session, course: CurriculumCourse, identity: d
         "assignment_instructions": course.assignment_instructions,
         "tool_scope": course.tool_scope,
         "rubric": normalize_rubric_payload(course.rubric_json),
+        "submission_extensions": submission_extensions,
+        "submission_max_bytes": min(
+            max(int(course.submission_max_bytes or MAX_SUBMISSION_FILE_BYTES), 1024 * 1024),
+            MAX_SUBMISSION_FILE_BYTES,
+        ),
         "materials": {kind: curriculum_material_payload(db, course, kind, identity) for kind in material_kinds},
         "schedule_ids": [item.id for item in schedules],
         "created_at": course.created_at.isoformat() if course.created_at else None,
@@ -897,14 +926,24 @@ def submit_project_for_task(db: Session, task: Task, student: User, project_id: 
         raise HTTPException(status_code=409, detail={"code": "PROJECT_MODERATION_PENDING", "message": "图片作品需要教师审核通过后才能提交。"})
     rubric = normalize_rubric(json.loads(task.rubric_json or "[]"))
     max_score = sum(int(item.get("max_score") or 0) for item in rubric) or 100
-    submission = db.query(TaskSubmission).filter(
+    dialect_name = db.get_bind().dialect.name
+    if dialect_name == "postgresql":
+        db.execute(
+            text("SELECT pg_advisory_xact_lock(:task_id, :user_id)"),
+            {"task_id": task.id, "user_id": student.id},
+        )
+    submission_query = db.query(TaskSubmission).filter(
         TaskSubmission.task_id == task.id,
         TaskSubmission.user_id == student.id,
-    ).first()
+    )
+    if dialect_name == "postgresql":
+        submission_query = submission_query.with_for_update()
+    submission = submission_query.first()
     is_late = bool(task.due_at and beijing_now_naive() > task.due_at)
     if submission:
         submission.owner_teacher_id = task.owner_teacher_id
         submission.project_id = project.id
+        submission.source_type = "project"
         submission.classroom_id = student.classroom_id
         submission.status = "submitted"
         submission.feedback = ""
@@ -927,21 +966,159 @@ def submit_project_for_task(db: Session, task: Task, student: User, project_id: 
             rubric_snapshot_json=json_dumps(rubric),
             max_score_snapshot=max_score,
         )
-        db.add(submission)
-        db.flush()
+        try:
+            with db.begin_nested():
+                db.add(submission)
+                db.flush()
+        except IntegrityError:
+            submission = submission_query.first()
+            if not submission:
+                raise
+            submission.owner_teacher_id = task.owner_teacher_id
+            submission.project_id = project.id
+            submission.source_type = "project"
+            submission.classroom_id = student.classroom_id
+            submission.status = "submitted"
+            submission.feedback = ""
+            submission.score = None
+            submission.version_count = (submission.version_count or 0) + 1
+            submission.is_late = is_late
+            if not submission.rubric_snapshot_json or submission.rubric_snapshot_json == "[]":
+                submission.rubric_snapshot_json = json_dumps(rubric)
+                submission.max_score_snapshot = max_score
     db.flush()
     db.add(SubmissionVersion(
         submission_id=submission.id,
         version_number=submission.version_count,
         project_id=project.id,
+        source_type="project",
         project_title=project.title,
         project_summary=project.summary,
         project_file_path=project.file_path,
+        file_name_snapshot=project.original_file_name,
+        mime_type_snapshot=project.mime_type,
+        file_size_snapshot=project.file_size,
         is_late=is_late,
+        review_status="submitted",
+        feedback_snapshot="",
+        score_snapshot=None,
+        max_score_snapshot=submission.max_score_snapshot or 100,
     ))
     db.commit()
     db.refresh(submission)
     return submission
+
+
+def submit_attachment_for_task(
+    db: Session,
+    task: Task,
+    student: User,
+    *,
+    title: str,
+    summary: str,
+    stored_reference: str,
+    metadata: dict[str, object],
+) -> tuple[TaskSubmission, SubmissionVersion, SubmissionAttachment]:
+    rubric = normalize_rubric(json.loads(task.rubric_json or "[]"))
+    max_score = sum(int(item.get("max_score") or 0) for item in rubric) or 100
+    dialect_name = db.get_bind().dialect.name
+    if dialect_name == "postgresql":
+        db.execute(
+            text("SELECT pg_advisory_xact_lock(:task_id, :user_id)"),
+            {"task_id": task.id, "user_id": student.id},
+        )
+    query = db.query(TaskSubmission).filter(
+        TaskSubmission.task_id == task.id,
+        TaskSubmission.user_id == student.id,
+    )
+    if dialect_name == "postgresql":
+        query = query.with_for_update()
+    submission = query.first()
+    is_late = bool(task.due_at and beijing_now_naive() > task.due_at)
+    if submission:
+        submission.owner_teacher_id = task.owner_teacher_id
+        submission.project_id = None
+        submission.source_type = "attachment"
+        submission.classroom_id = student.classroom_id
+        submission.status = "submitted"
+        submission.feedback = ""
+        submission.score = None
+        submission.version_count = (submission.version_count or 0) + 1
+        submission.is_late = is_late
+        if not submission.rubric_snapshot_json or submission.rubric_snapshot_json == "[]":
+            submission.rubric_snapshot_json = json_dumps(rubric)
+            submission.max_score_snapshot = max_score
+    else:
+        submission = TaskSubmission(
+            owner_teacher_id=task.owner_teacher_id,
+            task_id=task.id,
+            project_id=None,
+            source_type="attachment",
+            user_id=student.id,
+            classroom_id=student.classroom_id,
+            status="submitted",
+            version_count=1,
+            is_late=is_late,
+            rubric_snapshot_json=json_dumps(rubric),
+            max_score_snapshot=max_score,
+        )
+        db.add(submission)
+        db.flush()
+
+    version = SubmissionVersion(
+        submission_id=submission.id,
+        version_number=submission.version_count,
+        project_id=None,
+        source_type="attachment",
+        project_title=title,
+        project_summary=summary,
+        project_file_path="",
+        file_name_snapshot=str(metadata["original_name"]),
+        mime_type_snapshot=str(metadata["mime_type"]),
+        file_size_snapshot=int(metadata["file_size"]),
+        is_late=is_late,
+        review_status="submitted",
+        feedback_snapshot="",
+        score_snapshot=None,
+        max_score_snapshot=submission.max_score_snapshot or 100,
+    )
+    db.add(version)
+    db.flush()
+    safety_status = "pending" if str(metadata["extension"]) in IMAGE_SUBMISSION_EXTENSIONS else "approved"
+    attachment = SubmissionAttachment(
+        submission_id=submission.id,
+        version_id=version.id,
+        user_id=student.id,
+        classroom_id=student.classroom_id,
+        title=title,
+        file_path=stored_reference,
+        original_file_name=str(metadata["original_name"]),
+        mime_type=str(metadata["mime_type"]),
+        file_extension=str(metadata["extension"]),
+        file_size=int(metadata["file_size"]),
+        checksum_sha256=hashlib.sha256(read_stored_bytes(stored_reference)).hexdigest(),
+        safety_status=safety_status,
+    )
+    db.add(attachment)
+    if safety_status == "pending":
+        db.add(ModerationLog(
+            owner_teacher_id=task.owner_teacher_id,
+            user_id=student.id,
+            classroom_id=student.classroom_id,
+            input_text=title,
+            content_stage="submission_attachment",
+            passed=False,
+            reason="学生提交的图片附件需要教师复核。",
+            resource_type="image",
+            resource_path=stored_reference,
+            status="pending",
+            project_id=None,
+        ))
+    db.commit()
+    db.refresh(submission)
+    db.refresh(version)
+    db.refresh(attachment)
+    return submission, version, attachment
 
 
 def normalize_rubric_payload(raw: str | None) -> list[dict]:
@@ -1548,7 +1725,7 @@ async def text_generate(
             raise HTTPException(status_code=403, detail={"code": "AUTH_REQUIRED", "message": "请先登录学生端后再保存作品。"})
         project = save_project(
             db,
-            f"文字作品：{payload.prompt[:24]}",
+            project_title_from_prompt("文字作品：", payload.prompt),
             "text",
             text,
             student=identity["student"],
@@ -1722,6 +1899,7 @@ def cancel_video_task_status(
         raise HTTPException(status_code=409, detail={"code": "VIDEO_TASK_FINAL", "message": "任务已经结束，不能取消。"})
     task.status = "canceled"
     task.error_message = "已在本地取消；云端服务可能仍会继续处理并产生费用。"
+    sync_agent_video_job(db, task)
     if task.project:
         task.project.summary = f"# 视频任务\n\n状态：已取消\n\n提示词：{task.prompt}"
     db.commit()
@@ -2905,7 +3083,7 @@ def list_projects(
     total = query.count()
     rows = query.order_by(Project.updated_at.desc()).limit(300).all()
     return {
-        "projects": [to_project_dict(project, submitted_at) for project, submitted_at in rows],
+        "projects": [project_payload_for_identity(project, identity, submitted_at) for project, submitted_at in rows],
         "total": total,
     }
 
@@ -2934,7 +3112,9 @@ def get_project_file(project_id: int, identity: dict = Depends(require_student_o
             raise FileNotFoundError(project.file_path)
         return authenticated_storage_response(
             project.file_path,
-            media_type=mimetypes.guess_type(reference_name(project.file_path))[0] or "application/octet-stream",
+            media_type=project.mime_type or mimetypes.guess_type(reference_name(project.file_path))[0] or "application/octet-stream",
+            filename=project.original_file_name,
+            inline=project.project_type != "uploaded_file",
         )
     except ValueError:
         raise HTTPException(status_code=403, detail={"code": "PROJECT_FILE_FORBIDDEN", "message": "作品文件不在受管工作区中，不能读取。"})
@@ -3503,6 +3683,14 @@ def apply_curriculum_course_request(course: CurriculumCourse, payload: Curriculu
     allowed_tools = [item for item in dict.fromkeys(part.strip() for part in payload.tool_scope.split(",")) if item in {"text", "image", "video", "workflow"}]
     course.tool_scope = ",".join(allowed_tools)
     course.rubric_json = json_dumps(normalize_rubric(payload.rubric))
+    try:
+        course.submission_extensions_json = json_dumps(normalize_submission_extensions(payload.submission_extensions))
+    except SubmissionFileValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "COURSE_SUBMISSION_EXTENSIONS_INVALID", "message": str(exc)},
+        ) from exc
+    course.submission_max_bytes = min(max(payload.submission_max_bytes, 1024 * 1024), MAX_SUBMISSION_FILE_BYTES)
 
 
 @app.get("/api/course-packages")
@@ -3850,6 +4038,10 @@ def export_curriculum_package(
                 "assignment_instructions": course.assignment_instructions,
                 "tool_scope": course.tool_scope,
                 "rubric": normalize_rubric_payload(course.rubric_json),
+                "submission_extensions": normalize_submission_extensions(
+                    json.loads(course.submission_extensions_json or "[]")
+                ),
+                "submission_max_bytes": course.submission_max_bytes,
                 "materials": {},
             }
             for material in course.materials:
@@ -5128,6 +5320,26 @@ def list_course_schedule_submissions(
     return {"submissions": [submission_payload(db, row, actor) for row in rows]}
 
 
+def student_schedule_for_submission(db: Session, schedule_id: int, student: User) -> CourseSchedule:
+    schedule = db.get(CourseSchedule, schedule_id)
+    if not schedule:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "COURSE_SCHEDULE_NOT_FOUND", "message": "排课记录不存在。"},
+        )
+    if schedule.status == "canceled" or not schedule_applies_to_student(schedule, student):
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "COURSE_SCHEDULE_FORBIDDEN", "message": "这项课程没有排给当前学生或已被取消。"},
+        )
+    if schedule.starts_at > beijing_now_naive():
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "COURSE_SCHEDULE_NOT_STARTED", "message": "课程尚未开始，暂时不能提交作品。"},
+        )
+    return schedule
+
+
 @app.post("/api/course-schedules/{schedule_id}/submissions")
 def submit_course_schedule_project(
     schedule_id: int,
@@ -5138,17 +5350,136 @@ def submit_course_schedule_project(
     if identity["role"] != "student":
         raise HTTPException(status_code=403, detail={"code": "STUDENT_REQUIRED", "message": "只有学生可以提交课程作业。"})
     student = identity["student"]
-    schedule = db.get(CourseSchedule, schedule_id)
-    if not schedule:
-        raise HTTPException(status_code=404, detail={"code": "COURSE_SCHEDULE_NOT_FOUND", "message": "排课记录不存在。"})
-    if schedule.status == "canceled" or not schedule_applies_to_student(schedule, student):
-        raise HTTPException(status_code=403, detail={"code": "COURSE_SCHEDULE_FORBIDDEN", "message": "这项课程没有排给当前学生或已被取消。"})
-    if schedule.starts_at > beijing_now_naive():
-        raise HTTPException(status_code=403, detail={"code": "COURSE_SCHEDULE_NOT_STARTED", "message": "课程尚未开始，暂时不能提交作品。"})
+    schedule = student_schedule_for_submission(db, schedule_id, student)
     task = sync_schedule_task(db, schedule)
     db.flush()
     submission = submit_project_for_task(db, task, student, payload.project_id)
     return {"submission": to_submission_dict(submission), "schedule": schedule_payload(db, schedule, student=student)}
+
+
+@app.post("/api/course-schedules/{schedule_id}/submissions/file")
+async def upload_and_submit_course_file(
+    schedule_id: int,
+    file: UploadFile = File(...),
+    title: str = Form(default=""),
+    summary: str = Form(default=""),
+    identity: dict = Depends(require_student_or_teacher),
+    db: Session = Depends(get_db),
+):
+    if identity["role"] != "student":
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "STUDENT_REQUIRED", "message": "只有学生可以上传并提交课程作业。"},
+        )
+    student = identity["student"]
+    schedule = student_schedule_for_submission(db, schedule_id, student)
+    course = schedule.course
+    if not course:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "COURSE_SCHEDULE_CONTENT_MISSING", "message": "排课关联的课程内容不存在。"},
+        )
+    try:
+        allowed_extensions = normalize_submission_extensions(json.loads(course.submission_extensions_json or "[]"))
+    except (TypeError, json.JSONDecodeError, SubmissionFileValidationError):
+        allowed_extensions = list(DEFAULT_SUBMISSION_EXTENSIONS)
+    maximum_bytes = min(
+        max(int(course.submission_max_bytes or MAX_SUBMISSION_FILE_BYTES), 1024 * 1024),
+        MAX_SUBMISSION_FILE_BYTES,
+    )
+
+    upload_handle = tempfile.NamedTemporaryFile(prefix="coderai-submission-", delete=False)
+    upload_path = Path(upload_handle.name)
+    stored_reference = ""
+    keep_stored_file = False
+    try:
+        total = 0
+        while chunk := await file.read(1024 * 1024):
+            total += len(chunk)
+            if total > maximum_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail={
+                        "code": "SUBMISSION_FILE_TOO_LARGE",
+                        "message": f"当前课程的作品文件不能超过 {maximum_bytes // 1024 // 1024} MB。",
+                    },
+                )
+            upload_handle.write(chunk)
+        upload_handle.close()
+        try:
+            metadata = validate_submission_file(
+                upload_path,
+                file.filename or "",
+                allowed_extensions,
+                maximum_bytes,
+            )
+        except SubmissionFileValidationError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "SUBMISSION_FILE_INVALID", "message": str(exc)},
+            ) from exc
+
+        attachment_title = (title.strip() or Path(str(metadata["original_name"])).stem)[:160]
+        if not attachment_title:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "SUBMISSION_TITLE_REQUIRED", "message": "请填写作品名称。"},
+            )
+        attachment_summary = summary.strip()[:20_000]
+        moderation_text = "\n".join(
+            part for part in (attachment_title, attachment_summary, str(metadata["text_sample"])) if part
+        )
+        run_moderation(
+            db,
+            moderation_text,
+            user_id=student.id,
+            classroom_id=student.classroom_id,
+        )
+        stored_reference = put_stored_file(
+            f"submissions/student-{student.id}",
+            upload_path,
+            filename=str(metadata["original_name"]),
+            content_type=str(metadata["mime_type"]),
+        )
+        task = sync_schedule_task(db, schedule)
+        db.flush()
+        submission, version, attachment = submit_attachment_for_task(
+            db,
+            task,
+            student,
+            title=attachment_title,
+            summary=attachment_summary,
+            stored_reference=stored_reference,
+            metadata=metadata,
+        )
+        keep_stored_file = True
+        return {
+            "project": None,
+            "submission": to_submission_dict(submission),
+            "version": to_submission_version_dict(version),
+            "attachment": to_submission_version_dict(version)["attachment"],
+            "moderation_pending": attachment.safety_status == "pending",
+            "message": (
+                "文件已提交，图片附件正在等待教师安全复核。"
+                if attachment.safety_status == "pending"
+                else "文件已提交，不会加入我的作品。"
+            ),
+            "schedule": schedule_payload(db, schedule, student=student),
+        }
+    except Exception:
+        db.rollback()
+        if stored_reference and not keep_stored_file:
+            try:
+                delete_object(stored_reference)
+            except (OSError, ValueError):
+                pass
+        raise
+    finally:
+        try:
+            upload_handle.close()
+        except OSError:
+            pass
+        upload_path.unlink(missing_ok=True)
 
 
 @app.post("/api/classes/tasks")
@@ -5219,11 +5550,27 @@ def delete_class_task(task_id: int, teacher: TeacherSession = Depends(require_te
     ensure_teaching_record_access(db, actor, task.owner_teacher_id, task.classroom_id, "课堂任务")
     submission_ids = [row[0] for row in db.query(TaskSubmission.id).filter(TaskSubmission.task_id == task_id).all()]
     deleted_versions = 0
+    attachment_references: list[str] = []
     if submission_ids:
+        attachment_references = [
+            row[0]
+            for row in db.query(SubmissionAttachment.file_path)
+            .filter(SubmissionAttachment.submission_id.in_(submission_ids))
+            .all()
+            if row[0]
+        ]
+        db.query(SubmissionAttachment).filter(
+            SubmissionAttachment.submission_id.in_(submission_ids)
+        ).delete(synchronize_session=False)
         deleted_versions = db.query(SubmissionVersion).filter(SubmissionVersion.submission_id.in_(submission_ids)).delete(synchronize_session=False)
     deleted_submissions = db.query(TaskSubmission).filter(TaskSubmission.task_id == task_id).delete(synchronize_session=False)
     db.delete(task)
     db.commit()
+    for reference in attachment_references:
+        try:
+            delete_object(reference)
+        except (OSError, ValueError):
+            pass
     return {"deleted": True, "task_id": task_id, "deleted_submissions": deleted_submissions, "deleted_versions": deleted_versions}
 
 
@@ -5383,6 +5730,57 @@ def list_submission_versions(
     return {"versions": [to_submission_version_dict(version) for version in versions]}
 
 
+def require_submission_version_access(db: Session, version_id: int, identity: dict) -> SubmissionVersion:
+    version = db.query(SubmissionVersion).filter(SubmissionVersion.id == version_id).first()
+    if not version or not version.submission:
+        raise HTTPException(status_code=404, detail={"code": "SUBMISSION_VERSION_NOT_FOUND", "message": "提交版本不存在。"})
+    submission = version.submission
+    if identity["role"] == "student":
+        if submission.user_id != identity["student"].id:
+            raise HTTPException(status_code=403, detail={"code": "SUBMISSION_VERSION_FORBIDDEN", "message": "不能查看其他学生的提交版本。"})
+    else:
+        ensure_teaching_record_access(db, identity["teacher"], submission.owner_teacher_id, submission.classroom_id, "作业提交版本")
+    return version
+
+
+@app.get("/api/submission-versions/{version_id}")
+def get_submission_version(
+    version_id: int,
+    identity: dict = Depends(require_student_or_teacher),
+    db: Session = Depends(get_db),
+):
+    version = require_submission_version_access(db, version_id, identity)
+    submission = version.submission
+    schedule = submission.task.course_schedule if submission.task else None
+    return {
+        "version": to_submission_version_dict(version),
+        "submission": submission_payload(db, submission, identity_teacher(identity)),
+        "schedule": schedule_payload(db, schedule, student=identity.get("student"), actor=identity_teacher(identity)) if schedule else None,
+    }
+
+
+@app.get("/api/submission-versions/{version_id}/file")
+def get_submission_version_file(
+    version_id: int,
+    download: bool = False,
+    identity: dict = Depends(require_student_or_teacher),
+    db: Session = Depends(get_db),
+):
+    version = require_submission_version_access(db, version_id, identity)
+    attachment = version.attachment
+    reference = attachment.file_path if attachment else version.project_file_path
+    if not reference or not object_exists(reference):
+        raise HTTPException(status_code=404, detail={"code": "SUBMISSION_VERSION_FILE_MISSING", "message": "该版本没有可用文件或文件已缺失。"})
+    filename = (attachment.original_file_name if attachment else version.file_name_snapshot) or reference_name(reference)
+    media_type = attachment.mime_type if attachment else version.mime_type_snapshot
+    return authenticated_storage_response(
+        reference,
+        media_type=media_type or mimetypes.guess_type(filename)[0] or "application/octet-stream",
+        filename=filename or f"submission-version-{version.id}",
+        inline=not download,
+    )
+
+
 @app.put("/api/submissions/{submission_id}/review")
 def review_submission(
     submission_id: int,
@@ -5417,6 +5815,17 @@ def review_submission(
     submission.score = payload.score
     if payload.is_featured is not None:
         submission.is_featured = payload.is_featured
+    latest_version = (
+        db.query(SubmissionVersion)
+        .filter(SubmissionVersion.submission_id == submission.id)
+        .order_by(SubmissionVersion.version_number.desc())
+        .first()
+    )
+    if latest_version:
+        latest_version.review_status = payload.status
+        latest_version.feedback_snapshot = payload.feedback
+        latest_version.score_snapshot = payload.score
+        latest_version.max_score_snapshot = max_score
     db.commit()
     db.refresh(submission)
     record_teacher_audit(
@@ -5509,6 +5918,10 @@ def save_moderation_settings(
 def list_moderation_logs(teacher: TeacherSession = Depends(require_teacher), db: Session = Depends(get_db)):
     actor = teacher_actor(db, teacher)
     query = db.query(ModerationLog)
+    query = query.filter(~(
+        ModerationLog.content_stage.in_(("agent_input", "agent_output", "agent_tool_input"))
+        & ModerationLog.passed.is_(True)
+    ))
     if not is_admin_actor(actor):
         query = query.filter(staff_scope_condition(ModerationLog, db, actor))
         archived_student_ids = db.query(User.id).filter(User.role == "student", User.archived_at.is_not(None))
@@ -5578,6 +5991,18 @@ def review_image_moderation(
         if project:
             project.moderation_status = payload.status
             project.moderation_reason = payload.note.strip() or log.reason
+    attachment = db.query(SubmissionAttachment).filter(
+        SubmissionAttachment.file_path == log.resource_path,
+        SubmissionAttachment.user_id == log.user_id,
+    ).order_by(SubmissionAttachment.id.desc()).first()
+    if attachment:
+        attachment.safety_status = payload.status
+    artifact = db.query(AgentArtifact).filter(
+        AgentArtifact.file_path == log.resource_path,
+        AgentArtifact.user_id == log.user_id,
+    ).order_by(AgentArtifact.id.desc()).first()
+    if artifact and not artifact.saved_project_id:
+        artifact.status = "available" if payload.status == "approved" else "rejected"
     db.commit()
     db.refresh(log)
     record_teacher_audit(
@@ -5843,6 +6268,9 @@ def restore_system_backup(payload: SystemRestoreRequest, teacher: TeacherSession
                 owner_name=str(item.get("owner_name") or "未归属学生"),
                 summary=str(item.get("summary") or ""),
                 file_path=str(item.get("file_path") or ""),
+                original_file_name=str(item.get("original_file_name") or ""),
+                mime_type=str(item.get("mime_type") or ""),
+                file_size=max(0, int(item.get("file_size") or 0)),
                 lifecycle_status=str(item.get("lifecycle_status") or "active"),
                 archived_at=parse_backup_datetime(item.get("archived_at")),
                 trashed_at=parse_backup_datetime(item.get("trashed_at")),
@@ -5933,6 +6361,9 @@ def restore_system_backup(payload: SystemRestoreRequest, teacher: TeacherSession
             project_title=str(item.get("project_title") or ""),
             project_summary=str(item.get("project_summary") or ""),
             project_file_path=str(item.get("project_file_path") or ""),
+            file_name_snapshot=str(item.get("file_name_snapshot") or ""),
+            mime_type_snapshot=str(item.get("mime_type_snapshot") or ""),
+            file_size_snapshot=max(0, int(item.get("file_size_snapshot") or 0)),
             is_late=bool(item.get("is_late", False)),
         ))
         imported["submission_versions"] += 1
@@ -6057,6 +6488,7 @@ def _provider_audit_details(provider: AIProvider, api_key_changed: bool) -> dict
         "image_model": provider.image_model,
         "video_model": provider.video_model,
         "enabled": provider.enabled,
+        "student_selectable": provider.student_selectable,
         "api_key_changed": api_key_changed,
     }
 

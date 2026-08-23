@@ -9,6 +9,7 @@ import {
   Empty,
   Form,
   Input,
+  InputNumber,
   Modal,
   Popconfirm,
   Select,
@@ -21,10 +22,15 @@ import {
   Archive,
   ArrowDown,
   ArrowUp,
+  BookOpen,
+  CircleCheckBig,
   Download,
   Eye,
   FileText,
   FileUp,
+  Layers3,
+  Maximize2,
+  Minimize2,
   Pencil,
   Plus,
   Presentation,
@@ -33,8 +39,9 @@ import {
   Trash2,
   UploadCloud,
   UserRoundCheck,
+  UserRoundX,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -51,6 +58,10 @@ import { saveBlobFile } from "../../lib/downloads";
 import { explainError } from "../../lib/errors";
 import { formatBeijingTime } from "../../lib/format";
 import { ALL_SCHOOL_STAGES, SCHOOL_STAGE_OPTIONS, schoolStageLabel } from "../../lib/schoolStages";
+import {
+  defaultSubmissionExtensions,
+  submissionExtensionOptions,
+} from "../../lib/submissionFiles";
 
 
 const { Text, Title, Paragraph } = Typography;
@@ -78,6 +89,8 @@ type CourseFormValues = {
   assignment_instructions?: string;
   tools?: string[];
   rubric: Array<{ criterion: string; max_score: number }>;
+  submission_extensions: string[];
+  submission_max_mb: number;
 };
 
 const materialIcons: Record<CourseMaterialKind, React.ReactNode> = {
@@ -128,6 +141,8 @@ export function CurriculumManager({
   const [previewText, setPreviewText] = useState("");
   const [previewUrl, setPreviewUrl] = useState("");
   const [previewLoading, setPreviewLoading] = useState(false);
+  const [presentationMode, setPresentationMode] = useState(false);
+  const presentationRef = useRef<HTMLDivElement | null>(null);
   const [permissionDrawerOpen, setPermissionDrawerOpen] = useState(false);
   const [authorOptions, setAuthorOptions] = useState<CourseAuthorOption[]>([]);
   const [authorOptionsLoading, setAuthorOptionsLoading] = useState(false);
@@ -169,6 +184,14 @@ export function CurriculumManager({
   useEffect(() => () => {
     if (previewUrl) URL.revokeObjectURL(previewUrl);
   }, [previewUrl]);
+
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      if (!document.fullscreenElement) setPresentationMode(false);
+    };
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+    return () => document.removeEventListener("fullscreenchange", handleFullscreenChange);
+  }, []);
 
   const selectPackage = (packageId: number | null, replace = false) => {
     const next = new URLSearchParams(searchParams);
@@ -243,12 +266,18 @@ export function CurriculumManager({
       assignment_instructions: "",
       tools: ["text", "image", "workflow"],
       rubric: [{ criterion: "完成度", max_score: 100 }],
+      submission_extensions: [...defaultSubmissionExtensions],
+      submission_max_mb: 20,
     } : {
       title: item.title,
       description: item.description,
       assignment_instructions: item.assignment_instructions,
       tools: item.tool_scope.split(",").filter(Boolean),
       rubric: item.rubric,
+      submission_extensions: item.submission_extensions?.length
+        ? item.submission_extensions
+        : [...defaultSubmissionExtensions],
+      submission_max_mb: Math.max(1, Math.round((item.submission_max_bytes || 20 * 1024 * 1024) / 1024 / 1024)),
     });
   };
 
@@ -262,6 +291,8 @@ export function CurriculumManager({
         assignment_instructions: values.assignment_instructions?.trim() || "",
         tool_scope: (values.tools || []).join(","),
         rubric: values.rubric,
+        submission_extensions: values.submission_extensions,
+        submission_max_bytes: values.submission_max_mb * 1024 * 1024,
       };
       if (courseEditor === "new") {
         await api.post(`/api/course-packages/${selectedPackage.id}/courses`, payload);
@@ -280,7 +311,29 @@ export function CurriculumManager({
     }, kind === "slides" ? "PPT 已上传，正在生成预览" : "课程资料已上传");
   };
 
+  const exitPresentation = async () => {
+    if (document.fullscreenElement) {
+      try {
+        await document.exitFullscreen();
+      } catch {
+        // The application-level presentation layout remains available as a fallback.
+      }
+    }
+    setPresentationMode(false);
+  };
+
+  const enterPresentation = async () => {
+    if (!presentationRef.current || !previewUrl) return;
+    setPresentationMode(true);
+    try {
+      await presentationRef.current.requestFullscreen();
+    } catch {
+      message.info("系统全屏不可用，已切换为窗口内全屏展示");
+    }
+  };
+
   const closePreview = () => {
+    void exitPresentation();
     if (previewUrl) URL.revokeObjectURL(previewUrl);
     setPreviewUrl("");
     setPreviewText("");
@@ -402,7 +455,7 @@ export function CurriculumManager({
     <div className="curriculumWorkspace">
       {audience === "admin" && converter && (
         <Alert
-          className="mb16"
+          className="curriculumConverterNotice"
           showIcon
           type={converter.available ? "success" : "warning"}
           message={converter.available ? "PPT 预览转换服务可用" : "PPT 预览转换服务未配置"}
@@ -432,11 +485,28 @@ export function CurriculumManager({
 
       {!selectedPackage ? (
         <section className="curriculumOverview" aria-label="课程概览">
-          <div className="curriculumOverviewGrid">
-            <div><Text type="secondary">课程包</Text><Text strong>{packages.length}</Text></div>
-            <div><Text type="secondary">已发布</Text><Text strong>{packages.filter((item) => item.status === "published").length}</Text></div>
-            <div><Text type="secondary">课程总数</Text><Text strong>{packages.reduce((sum, item) => sum + item.course_count, 0)}</Text></div>
-            {audience === "admin" && <div><Text type="secondary">尚未授权教师</Text><Text strong>{packages.filter((item) => item.assignment_status === "unassigned").length}</Text></div>}
+          <div className="teachingMetricStrip curriculumMetricStrip">
+            <div className="teachingMetricItem metricBlue">
+              <span className="teachingMetricIcon"><Layers3 size={22} /></span>
+              <span><Text type="secondary">课程包</Text><strong>{packages.length}</strong></span>
+            </div>
+            <div className="teachingMetricItem metricGreen">
+              <span className="teachingMetricIcon"><CircleCheckBig size={22} /></span>
+              <span><Text type="secondary">已发布</Text><strong>{packages.filter((item) => item.status === "published").length}</strong></span>
+            </div>
+            <div className="teachingMetricItem metricAmber">
+              <span className="teachingMetricIcon"><BookOpen size={22} /></span>
+              <span><Text type="secondary">课程总数</Text><strong>{packages.reduce((sum, item) => sum + item.course_count, 0)}</strong></span>
+            </div>
+            <div className="teachingMetricItem metricCoral">
+              <span className="teachingMetricIcon">{audience === "admin" ? <UserRoundX size={22} /> : <Send size={22} />}</span>
+              <span>
+                <Text type="secondary">{audience === "admin" ? "尚未授权教师" : "可排课课程包"}</Text>
+                <strong>{audience === "admin"
+                  ? packages.filter((item) => item.assignment_status === "unassigned").length
+                  : packages.filter((item) => item.can_schedule).length}</strong>
+              </span>
+            </div>
           </div>
           {!packages.length && <Empty description={audience === "admin" ? "暂无课程包" : "当前没有已授权课程包"} />}
           {audience === "admin" && packages.some((item) => item.assignment_status === "unassigned") && (
@@ -524,7 +594,7 @@ export function CurriculumManager({
               {!selectedPackage.courses.length ? (
                 <Alert type="info" showIcon message="课程包还没有课程" description="添加至少一门课程后即可发布；PPT、工程包和成果包均可暂时留空。" />
               ) : (
-                <Space direction="vertical" size={12} className="fullWidth">
+                <div className="curriculumCourseLedger">
                   {[...selectedPackage.courses].sort((left, right) => left.order_index - right.order_index).map((course, courseIndex) => (
                     <article className="curriculumCourse" key={course.id}>
                       <div className="curriculumCourseHeader">
@@ -601,7 +671,7 @@ export function CurriculumManager({
                       </div>
                     </article>
                   ))}
-                </Space>
+                </div>
               )}
             </section>
           )}
@@ -613,7 +683,7 @@ export function CurriculumManager({
         open={Boolean(packageEditor)}
         onCancel={() => setPackageEditor(null)}
         footer={null}
-        destroyOnClose
+        destroyOnHidden
       >
         <Form form={packageForm} layout="vertical" onFinish={savePackage}>
           <Form.Item name="title" label="课程包名称" rules={[{ required: true, message: "请输入课程包名称" }]}><Input maxLength={160} /></Form.Item>
@@ -652,7 +722,7 @@ export function CurriculumManager({
         onCancel={() => setCourseEditor(null)}
         footer={null}
         width={720}
-        destroyOnClose
+        destroyOnHidden
       >
         <Form form={courseForm} layout="vertical" onFinish={saveCourse}>
           <Form.Item name="title" label="课程名称" rules={[{ required: true, message: "请输入课程名称" }]}><Input maxLength={160} /></Form.Item>
@@ -660,6 +730,27 @@ export function CurriculumManager({
           <Form.Item name="assignment_instructions" label="提交说明"><Input.TextArea rows={3} maxLength={20000} placeholder="学生提交作品时看到的要求" /></Form.Item>
           <Form.Item name="tools" label="允许使用的 AI 工具">
             <Checkbox.Group options={[{ label: "文字生成", value: "text" }, { label: "图片生成", value: "image" }, { label: "视频生成", value: "video" }, { label: "工作流", value: "workflow" }]} />
+          </Form.Item>
+          <Divider orientation="left">本机文件提交</Divider>
+          <Form.Item
+            name="submission_extensions"
+            label="允许的文件类型"
+            rules={[{ required: true, type: "array", min: 1, message: "请至少选择一种文件类型" }]}
+          >
+            <Select
+              mode="multiple"
+              options={submissionExtensionOptions}
+              optionFilterProp="label"
+              showSearch
+              placeholder="选择学生可上传的文件类型"
+            />
+          </Form.Item>
+          <Form.Item
+            name="submission_max_mb"
+            label="单文件上限"
+            rules={[{ required: true, type: "number", min: 1, max: 20 }]}
+          >
+            <InputNumber min={1} max={20} precision={0} addonAfter="MB" className="fullWidth" />
           </Form.Item>
           <Divider orientation="left">评分规则</Divider>
           <Form.List name="rubric">
@@ -718,10 +809,37 @@ export function CurriculumManager({
         title={preview ? `${preview.course.title} · ${preview.course.materials[preview.kind].label}` : "课程资料预览"}
         open={Boolean(preview)}
         onClose={closePreview}
-        width={860}
+        width={presentationMode ? "100%" : 860}
+        extra={preview?.kind === "slides" && previewUrl ? (
+          <Button
+            icon={presentationMode ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
+            onClick={() => void (presentationMode ? exitPresentation() : enterPresentation())}
+          >
+            {presentationMode ? "退出全屏" : "全屏播放"}
+          </Button>
+        ) : null}
       >
         {previewLoading && <Alert type="info" showIcon message="正在加载课程资料" />}
-        {!previewLoading && preview?.kind === "slides" && previewUrl && <iframe className="coursePdfPreview" src={previewUrl} title="课堂 PPT PDF 预览" />}
+        {!previewLoading && preview?.kind === "slides" && previewUrl && (
+          <div
+            ref={presentationRef}
+            className={`coursePresentationStage${presentationMode ? " presentationMode" : ""}`}
+          >
+            {presentationMode && (
+              <div className="coursePresentationToolbar">
+                <Text strong ellipsis>{preview.course.title}</Text>
+                <Button
+                  ghost
+                  icon={<Minimize2 size={16} />}
+                  onClick={() => void exitPresentation()}
+                >
+                  退出全屏
+                </Button>
+              </div>
+            )}
+            <iframe className="coursePdfPreview" src={previewUrl} title="课堂 PPT PDF 播放" />
+          </div>
+        )}
         {!previewLoading && preview && preview.kind !== "slides" && (
           <article className="markdownPreview courseMarkdownPreview"><ReactMarkdown remarkPlugins={[remarkGfm]}>{previewText || "资料内容为空。"}</ReactMarkdown></article>
         )}

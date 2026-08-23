@@ -1,4 +1,6 @@
+import json
 from pathlib import Path
+import tomllib
 import unittest
 
 
@@ -6,6 +8,26 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class PublicIpDeploymentConfigTests(unittest.TestCase):
+    def test_release_versions_are_synchronized(self):
+        client_version = "0.2.0-beta.7"
+        api_version = "0.2.0-beta.5"
+        package = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
+        package_lock = json.loads((ROOT / "package-lock.json").read_text(encoding="utf-8"))
+        tauri = json.loads((ROOT / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8"))
+        cargo = tomllib.loads((ROOT / "src-tauri" / "Cargo.toml").read_text(encoding="utf-8"))
+        cargo_lock = (ROOT / "src-tauri" / "Cargo.lock").read_text(encoding="utf-8")
+        api_main = (ROOT / "backend" / "app" / "main.py").read_text(encoding="utf-8")
+        compose = (ROOT / "deploy" / "docker-compose.yml").read_text(encoding="utf-8")
+
+        self.assertEqual(package["version"], client_version)
+        self.assertEqual(package_lock["version"], client_version)
+        self.assertEqual(package_lock["packages"][""]["version"], client_version)
+        self.assertEqual(tauri["version"], client_version)
+        self.assertEqual(cargo["package"]["version"], client_version)
+        self.assertIn(f'name = "coderai-school"\nversion = "{client_version}"', cargo_lock)
+        self.assertIn(f'APP_VERSION = "{api_version}"', api_main)
+        self.assertEqual(compose.count(f"image: coderai-api:{api_version}"), 5)
+
     def test_caddy_uses_no_sni_ip_tls_and_hosts_updates(self):
         caddyfile = (ROOT / "deploy" / "Caddyfile").read_text(encoding="utf-8")
         self.assertIn("http://{$CODERAI_PUBLIC_IP}", caddyfile)

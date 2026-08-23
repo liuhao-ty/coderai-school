@@ -124,6 +124,11 @@ class CurriculumCourse(TenantScopedMixin, Base):
     assignment_instructions: Mapped[str] = mapped_column(Text, default="")
     tool_scope: Mapped[str] = mapped_column(String(120), default="text,image,workflow")
     rubric_json: Mapped[str] = mapped_column(Text, default='[{"criterion":"完成度","max_score":100}]')
+    submission_extensions_json: Mapped[str] = mapped_column(
+        Text,
+        default='[".md",".txt",".pdf",".zip",".sb3",".py",".html",".css",".js",".ts",".json",".csv",".docx",".pptx",".xlsx",".png",".jpg",".jpeg",".webp",".mp4"]',
+    )
+    submission_max_bytes: Mapped[int] = mapped_column(Integer, default=20 * 1024 * 1024)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
 
@@ -262,6 +267,9 @@ class Project(TenantScopedMixin, Base):
     summary: Mapped[str] = mapped_column(Text, default="")
     workspace_answers_json: Mapped[str] = mapped_column(Text, default="{}")
     file_path: Mapped[str] = mapped_column(Text, default="")
+    original_file_name: Mapped[str] = mapped_column(String(255), default="")
+    mime_type: Mapped[str] = mapped_column(String(120), default="")
+    file_size: Mapped[int] = mapped_column(Integer, default=0)
     lifecycle_status: Mapped[str] = mapped_column(String(20), default="active")
     moderation_status: Mapped[str] = mapped_column(String(20), default="approved")
     moderation_reason: Mapped[str] = mapped_column(Text, default="")
@@ -277,11 +285,15 @@ class Project(TenantScopedMixin, Base):
 
 class TaskSubmission(TenantScopedMixin, Base):
     __tablename__ = "task_submissions"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "task_id", "user_id", name="ux_task_submissions_org_task_user"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     owner_teacher_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id"), nullable=False)
-    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), nullable=False)
+    project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id"), nullable=True)
+    source_type: Mapped[str] = mapped_column(String(20), default="project")
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     classroom_id: Mapped[int | None] = mapped_column(ForeignKey("classrooms.id"), nullable=True)
     status: Mapped[str] = mapped_column(String(30), default="submitted")
@@ -298,22 +310,72 @@ class TaskSubmission(TenantScopedMixin, Base):
     project = relationship("Project")
     user = relationship("User")
     classroom = relationship("Classroom")
+    versions = relationship(
+        "SubmissionVersion",
+        back_populates="submission",
+        order_by="SubmissionVersion.version_number",
+        cascade="all, delete-orphan",
+    )
 
 
 class SubmissionVersion(TenantScopedMixin, Base):
     __tablename__ = "submission_versions"
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_id",
+            "submission_id",
+            "version_number",
+            name="ux_submission_versions_org_submission_version",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     submission_id: Mapped[int] = mapped_column(ForeignKey("task_submissions.id"), nullable=False)
     version_number: Mapped[int] = mapped_column(Integer, default=1)
-    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), nullable=False)
+    project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id"), nullable=True)
+    source_type: Mapped[str] = mapped_column(String(20), default="project")
     project_title: Mapped[str] = mapped_column(String(160), default="")
     project_summary: Mapped[str] = mapped_column(Text, default="")
     project_file_path: Mapped[str] = mapped_column(Text, default="")
+    file_name_snapshot: Mapped[str] = mapped_column(String(255), default="")
+    mime_type_snapshot: Mapped[str] = mapped_column(String(120), default="")
+    file_size_snapshot: Mapped[int] = mapped_column(Integer, default=0)
     is_late: Mapped[bool] = mapped_column(Boolean, default=False)
+    review_status: Mapped[str] = mapped_column(String(30), default="submitted")
+    feedback_snapshot: Mapped[str] = mapped_column(Text, default="")
+    score_snapshot: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_score_snapshot: Mapped[int] = mapped_column(Integer, default=100)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
-    submission = relationship("TaskSubmission")
+    submission = relationship("TaskSubmission", back_populates="versions")
     project = relationship("Project")
+    attachment = relationship("SubmissionAttachment", back_populates="version", uselist=False)
+
+
+class SubmissionAttachment(TenantScopedMixin, Base):
+    __tablename__ = "submission_attachments"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "version_id", name="ux_submission_attachments_org_version"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    submission_id: Mapped[int] = mapped_column(ForeignKey("task_submissions.id"), nullable=False, index=True)
+    version_id: Mapped[int] = mapped_column(ForeignKey("submission_versions.id"), nullable=False, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    classroom_id: Mapped[int | None] = mapped_column(ForeignKey("classrooms.id"), nullable=True, index=True)
+    title: Mapped[str] = mapped_column(String(160), default="")
+    file_path: Mapped[str] = mapped_column(Text, default="")
+    original_file_name: Mapped[str] = mapped_column(String(255), default="")
+    mime_type: Mapped[str] = mapped_column(String(120), default="")
+    file_extension: Mapped[str] = mapped_column(String(20), default="")
+    file_size: Mapped[int] = mapped_column(Integer, default=0)
+    checksum_sha256: Mapped[str] = mapped_column(String(64), default="")
+    safety_status: Mapped[str] = mapped_column(String(30), default="approved")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+    submission = relationship("TaskSubmission")
+    version = relationship("SubmissionVersion", back_populates="attachment")
+    user = relationship("User")
+    classroom = relationship("Classroom")
 
 
 class FeedbackTemplate(TenantScopedMixin, Base):
@@ -406,11 +468,13 @@ class VideoTask(TenantScopedMixin, Base):
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     download_url_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id"), nullable=True)
+    generation_job_id: Mapped[int | None] = mapped_column(ForeignKey("ai_generation_jobs.id"), nullable=True, index=True)
     user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     classroom_id: Mapped[int | None] = mapped_column(ForeignKey("classrooms.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
     project = relationship("Project")
+    generation_job = relationship("AIGenerationJob", foreign_keys=[generation_job_id])
     user = relationship("User")
     classroom = relationship("Classroom")
 
@@ -427,6 +491,7 @@ class AIProvider(TenantScopedMixin, Base):
     image_model: Mapped[str] = mapped_column(String(120), default="gpt-image-1")
     video_model: Mapped[str] = mapped_column(String(120), default="")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    student_selectable: Mapped[bool] = mapped_column(Boolean, default=False)
     last_test_status: Mapped[str] = mapped_column(String(20), default="untested")
     last_test_message: Mapped[str] = mapped_column(Text, default="")
     last_tested_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -442,6 +507,107 @@ class AIProviderRoute(TenantScopedMixin, Base):
     capability: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
     provider_ids_json: Mapped[str] = mapped_column(Text, default="[]")
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+
+class AgentConversation(TenantScopedMixin, Base):
+    __tablename__ = "agent_conversations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(160), default="新对话")
+    selected_provider_id: Mapped[int | None] = mapped_column(ForeignKey("ai_providers.id"), nullable=True)
+    memory_summary: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(20), default="active", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+    user = relationship("User")
+    selected_provider = relationship("AIProvider")
+
+
+class AgentMessage(TenantScopedMixin, Base):
+    __tablename__ = "agent_messages"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "conversation_id", "sequence", name="ux_agent_messages_org_sequence"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    conversation_id: Mapped[int] = mapped_column(ForeignKey("agent_conversations.id"), nullable=False, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    role: Mapped[str] = mapped_column(String(20), nullable=False)
+    content: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(20), default="completed")
+    provider_id: Mapped[int | None] = mapped_column(ForeignKey("ai_providers.id"), nullable=True)
+    model: Mapped[str] = mapped_column(String(120), default="")
+    sequence: Mapped[int] = mapped_column(Integer, default=1)
+    tool_suggestion_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+    conversation = relationship("AgentConversation")
+    user = relationship("User")
+    provider = relationship("AIProvider")
+
+
+class AIGenerationJob(TenantScopedMixin, Base):
+    __tablename__ = "ai_generation_jobs"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "user_id", "client_request_id", name="ux_ai_jobs_org_user_request"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    classroom_id: Mapped[int | None] = mapped_column(ForeignKey("classrooms.id"), nullable=True, index=True)
+    conversation_id: Mapped[int | None] = mapped_column(ForeignKey("agent_conversations.id"), nullable=True, index=True)
+    assistant_message_id: Mapped[int | None] = mapped_column(ForeignKey("agent_messages.id"), nullable=True)
+    provider_id: Mapped[int | None] = mapped_column(ForeignKey("ai_providers.id"), nullable=True)
+    project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id"), nullable=True)
+    client_request_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    capability: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    operation: Mapped[str] = mapped_column(String(40), default="generate")
+    model: Mapped[str] = mapped_column(String(120), default="")
+    status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    request_json: Mapped[str] = mapped_column(Text, default="{}")
+    result_json: Mapped[str] = mapped_column(Text, default="{}")
+    error_code: Mapped[str] = mapped_column(String(80), default="")
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+    user = relationship("User")
+    conversation = relationship("AgentConversation")
+    assistant_message = relationship("AgentMessage")
+    provider = relationship("AIProvider")
+    project = relationship("Project")
+
+
+class AgentArtifact(TenantScopedMixin, Base):
+    __tablename__ = "agent_artifacts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    conversation_id: Mapped[int] = mapped_column(ForeignKey("agent_conversations.id"), nullable=False, index=True)
+    message_id: Mapped[int | None] = mapped_column(ForeignKey("agent_messages.id"), nullable=True, index=True)
+    generation_job_id: Mapped[int | None] = mapped_column(ForeignKey("ai_generation_jobs.id"), nullable=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    saved_project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id"), nullable=True)
+    artifact_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    title: Mapped[str] = mapped_column(String(160), default="")
+    file_path: Mapped[str] = mapped_column(Text, default="")
+    original_file_name: Mapped[str] = mapped_column(String(255), default="")
+    mime_type: Mapped[str] = mapped_column(String(120), default="")
+    file_size: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(20), default="available", index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+    conversation = relationship("AgentConversation")
+    message = relationship("AgentMessage")
+    generation_job = relationship("AIGenerationJob", foreign_keys=[generation_job_id])
+    user = relationship("User")
+    saved_project = relationship("Project")
 
 
 class UsageLog(TenantScopedMixin, Base):

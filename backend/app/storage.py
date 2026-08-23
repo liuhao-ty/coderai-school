@@ -6,6 +6,7 @@ import mimetypes
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import tempfile
 from typing import Iterator
 from urllib.parse import quote
@@ -143,13 +144,27 @@ def put_bytes(
 
 
 def put_file(category: str, source: Path, *, filename: str = "", content_type: str = "", stable_name: str = "") -> str:
-    return put_bytes(
-        category,
-        filename or source.name,
-        source.read_bytes(),
-        content_type=content_type,
-        stable_name=stable_name,
-    )
+    stored_name = filename or source.name
+    if STORAGE_BACKEND == "local":
+        directory = (DATA_DIR / category).resolve()
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / _safe_name(stable_name or f"{uuid.uuid4().hex}-{stored_name}")
+        shutil.copyfile(source, target)
+        return str(target)
+
+    key = build_object_key(category, stored_name, stable_name=stable_name)
+    checksum = hashlib.sha256()
+    with source.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            checksum.update(chunk)
+    extra_args = {
+        "ContentType": content_type or mimetypes.guess_type(stored_name)[0] or "application/octet-stream",
+        "Metadata": {"sha256": checksum.hexdigest()},
+    }
+    if S3_SSE:
+        extra_args["ServerSideEncryption"] = S3_SSE
+    _s3_client().upload_file(str(source), S3_BUCKET, key, ExtraArgs=extra_args)
+    return _reference(S3_BUCKET, key)
 
 
 def read_bytes(reference: str, *, maximum_bytes: int | None = None) -> bytes:

@@ -10,7 +10,7 @@ PROVIDER_PRESETS: list[dict[str, Any]] = [
         "text_model": "gpt-4o-mini",
         "image_model": "gpt-image-1",
         "video_model": "",
-        "capabilities": ["text", "image"],
+        "capabilities": ["text", "image", "video"],
         "models": {
             "text": [
                 {"id": "gpt-4o-mini", "name": "GPT-4o mini"},
@@ -52,6 +52,28 @@ PROVIDER_PRESETS: list[dict[str, Any]] = [
         "description": "DeepSeek 官方 OpenAI 兼容接口，主要用于文本生成、代码解释和推理任务。",
     },
     {
+        "id": "local_openai_compatible",
+        "name": "本地 / 私有模型",
+        "provider_type": "local_openai_compatible",
+        "base_url": "http://host.docker.internal:11434/v1",
+        "text_model": "qwen2.5-coder:7b",
+        "image_model": "",
+        "video_model": "",
+        "capabilities": ["text"],
+        "requires_api_key": False,
+        "models": {
+            "text": [
+                {"id": "qwen2.5-coder:7b", "name": "Qwen 2.5 Coder 7B"},
+                {"id": "qwen2.5:7b", "name": "Qwen 2.5 7B"},
+                {"id": "llama3.2:3b", "name": "Llama 3.2 3B"},
+                {"id": "deepseek-r1:7b", "name": "DeepSeek R1 7B"},
+            ],
+            "image": [],
+            "video": [],
+        },
+        "description": "连接 API 服务器可访问的 Ollama、LM Studio 或机构私有 OpenAI 兼容推理服务；API Key 可留空。",
+    },
+    {
         "id": "minimax",
         "name": "MiniMax",
         "provider_type": "minimax",
@@ -85,7 +107,7 @@ PROVIDER_PRESETS: list[dict[str, Any]] = [
         "text_model": "doubao-seed-1-6",
         "image_model": "doubao-seedream-3-0-t2i-250415",
         "video_model": "doubao-seedance-1-0-lite-t2v-250428",
-        "capabilities": ["text", "image"],
+        "capabilities": ["text", "image", "video"],
         "models": {
             "text": [
                 {"id": "doubao-seed-1-6", "name": "豆包 Seed 1.6"},
@@ -96,9 +118,16 @@ PROVIDER_PRESETS: list[dict[str, Any]] = [
                 {"id": "doubao-seedream-3-0-t2i-250415", "name": "Seedream 3.0"},
                 {"id": "doubao-seedream-4-0-250828", "name": "Seedream 4.0"},
             ],
-            "video": [],
+            "video": [
+                {
+                    "id": "doubao-seedance-1-0-lite-t2v-250428",
+                    "name": "Seedance 1.0 Lite",
+                    "durations": [5, 10],
+                    "supports_image": True,
+                },
+            ],
         },
-        "description": "火山方舟文本与 Seedream 图片入口。Seedance 视频适配器尚未接入，因此暂不声明视频能力。",
+        "description": "火山方舟文本、Seedream 图片与 Seedance 异步视频生成入口。",
     },
     {
         "id": "qwen",
@@ -168,3 +197,7 @@ def list_provider_presets() -> list[dict[str, Any]]:
 
 def provider_capabilities(provider_type: str) -> list[str]:
     return get_provider_preset(provider_type).get("capabilities", [])
+
+
+def provider_requires_api_key(provider_type: str) -> bool:
+    return bool(get_provider_preset(provider_type).get("requires_api_key", True))

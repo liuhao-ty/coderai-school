@@ -20,11 +20,16 @@ from backend.app.audit import record_teacher_audit
 from backend.app.auth import SECRET_SETTING_KEY, ensure_auth_settings, get_setting, require_admin, require_student_or_teacher, require_teacher
 from backend.app.db import CLOUD_MODE, DATA_DIR, get_db
 from backend.app.models import (
+    AIGenerationJob,
+    AgentArtifact,
+    AgentConversation,
+    AgentMessage,
     Asset,
     GuardianConsent,
     ModerationLog,
     PrivacyPolicy,
     Project,
+    SubmissionAttachment,
     SubmissionVersion,
     StudentSession,
     TaskSubmission,
@@ -295,6 +300,13 @@ def _student_records(db: Session, student_id: int) -> dict[str, list[Any]]:
         if project_ids:
             filters.append(SubmissionVersion.project_id.in_(project_ids))
         versions = db.query(SubmissionVersion).filter(or_(*filters)).order_by(SubmissionVersion.id).all()
+    version_ids = [item.id for item in versions]
+    attachment_filter = SubmissionAttachment.user_id == student_id
+    if submission_ids:
+        attachment_filter = or_(attachment_filter, SubmissionAttachment.submission_id.in_(submission_ids))
+    if version_ids:
+        attachment_filter = or_(attachment_filter, SubmissionAttachment.version_id.in_(version_ids))
+    attachments = db.query(SubmissionAttachment).filter(attachment_filter).order_by(SubmissionAttachment.id).all()
 
     assets = db.query(Asset).filter(Asset.project_id.in_(project_ids)).order_by(Asset.id).all() if project_ids else []
     workflows = db.query(Workflow).filter(Workflow.owner_user_id == student_id).order_by(Workflow.id).all()
@@ -309,10 +321,16 @@ def _student_records(db: Session, student_id: int) -> dict[str, list[Any]]:
         video_filter = or_(video_filter, VideoTask.project_id.in_(project_ids))
         moderation_filter = or_(moderation_filter, ModerationLog.project_id.in_(project_ids))
 
+    conversations = db.query(AgentConversation).filter(AgentConversation.user_id == student_id).order_by(AgentConversation.id).all()
+    messages = db.query(AgentMessage).filter(AgentMessage.user_id == student_id).order_by(AgentMessage.id).all()
+    jobs = db.query(AIGenerationJob).filter(AIGenerationJob.user_id == student_id).order_by(AIGenerationJob.id).all()
+    artifacts = db.query(AgentArtifact).filter(AgentArtifact.user_id == student_id).order_by(AgentArtifact.id).all()
+
     return {
         "projects": projects,
         "submissions": submissions,
         "submission_versions": versions,
+        "submission_attachments": attachments,
         "assets": assets,
         "workflows": workflows,
         "workflow_runs": workflow_runs,
@@ -320,6 +338,10 @@ def _student_records(db: Session, student_id: int) -> dict[str, list[Any]]:
         "moderation_logs": db.query(ModerationLog).filter(moderation_filter).order_by(ModerationLog.id).all(),
         "usage_logs": db.query(UsageLog).filter(UsageLog.user_id == student_id).order_by(UsageLog.id).all(),
         "guardian_consents": db.query(GuardianConsent).filter(GuardianConsent.user_id == student_id).order_by(GuardianConsent.id).all(),
+        "agent_conversations": conversations,
+        "agent_messages": messages,
+        "ai_generation_jobs": jobs,
+        "agent_artifacts": artifacts,
     }
 
 
@@ -328,6 +350,8 @@ def _raw_record_paths(records: dict[str, list[Any]]) -> list[str]:
     paths.extend(item.file_path for item in records["projects"])
     paths.extend(item.file_path for item in records["assets"])
     paths.extend(item.project_file_path for item in records["submission_versions"])
+    paths.extend(item.file_path for item in records["submission_attachments"])
+    paths.extend(item.file_path for item in records["agent_artifacts"])
     for item in records["video_tasks"]:
         paths.extend([item.file_path, item.source_image_path])
     paths.extend(item.resource_path for item in records["moderation_logs"])
@@ -354,6 +378,8 @@ def _other_referenced_paths(db: Session, records: dict[str, list[Any]]) -> set[P
     raw_paths.extend(item.file_path for item in db.query(Project).filter(~Project.id.in_(excluded["projects"] or [-1])).all())
     raw_paths.extend(item.file_path for item in db.query(Asset).filter(~Asset.id.in_(excluded["assets"] or [-1])).all())
     raw_paths.extend(item.project_file_path for item in db.query(SubmissionVersion).filter(~SubmissionVersion.id.in_(excluded["submission_versions"] or [-1])).all())
+    raw_paths.extend(item.file_path for item in db.query(SubmissionAttachment).filter(~SubmissionAttachment.id.in_(excluded["submission_attachments"] or [-1])).all())
+    raw_paths.extend(item.file_path for item in db.query(AgentArtifact).filter(~AgentArtifact.id.in_(excluded["agent_artifacts"] or [-1])).all())
     for item in db.query(VideoTask).filter(~VideoTask.id.in_(excluded["video_tasks"] or [-1])).all():
         raw_paths.extend([item.file_path, item.source_image_path])
     raw_paths.extend(item.resource_path for item in db.query(ModerationLog).filter(~ModerationLog.id.in_(excluded["moderation_logs"] or [-1])).all())
@@ -366,6 +392,8 @@ def _other_referenced_objects(db: Session, records: dict[str, list[Any]]) -> set
     raw_paths.extend(item.file_path for item in db.query(Project).filter(~Project.id.in_(excluded["projects"] or [-1])).all())
     raw_paths.extend(item.file_path for item in db.query(Asset).filter(~Asset.id.in_(excluded["assets"] or [-1])).all())
     raw_paths.extend(item.project_file_path for item in db.query(SubmissionVersion).filter(~SubmissionVersion.id.in_(excluded["submission_versions"] or [-1])).all())
+    raw_paths.extend(item.file_path for item in db.query(SubmissionAttachment).filter(~SubmissionAttachment.id.in_(excluded["submission_attachments"] or [-1])).all())
+    raw_paths.extend(item.file_path for item in db.query(AgentArtifact).filter(~AgentArtifact.id.in_(excluded["agent_artifacts"] or [-1])).all())
     for item in db.query(VideoTask).filter(~VideoTask.id.in_(excluded["video_tasks"] or [-1])).all():
         raw_paths.extend([item.file_path, item.source_image_path])
     raw_paths.extend(item.resource_path for item in db.query(ModerationLog).filter(~ModerationLog.id.in_(excluded["moderation_logs"] or [-1])).all())
@@ -681,6 +709,8 @@ def _delete_database_records(
     reason: str,
 ) -> None:
     ids = {name: [item.id for item in rows] for name, rows in records.items()}
+    if ids["submission_attachments"]:
+        db.query(SubmissionAttachment).filter(SubmissionAttachment.id.in_(ids["submission_attachments"])).delete(synchronize_session=False)
     if ids["submission_versions"]:
         db.query(SubmissionVersion).filter(SubmissionVersion.id.in_(ids["submission_versions"])).delete(synchronize_session=False)
     if ids["submissions"]:
@@ -693,6 +723,14 @@ def _delete_database_records(
         db.query(Workflow).filter(Workflow.id.in_(ids["workflows"])).delete(synchronize_session=False)
     if ids["video_tasks"]:
         db.query(VideoTask).filter(VideoTask.id.in_(ids["video_tasks"])).delete(synchronize_session=False)
+    if ids["agent_artifacts"]:
+        db.query(AgentArtifact).filter(AgentArtifact.id.in_(ids["agent_artifacts"])).delete(synchronize_session=False)
+    if ids["ai_generation_jobs"]:
+        db.query(AIGenerationJob).filter(AIGenerationJob.id.in_(ids["ai_generation_jobs"])).delete(synchronize_session=False)
+    if ids["agent_messages"]:
+        db.query(AgentMessage).filter(AgentMessage.id.in_(ids["agent_messages"])).delete(synchronize_session=False)
+    if ids["agent_conversations"]:
+        db.query(AgentConversation).filter(AgentConversation.id.in_(ids["agent_conversations"])).delete(synchronize_session=False)
     if ids["moderation_logs"]:
         db.query(ModerationLog).filter(ModerationLog.id.in_(ids["moderation_logs"])).delete(synchronize_session=False)
     if ids["usage_logs"]:

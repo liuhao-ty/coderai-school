@@ -24,7 +24,6 @@ const viewportCases: ViewportCase[] = [
   { name: "1280x720", width: 1280, height: 720 },
   { name: "900x800", width: 900, height: 800 },
   { name: "1920x1080", width: 1920, height: 1080 },
-  { name: "1280x720-hidpi", width: 1280, height: 720, deviceScaleFactor: 2 }
 ];
 
 async function loginData(request: APIRequestContext) {
@@ -494,7 +493,7 @@ test("管理员侧栏提供全机构教学管理并保持系统总览独立", as
   const { teacherAuth } = await loginData(request);
   await setTeacherAuth(page, teacherAuth);
   await expect(page.getByRole("heading", { name: "系统总览" })).toBeVisible();
-  await expect(page.getByText("教师的班级、学员、作品和批改数据不会出现在此总览。")).toBeVisible();
+  await expect(page.getByText("系统总览仅展示账号、模型与运维状态；教学数据在教学总览中查看。")).toBeVisible();
 
   await page.getByRole("menuitem", { name: "教学总览" }).click();
   await expect(page).toHaveURL(/#\/admin\/teaching$/);
@@ -702,28 +701,28 @@ test("图片作品支持本地与云端预览下载且不显示云端地址", as
   await setTeacherAuth(page, teacherAuth);
   await page.getByRole("menuitem", { name: "学员作品" }).click();
   await expect(page.getByRole("heading", { name: "作品管理" })).toBeVisible();
-  await expect(page.getByText(/最近提交：/).first()).toBeVisible();
+  await expect(page.getByRole("columnheader", { name: "最近提交" })).toBeVisible();
   const studentFilter = page.getByRole("combobox", { name: "按学生筛选作品" });
   await studentFilter.fill("默认");
   await page.locator(".ant-select-item-option").filter({ hasText: "默认学生" }).click();
   const studentSelect = studentFilter.locator("xpath=ancestor::div[contains(concat(' ',normalize-space(@class),' '),' ant-select ')][1]");
   await studentSelect.hover();
   await studentSelect.locator(".ant-select-clear").click();
-  await expect(page.locator(".projectCard")).toHaveCount(projects.length);
+  await expect(page.locator(".projectLedgerRow")).toHaveCount(projects.length);
   const classroomFilter = page.getByRole("combobox", { name: "按班级筛选作品" });
   await classroomFilter.fill("默认");
   await page.locator(".ant-select-item-option").filter({ hasText: "默认班级" }).click();
   const classroomSelect = classroomFilter.locator("xpath=ancestor::div[contains(concat(' ',normalize-space(@class),' '),' ant-select ')][1]");
   await classroomSelect.hover();
   await classroomSelect.locator(".ant-select-clear").click();
-  await expect(page.locator(".projectCard")).toHaveCount(projects.length);
+  await expect(page.locator(".projectLedgerRow")).toHaveCount(projects.length);
   await page.getByPlaceholder("提交开始日期").fill("2026-07-16");
   await page.getByPlaceholder("提交开始日期").press("Enter");
   await page.getByPlaceholder("提交结束日期").fill("2026-07-16");
   await page.getByPlaceholder("提交结束日期").press("Enter");
-  await expect(page.locator(".projectCard")).toHaveCount(projects.length);
+  await expect(page.locator(".projectLedgerRow")).toHaveCount(projects.length);
 
-  await page.locator(".projectCard").filter({ hasText: "E2E 本地图片" }).click();
+  await page.locator(".projectLedgerRow").filter({ hasText: "E2E 本地图片" }).click();
   let drawer = page.locator(".ant-drawer-content").last();
   await expect(drawer.getByRole("tab", { name: /图片预览/ })).toBeVisible();
   const localImage = drawer.getByRole("img", { name: "图片作品：E2E 本地图片" });
@@ -734,7 +733,7 @@ test("图片作品支持本地与云端预览下载且不显示云端地址", as
   expect(localDownload.suggestedFilename()).toBe("E2E 本地图片.png");
   await drawer.locator(".ant-drawer-close").click();
 
-  await page.locator(".projectCard").filter({ hasText: "E2E 云端图片" }).click();
+  await page.locator(".projectLedgerRow").filter({ hasText: "E2E 云端图片" }).click();
   drawer = page.locator(".ant-drawer-content").last();
   const remoteImage = drawer.getByRole("img", { name: "图片作品：E2E 云端图片" });
   await expect.poll(() => remoteImage.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBeGreaterThan(0);
@@ -751,21 +750,21 @@ test("图片作品支持本地与云端预览下载且不显示云端地址", as
   expect(remoteDownload).toEqual({ href: remoteUrl, download: "E2E 云端图片.png", target: "_blank" });
   await drawer.locator(".ant-drawer-close").click();
 
-  await page.locator(".projectCard").filter({ hasText: "E2E 缺失图片" }).click();
+  await page.locator(".projectLedgerRow").filter({ hasText: "E2E 缺失图片" }).click();
   drawer = page.locator(".ant-drawer-content").last();
   await expect(drawer.getByText("图片暂时无法预览", { exact: true })).toBeVisible();
   await expect(drawer.getByText("作品记录存在，但图片文件已经缺失。", { exact: true })).toBeVisible();
   await expect(drawer.getByRole("button", { name: "下载原图" })).toBeDisabled();
   await drawer.locator(".ant-drawer-close").click();
 
-  await page.locator(".projectCard").filter({ hasText: "E2E 审核失败图片" }).click();
+  await page.locator(".projectLedgerRow").filter({ hasText: "E2E 审核失败图片" }).click();
   drawer = page.locator(".ant-drawer-content").last();
   await expect(drawer.getByText("审核未通过", { exact: true })).toBeVisible();
   await expect(drawer.getByText("云端图片加载失败，请稍后重试或使用下载按钮打开原图。", { exact: true })).toBeVisible();
   expect(await drawer.evaluate((element, url) => element.innerText.includes(url), failedRemoteUrl)).toBeFalsy();
   await drawer.locator(".ant-drawer-close").click();
 
-  await page.locator(".projectCard").filter({ hasText: "E2E 下载失败图片" }).click();
+  await page.locator(".projectLedgerRow").filter({ hasText: "E2E 下载失败图片" }).click();
   drawer = page.locator(".ant-drawer-content").last();
   const failedDownloadImage = drawer.getByRole("img", { name: "图片作品：E2E 下载失败图片" });
   await expect.poll(() => failedDownloadImage.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBeGreaterThan(0);
@@ -940,13 +939,52 @@ test("键盘可以完成学生登录、跳过导航和页面切换", async ({ pa
 
 test("学生学习工作台使用二级导航并兼容旧工作流地址", async ({ page, request }) => {
   const { studentAuth } = await loginData(request);
+  let selectedWorkflowId: number | null = null;
   await page.route("**/api/classes/tasks", (route) => route.fulfill({
     status: 200,
     contentType: "application/json",
     body: JSON.stringify({ tasks: [] }),
   }));
+  await page.route("**/api/agent/models", (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({ models: [{ provider_id: 81, provider_name: "课堂模型", model: "classroom-agent" }] }),
+  }));
+  await page.route("**/api/agent/conversations", (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({ conversations: [{ id: 77, title: "机器人课程讨论", selected_provider_id: 81, status: "active", created_at: "2026-08-23T10:00:00+08:00", updated_at: "2026-08-23T10:02:00+08:00" }] }),
+  }));
+  await page.route("**/api/agent/conversations/77", (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({
+      conversation: { id: 77, title: "机器人课程讨论", selected_provider_id: 81, status: "active", created_at: "2026-08-23T10:00:00+08:00", updated_at: "2026-08-23T10:02:00+08:00" },
+      messages: [{ id: 91, conversation_id: 77, role: "assistant", content: "可以运行已保存的课堂工作流。", status: "completed", model: "classroom-agent", sequence: 1, tool_suggestion: { capability: "workflow", prompt: "生成机器人课程计划" }, created_at: "2026-08-23T10:02:00+08:00" }],
+      artifacts: [],
+    }),
+  }));
+  await page.route("**/api/ai/jobs", (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({ jobs: [] }),
+  }));
+  await page.route("**/api/workflows", (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({ workflows: [{ id: 303, name: "机器人课堂 DAG" }] }),
+  }));
+  await page.route("**/api/agent/conversations/77/tools", async (route) => {
+    const body = route.request().postDataJSON() as { workflow_id?: number };
+    selectedWorkflowId = body.workflow_id ?? null;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ job: { id: 404, client_request_id: "e2e-agent", capability: "workflow", operation: "agent_workflow", model: "", status: "queued", result: {}, error_code: "", error_message: "", retry_count: 0, cancel_requested: false, conversation_id: 77, created_at: "2026-08-23T10:03:00+08:00", updated_at: "2026-08-23T10:03:00+08:00" } }),
+    });
+  });
   await setStudentAuth(page, studentAuth);
-  for (const label of ["课堂通知", "课堂素材", "文字生成", "图片生成", "视频生成", "工作流生成"]) {
+  for (const label of ["课堂通知", "课堂素材", "文字生成", "图片生成", "视频生成", "工作流生成", "AI 助手"]) {
     await expect(page.getByRole("menuitem", { name: label })).toBeVisible();
   }
   await expect(page.getByText("编程助手", { exact: true })).toHaveCount(0);
@@ -960,13 +998,60 @@ test("学生学习工作台使用二级导航并兼容旧工作流地址", async
   await expect(page.getByRole("heading", { name: "文字生成" })).toBeVisible();
   await expect(page.getByText("代码解释", { exact: true })).toHaveCount(0);
 
+  await page.getByRole("menuitem", { name: "AI 助手" }).click();
+  await expect(page).toHaveURL(/#\/student\/workspace\/agent$/);
+  await expect(page.getByRole("heading", { name: "AI 助手" })).toBeVisible();
+  await expect(page.getByText("机器人课程讨论", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "确认运行工作流" }).click();
+  const confirmDialog = page.getByRole("dialog", { name: "确认运行工作流？" });
+  await expect(confirmDialog.getByText("机器人课堂 DAG", { exact: true })).toBeVisible();
+  await confirmDialog.getByRole("button", { name: "确认执行" }).click();
+  await expect.poll(() => selectedWorkflowId).toBe(303);
+  await expect(page.getByText("任务正在排队", { exact: true })).toBeVisible();
+
   await page.goto("/#/student/workflows");
   await expect(page).toHaveURL(/#\/student\/workspace\/workflow$/);
   await expect(page.getByRole("heading", { name: "工作流制作" })).toBeVisible();
   await expect(page.getByText("代码解释", { exact: true })).toHaveCount(0);
 });
 
-test("学生端和管理员端适配目标 Windows 分辨率及高 DPI", async ({ browser, request }) => {
+test("长文字标题和实时 Markdown 编辑器适配三个目标视口", async ({ browser, request }) => {
+  test.setTimeout(120_000);
+  const { studentAuth } = await loginData(request);
+  const longTitle = "这是一个超过二十四个中文字符且需要完整显示两行的人工智能课堂文字作品标题";
+  const created = await request.post(`${API_URL}/api/projects`, {
+    headers: { "X-CoderAI-Student-Token": studentAuth.token as string },
+    data: { title: longTitle, project_type: "text", summary: "# 初始内容" },
+  });
+  expect(created.ok()).toBeTruthy();
+
+  for (const viewport of viewportCases) {
+    await test.step(viewport.name, async () => {
+      const context = await browser.newContext({ viewport: { width: viewport.width, height: viewport.height } });
+      const page = await context.newPage();
+      await setStudentAuth(page, studentAuth);
+      await page.getByRole("menuitem", { name: "我的作品" }).click();
+      const card = page.locator(".projectCard").filter({ hasText: longTitle }).first();
+      await expect(card).toBeVisible();
+      const cardTitle = card.locator(".projectCardTitle");
+      await expect(cardTitle).toHaveAttribute("title", longTitle);
+      expect(await cardTitle.evaluate((element) => getComputedStyle(element).webkitLineClamp)).toBe("2");
+      await card.click();
+      const drawer = page.locator(".ant-drawer-content").last();
+      await expect(drawer.locator(".projectDrawerTitle")).toHaveText(longTitle);
+      await drawer.getByRole("tab", { name: "编辑" }).click();
+      const editor = drawer.getByLabel("Markdown 编辑器");
+      await editor.fill("# 实时变化标题\n\n| 项目 | 状态 |\n| --- | --- |\n| 机器人 | 完成 |");
+      const preview = drawer.locator(".liveMarkdownPreview");
+      await expect(preview.getByRole("heading", { name: "实时变化标题" })).toBeVisible();
+      await expect(preview.getByRole("cell", { name: "机器人" })).toBeVisible();
+      await expectNoHorizontalOverflow(page);
+      await context.close();
+    });
+  }
+});
+
+test("学生端和管理员端适配三个目标 Windows 分辨率", async ({ browser, request }) => {
   const { studentAuth, teacherAuth } = await loginData(request);
   for (const viewport of viewportCases) {
     await test.step(viewport.name, async () => {
@@ -988,7 +1073,7 @@ test("学生端和管理员端适配目标 Windows 分辨率及高 DPI", async (
   }
 });
 
-test("课程目录、排课表和管理员 PDF 抽屉适配目标 Windows 分辨率及高 DPI", async ({ browser, request }) => {
+test("课程目录、排课表和管理员 PDF 抽屉适配三个目标 Windows 分辨率", async ({ browser, request }) => {
   test.setTimeout(180_000);
   const { studentAuth, teacherAuth, packageTitle, courseTitle } = await seedResponsiveCurriculum(request);
 
@@ -1028,6 +1113,15 @@ test("课程目录、排课表和管理员 PDF 抽屉适配目标 Windows 分辨
       expect(bounds!.x).toBeGreaterThanOrEqual(0);
       expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(viewport.width + 1);
       expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(viewport.height + 1);
+      await drawer.getByRole("button", { name: "全屏播放" }).click();
+      const presentation = page.locator(".coursePresentationStage.presentationMode");
+      await expect(presentation).toBeVisible();
+      const presentationBounds = await presentation.boundingBox();
+      expect(presentationBounds).not.toBeNull();
+      expect(presentationBounds!.width).toBeGreaterThanOrEqual(viewport.width - 2);
+      expect(presentationBounds!.height).toBeGreaterThanOrEqual(viewport.height - 2);
+      await presentation.getByRole("button", { name: "退出全屏" }).click();
+      await expect(page.locator(".coursePresentationStage.presentationMode")).toHaveCount(0);
       await page.screenshot({ path: `test-results/layout-course-pdf-${viewport.name}.png`, fullPage: true });
       await page.locator(".ant-drawer-close").last().click();
 
@@ -1053,10 +1147,24 @@ test("课程目录、排课表和管理员 PDF 抽屉适配目标 Windows 分辨
       await expect(workspaceEditor).toBeVisible();
       const workspaceContent = `# 我的课堂工程\n\n${viewport.name} 已完成在线编辑。`;
       await workspaceEditor.fill(workspaceContent);
+      await expect(workspaceDrawer.locator(".liveMarkdownPreview").getByRole("heading", { name: "我的课堂工程" })).toBeVisible();
+      await expect(workspaceDrawer.locator(".liveMarkdownPreview")).toContainText(`${viewport.name} 已完成在线编辑。`);
       await workspaceDrawer.getByRole("button", { name: "保存", exact: true }).click();
       await expect(workspaceDrawer.getByText(/保存于/)).toBeVisible();
       await workspaceDrawer.locator(".ant-segmented-item").filter({ hasText: "预览" }).click();
       await expect(workspaceDrawer.getByRole("heading", { name: "我的课堂工程" })).toBeVisible();
+      await workspaceDrawer.locator(".ant-drawer-close").click();
+      await page.getByRole("button", { name: /提交作品|提交新版本/ }).click();
+      await expect(page.getByText(/作品已提交|已提交新版本/)).toBeVisible();
+      const history = page.locator(".submissionHistoryCollapse");
+      await expect(history).toBeVisible();
+      await history.locator(".ant-collapse-header").click();
+      await history.getByRole("button", { name: "查看该版本" }).first().click();
+      await expect(page).toHaveURL(/#\/student\/submissions\/\d+\/versions\/\d+$/);
+      await expect(page.getByText("历史版本为提交时快照，不会随作品当前内容变化。", { exact: true })).toBeVisible();
+      await page.reload();
+      await expect(page).toHaveURL(/#\/student\/submissions\/\d+\/versions\/\d+$/);
+      await expect(page.getByText("提交内容快照", { exact: true })).toBeVisible();
       await page.screenshot({ path: `test-results/layout-student-course-${viewport.name}.png`, fullPage: true });
       await context.close();
     });

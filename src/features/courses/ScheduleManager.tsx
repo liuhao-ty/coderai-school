@@ -460,7 +460,7 @@ export function ScheduleManager({
         />
       </section>}
 
-      <Modal title={editing ? `调整排课：${editing.course_title}` : "调整排课"} open={Boolean(editing)} onCancel={() => setEditing(null)} footer={null} destroyOnClose>
+      <Modal title={editing ? `调整排课：${editing.course_title}` : "调整排课"} open={Boolean(editing)} onCancel={() => setEditing(null)} footer={null} destroyOnHidden>
         <Form form={updateForm} layout="vertical" onFinish={saveTime}>
           <Form.Item name="starts_at" label="开始时间" rules={[{ required: true, message: "请选择开始时间" }]}><DatePicker showTime format="YYYY-MM-DD HH:mm" className="fullWidth" /></Form.Item>
           <Form.Item name="due_at" label="截止时间（可选）"><DatePicker showTime format="YYYY-MM-DD HH:mm" className="fullWidth" /></Form.Item>

@@ -10,7 +10,7 @@ import remarkGfm from "remark-gfm";
 
 import { IconTitle } from "../../components/IconTitle";
 import { EmptyState } from "../../components/PageState";
-import type { AssetItem, ClassTask, Course, Lesson, Project, ProviderState, SubmissionVersion, TaskSubmission, VideoTask } from "../../domain-types";
+import type { AIGenerationJob, AssetItem, ClassTask, Course, Lesson, Project, ProviderState, SubmissionVersion, TaskSubmission, VideoTask } from "../../domain-types";
 import { api } from "../../lib/api";
 import { allowedToolsFromTasks, assetName, assetTypeLabel, projectTypeLabel, submissionForTask, submissionStatusColor, submissionStatusLabel, toolScopeLabel, videoTaskStatusColor, videoTaskStatusLabel } from "../../lib/domain";
 import { errorCode, explainError } from "../../lib/errors";
@@ -49,13 +49,8 @@ export function StudentWorkspace({
 }) {
   const { message } = AntApp.useApp();
   const [textResult, setTextResult] = useState("");
-  const [imageResult, setImageResult] = useState<{
-    url?: string;
-    file_path?: string;
-    moderation_status?: "approved" | "pending" | "rejected";
-    moderation_reason?: string;
-    moderation_message?: string;
-  } | null>(null);
+  const [imageResultUrl, setImageResultUrl] = useState("");
+  const [generationJob, setGenerationJob] = useState<AIGenerationJob | null>(null);
   const [videoNotice, setVideoNotice] = useState<{ type: "success" | "warning" | "error"; message: string } | null>(null);
   const [refreshingVideoId, setRefreshingVideoId] = useState<number | null>(null);
   const [loading, setLoading] = useState("");
@@ -69,6 +64,9 @@ export function StudentWorkspace({
   const [videoInput, setVideoInput] = useState<{ file_name: string; file_path: string; size: number } | null>(null);
   const [uploadingInput, setUploadingInput] = useState<"image" | "video" | "">("");
   const [generationError, setGenerationError] = useState<{ tool: "text" | "image" | "video"; message: string; code: string; values: any } | null>(null);
+  const completedJobRef = useRef<number | null>(null);
+  const imageResultObjectUrlRef = useRef("");
+  const [videoDurations, setVideoDurations] = useState<number[]>([5, 10]);
   const allowedTools = useMemo(() => allowedToolsFromTasks(classTasks), [classTasks]);
   const legacyTasks = useMemo(
     () => classTasks.filter((task) => !task.course_schedule_id && task.task_kind !== "schedule"),
@@ -83,22 +81,94 @@ export function StudentWorkspace({
   const supportsImage = provider.configured && (provider.capabilities || []).includes("image");
   const supportsVideo = provider.configured && (provider.capabilities || []).includes("video");
 
+  const loadJobImage = async (jobId: number) => {
+    if (imageResultObjectUrlRef.current) URL.revokeObjectURL(imageResultObjectUrlRef.current);
+    const response = await api.get(`/api/ai/jobs/${jobId}/file`, { responseType: "blob" });
+    const objectUrl = URL.createObjectURL(response.data);
+    imageResultObjectUrlRef.current = objectUrl;
+    setImageResultUrl(objectUrl);
+  };
+
+  useEffect(() => () => {
+    if (imageResultObjectUrlRef.current) URL.revokeObjectURL(imageResultObjectUrlRef.current);
+  }, []);
+
+  useEffect(() => {
+    if (view !== "text" && view !== "image") return;
+    void api.get("/api/ai/jobs").then(async (response) => {
+      const job = (response.data.jobs || []).find((item: AIGenerationJob) => item.operation === "generate" && item.capability === view);
+      if (!job) return;
+      if (job.status === "succeeded") {
+        completedJobRef.current = job.id;
+        if (view === "text") setTextResult(String(job.result.text || ""));
+        if (view === "image" && job.result.file_available) await loadJobImage(job.id);
+      }
+      if (["queued", "running"].includes(job.status)) {
+        setGenerationJob(job);
+        setLoading(view);
+      }
+    }).catch(() => undefined);
+  }, [view]);
+
+  useEffect(() => {
+    if (view !== "video") return;
+    void api.get("/api/models/catalog").then((response) => {
+      const available = (response.data.models || []).find((item: { capability: string; available: boolean; parameters?: { durations?: number[] } }) => item.capability === "video" && item.available);
+      const durations = available?.parameters?.durations?.filter((item: number) => Number.isInteger(item) && item > 0);
+      if (durations?.length) setVideoDurations(durations);
+    }).catch(() => undefined);
+  }, [view]);
+
+  useEffect(() => {
+    if (!generationJob) return;
+    if (["queued", "running"].includes(generationJob.status)) {
+      const timer = window.setInterval(() => {
+        void api.get(`/api/ai/jobs/${generationJob.id}`).then((response) => {
+          setGenerationJob(response.data.job);
+        }).catch(() => undefined);
+      }, 1_800);
+      return () => window.clearInterval(timer);
+    }
+    if (completedJobRef.current === generationJob.id) return;
+    completedJobRef.current = generationJob.id;
+    setLoading("");
+    if (generationJob.status === "succeeded") {
+      setGenerationError(null);
+      if (generationJob.capability === "text") setTextResult(String(generationJob.result.text || ""));
+      if (generationJob.capability === "image" && generationJob.result.file_available) {
+        void loadJobImage(generationJob.id).catch((error) => message.error(explainError(error)));
+      }
+      void onRefresh();
+      message.success(generationJob.capability === "text" ? "文字作品已保存到作品库" : "图片任务已完成");
+    } else {
+      const tool = generationJob.capability === "image" ? "image" : "text";
+      setGenerationError({
+        tool,
+        message: generationJob.error_message || "生成任务失败",
+        code: generationJob.error_code || generationJob.status,
+        values: {},
+      });
+    }
+  }, [generationJob, message, onRefresh]);
+
   const runText = async (values: { prompt: string; mode: string; age_level: string }) => {
     setLoading("text");
     setGenerationError(null);
     setTextResult("");
     try {
-      const res = await api.post("/api/text/generate", {
-        ...values,
-        age_level: studentProfile?.age_level || values.age_level || "primary_lower"
+      const res = await api.post("/api/ai/jobs", {
+        client_request_id: crypto.randomUUID(),
+        capability: "text",
+        prompt: values.prompt,
+        mode: values.mode || "general",
+        save_project: true,
       });
-      setTextResult(res.data.text);
-      await onRefresh();
-      message.success("文字作品已保存到作品库");
+      completedJobRef.current = null;
+      setGenerationJob(res.data.job);
+      message.info("文字任务已提交，离开页面后仍会继续执行");
     } catch (error) {
       setGenerationError({ tool: "text", message: explainError(error), code: errorCode(error), values });
       message.error(explainError(error));
-    } finally {
       setLoading("");
     }
   };
@@ -106,18 +176,23 @@ export function StudentWorkspace({
   const runImage = async (values: { prompt: string; style: string; size: string }) => {
     setLoading("image");
     setGenerationError(null);
-    setImageResult(null);
+    setImageResultUrl("");
     try {
-      const request = { ...values, source_image_path: imageInput?.file_path || null };
-      const res = await api.post("/api/image/generate", request);
-      setImageResult(res.data);
-      await onRefresh();
-      if (res.data.moderation_status === "approved") message.success("图片审核通过，已保存到作品库");
-      else message.warning(res.data.moderation_message || "图片已进入教师复核队列");
+      const res = await api.post("/api/ai/jobs", {
+        client_request_id: crypto.randomUUID(),
+        capability: "image",
+        prompt: values.prompt,
+        style: values.style,
+        size: values.size,
+        source_image_path: imageInput?.file_path || null,
+        save_project: true,
+      });
+      completedJobRef.current = null;
+      setGenerationJob(res.data.job);
+      message.info("图片任务已提交，离开页面后仍会继续执行");
     } catch (error) {
       setGenerationError({ tool: "image", message: explainError(error), code: errorCode(error), values });
       message.error(explainError(error));
-    } finally {
       setLoading("");
     }
   };
@@ -158,11 +233,34 @@ export function StudentWorkspace({
   };
 
   const retryGeneration = () => {
+    if (generationJob && ["failed", "timed_out", "canceled"].includes(generationJob.status)) {
+      setLoading(generationJob.capability);
+      setGenerationError(null);
+      void api.post(`/api/ai/jobs/${generationJob.id}/retry`).then((response) => {
+        completedJobRef.current = null;
+        setGenerationJob(response.data.job);
+      }).catch((error) => {
+        setLoading("");
+        message.error(explainError(error));
+      });
+      return;
+    }
     if (!generationError) return;
     const { tool, values } = generationError;
     if (tool === "text") void runText(values);
     if (tool === "image") void runImage(values);
     if (tool === "video") void runVideo(values);
+  };
+
+  const cancelGeneration = async () => {
+    if (!generationJob) return;
+    try {
+      const response = await api.post(`/api/ai/jobs/${generationJob.id}/cancel`);
+      setGenerationJob(response.data.job);
+      message.info("已请求取消生成任务");
+    } catch (error) {
+      message.error(explainError(error));
+    }
   };
 
   const refreshVideoTask = async (taskId: number) => {
@@ -383,17 +481,28 @@ export function StudentWorkspace({
           onClose={() => setGenerationError(null)}
         />
       )}
+      {(view === "text" || view === "image") && generationJob && ["queued", "running"].includes(generationJob.status) && (
+        <Alert
+          className="mb16"
+          type="info"
+          showIcon
+          message={generationJob.status === "queued" ? "生成任务正在排队" : "模型正在生成"}
+          description="任务已由云端接管，刷新页面或暂时离开不会中断。"
+          action={<Button onClick={() => void cancelGeneration()}>取消任务</Button>}
+        />
+      )}
       {view === "text" && canUseText && <PluginToolsPanel supportsText={supportsText} onRefresh={onRefresh} />}
       <Row gutter={[16, 16]}>
         {view === "text" && canUseText && (
         <Col span={24}>
           <Card title={<IconTitle icon={<BookOpen size={18} />} text="AI文字生成" />}>
             {!supportsText && <Alert className="mb16" type="warning" showIcon message="当前 AI 服务未提供文字生成能力" />}
-            <Form layout="vertical" onFinish={runText} initialValues={{ mode: "story", age_level: studentSchoolStage }}>
+            <Form layout="vertical" onFinish={runText} initialValues={{ mode: "general", age_level: studentSchoolStage }}>
               {!isPrimaryLowerStudent && (
                 <Form.Item name="mode" label="任务类型">
                   <Select
                     options={[
+                      { value: "general", label: "常规生成" },
                       { value: "story", label: "故事创作" },
                       { value: "polish", label: "作文润色" },
                       { value: "prompt_refine", label: "提示词改写" }
@@ -408,7 +517,11 @@ export function StudentWorkspace({
                 生成并保存
               </Button>
             </Form>
-            {textResult && <pre className="resultText">{textResult}</pre>}
+            {textResult && (
+              <article className="markdownPreview resultMarkdown">
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{textResult}</ReactMarkdown>
+              </article>
+            )}
           </Card>
         </Col>
         )}
@@ -457,17 +570,7 @@ export function StudentWorkspace({
                 生成并保存
               </Button>
             </Form>
-            {imageResult?.url && <img className="generatedImage" src={imageResult.url} alt="AI生成结果" />}
-            {imageResult?.file_path && <Alert className="mt16" type="success" message={`已保存：${imageResult.file_path}`} />}
-            {imageResult?.moderation_status && imageResult.moderation_status !== "approved" && (
-              <Alert
-                className="mt16"
-                type="warning"
-                showIcon
-                message={imageResult.moderation_status === "pending" ? "图片等待教师复核" : "图片被自动审核拦截"}
-                description={imageResult.moderation_message || imageResult.moderation_reason}
-              />
-            )}
+            {imageResultUrl && <img className="generatedImage" src={imageResultUrl} alt="AI生成结果" />}
           </Card>
         </Col>
         )}
@@ -507,11 +610,7 @@ export function StudentWorkspace({
                   </Form.Item>
                   <Form.Item name="duration_seconds" label="时长">
                     <Select
-                      options={[
-                        { value: 5, label: "5 秒" },
-                        { value: 8, label: "8 秒" },
-                        { value: 10, label: "10 秒" }
-                      ]}
+                      options={videoDurations.map((duration) => ({ value: duration, label: `${duration} 秒` }))}
                     />
                   </Form.Item>
                 </>

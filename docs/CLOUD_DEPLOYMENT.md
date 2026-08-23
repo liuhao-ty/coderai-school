@@ -1,6 +1,6 @@
 # 单机构公网 IP 云端部署手册
 
-适用版本：`0.2.0-beta.4`
+适用版本：`0.2.0-beta.5`
 目标：境内 Linux x64、单机构、最多 50 人同时在线
 
 ## 1. 上线前条件
@@ -145,7 +145,7 @@ curl -fsS "https://$CODERAI_PUBLIC_IP/desktop-updates/latest.json" || true
 
 - `live` 返回 `ok`
 - `ready` 返回 HTTP 200 且数据库、队列和对象存储全部 `ready`
-- `version` 为 `0.2.0-beta.4`，`deployment_mode` 为 `cloud`
+- `version` 为 `0.2.0-beta.5`，`deployment_mode` 为 `cloud`
 - 公网访问 `https://<公网IP>/metrics` 返回 404
 - TLS 证书 SAN 包含当前公网 IP，系统和 WebView 均能建立受信任连接
 - `coderai-cert-renew.timer` 已启用，且 `coderai_tls_certificate_valid_beyond_48h` 为 `1`

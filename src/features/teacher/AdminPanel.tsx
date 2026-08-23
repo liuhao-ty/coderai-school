@@ -1,5 +1,5 @@
-import { Card, Col, List, Row, Space, Statistic, Tag, Typography } from "antd";
-import { Bot, DatabaseBackup, KeyRound, ShieldCheck, UsersRound } from "lucide-react";
+import { Card, List, Space, Tag, Typography } from "antd";
+import { Bot, CheckCircle2, DatabaseBackup, KeyRound, ServerCog, ShieldCheck, UsersRound } from "lucide-react";
 
 import { IconTitle } from "../../components/IconTitle";
 import { EmptyState } from "../../components/PageState";
@@ -60,36 +60,44 @@ export function AdminPanel({
 
       {section === "overview" && (
         <Space direction="vertical" size={16} className="fullWidth">
-          <Row gutter={[12, 12]}>
-            <Col xs={12} lg={6}><Card><Statistic title="当前角色" value="管理员" /></Card></Col>
-            <Col xs={12} lg={6}><Card><Statistic title="模型服务" value={provider.configured ? "已配置" : "待配置"} /></Card></Col>
-            <Col xs={12} lg={6}><Card><Statistic title="服务商数量" value={provider.provider_count || (provider.configured ? 1 : 0)} /></Card></Col>
-            <Col xs={12} lg={6}><Card><Statistic title="累计调用记录" value={totalUsage} /></Card></Col>
-          </Row>
-          <Row gutter={[16, 16]}>
-            <Col xs={24} xl={12}>
-              <Card title={<IconTitle icon={<KeyRound size={18} />} text="当前管理员" />}>
-                <Space direction="vertical" size={8}>
-                  <Text strong>{profile?.name || "管理员"}</Text>
-                  <Text code>{profile?.username || "admin"}</Text>
-                  <Text type="secondary">教师的班级、学员、作品和批改数据不会出现在此总览。</Text>
-                </Space>
-              </Card>
-            </Col>
-            <Col xs={24} xl={12}>
-              <Card title={<IconTitle icon={<ShieldCheck size={18} />} text="管理员职责" />}>
-                <List
-                  size="small"
-                  dataSource={[
-                    { icon: <UsersRound size={16} />, text: "职员账号、学生开户与角色权限" },
-                    { icon: <Bot size={16} />, text: "全局模型服务与能力路由" },
-                    { icon: <DatabaseBackup size={16} />, text: "系统运维、备份与授权" },
-                  ]}
-                  renderItem={(item) => <List.Item><Space>{item.icon}<Text>{item.text}</Text></Space></List.Item>}
-                />
-              </Card>
-            </Col>
-          </Row>
+          <section className="teachingMetricStrip systemMetricStrip" aria-label="系统统计">
+            <div className="teachingMetricItem metricBlue">
+              <span className="teachingMetricIcon"><ShieldCheck size={22} /></span>
+              <span><Text type="secondary">当前角色</Text><strong>管理员</strong></span>
+            </div>
+            <div className="teachingMetricItem metricGreen">
+              <span className="teachingMetricIcon"><CheckCircle2 size={22} /></span>
+              <span><Text type="secondary">模型服务</Text><strong>{provider.configured ? "已配置" : "待配置"}</strong></span>
+            </div>
+            <div className="teachingMetricItem metricAmber">
+              <span className="teachingMetricIcon"><ServerCog size={22} /></span>
+              <span><Text type="secondary">服务商数量</Text><strong>{provider.provider_count || (provider.configured ? 1 : 0)}</strong></span>
+            </div>
+            <div className="teachingMetricItem metricCoral">
+              <span className="teachingMetricIcon"><Bot size={22} /></span>
+              <span><Text type="secondary">累计调用记录</Text><strong>{totalUsage}</strong></span>
+            </div>
+          </section>
+          <div className="systemOverviewGrid">
+            <Card className="ledgerPanel" title={<IconTitle icon={<KeyRound size={18} />} text="当前管理员" />}>
+              <Space direction="vertical" size={8}>
+                <Text strong>{profile?.name || "管理员"}</Text>
+                <Text code>{profile?.username || "admin"}</Text>
+                <Text type="secondary">系统总览仅展示账号、模型与运维状态；教学数据在教学总览中查看。</Text>
+              </Space>
+            </Card>
+            <Card className="ledgerPanel" title={<IconTitle icon={<ShieldCheck size={18} />} text="管理员职责" />}>
+              <List
+                size="small"
+                dataSource={[
+                  { icon: <UsersRound size={16} />, text: "职员账号、学生开户与角色权限" },
+                  { icon: <Bot size={16} />, text: "全局模型服务与能力路由" },
+                  { icon: <DatabaseBackup size={16} />, text: "系统运维、备份与授权" },
+                ]}
+                renderItem={(item) => <List.Item><Space>{item.icon}<Text>{item.text}</Text></Space></List.Item>}
+              />
+            </Card>
+          </div>
         </Space>
       )}
 

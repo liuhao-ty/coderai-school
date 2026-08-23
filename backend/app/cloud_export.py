@@ -22,6 +22,8 @@ FILE_COLUMNS: dict[str, tuple[str, ...]] = {
     "course_materials": ("source_path", "preview_path"),
     "projects": ("file_path",),
     "submission_versions": ("project_file_path",),
+    "submission_attachments": ("file_path",),
+    "agent_artifacts": ("file_path",),
     "assets": ("file_path",),
     "video_tasks": ("source_image_path", "file_path"),
     "moderation_logs": ("resource_path",),

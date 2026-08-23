@@ -3,10 +3,12 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from backend.app.submission_files import DEFAULT_SUBMISSION_EXTENSIONS, MAX_SUBMISSION_FILE_BYTES
+
 
 class TextGenerateRequest(BaseModel):
     prompt: str = Field(min_length=1)
-    mode: str = "story"
+    mode: Literal["general", "story", "polish", "prompt_refine", "code_explain"] = "general"
     age_level: Literal["primary_lower", "primary_upper", "secondary", "mixed"] = "primary_lower"
     save_project: bool = True
 
@@ -78,6 +80,46 @@ class ProviderSettingsRequest(BaseModel):
     image_model: str = Field(default="gpt-image-1", max_length=120)
     video_model: str = Field(default="", max_length=120)
     enabled: bool = True
+    student_selectable: bool = False
+
+
+class AIGenerationJobRequest(BaseModel):
+    client_request_id: str = Field(min_length=8, max_length=80)
+    capability: Literal["text", "image"]
+    prompt: str = Field(min_length=1, max_length=50_000)
+    provider_id: int | None = Field(default=None, ge=1)
+    mode: Literal["general", "story", "polish", "prompt_refine"] = "general"
+    style: str = Field(default="classroom-friendly", max_length=120)
+    size: str = Field(default="1024x1024", max_length=40)
+    source_image_path: str | None = Field(default=None, max_length=2_000)
+    save_project: bool = True
+
+
+class AgentConversationCreateRequest(BaseModel):
+    title: str = Field(default="新对话", min_length=1, max_length=160)
+    selected_provider_id: int | None = Field(default=None, ge=1)
+
+
+class AgentConversationUpdateRequest(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=160)
+    selected_provider_id: int | None = Field(default=None, ge=1)
+
+
+class AgentMessageCreateRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=50_000)
+    client_request_id: str = Field(min_length=8, max_length=80)
+
+
+class AgentToolRunRequest(BaseModel):
+    capability: Literal["image", "video", "workflow"]
+    prompt: str = Field(min_length=1, max_length=20_000)
+    client_request_id: str = Field(min_length=8, max_length=80)
+    duration_seconds: int = Field(default=5, ge=1, le=10)
+    workflow_id: int | None = Field(default=None, ge=1)
+
+
+class AgentArtifactSaveRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=160)
 
 
 class ProviderConnectionTestRequest(BaseModel):
@@ -214,6 +256,16 @@ class CurriculumCourseRequest(BaseModel):
     assignment_instructions: str = Field(default="", max_length=20_000)
     tool_scope: str = Field(default="text,image,workflow", max_length=120)
     rubric: list[dict] = Field(default_factory=lambda: [{"criterion": "完成度", "max_score": 100}], min_length=1, max_length=30)
+    submission_extensions: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_SUBMISSION_EXTENSIONS),
+        min_length=1,
+        max_length=len(DEFAULT_SUBMISSION_EXTENSIONS),
+    )
+    submission_max_bytes: int = Field(
+        default=MAX_SUBMISSION_FILE_BYTES,
+        ge=1024 * 1024,
+        le=MAX_SUBMISSION_FILE_BYTES,
+    )
 
 
 class CurriculumCourseOrderRequest(BaseModel):

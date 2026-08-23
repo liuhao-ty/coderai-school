@@ -44,6 +44,8 @@ import { PrivacyPolicyPage } from "./features/privacy/PrivacyPolicyPage";
 import { ProjectLibrary } from "./features/projects/ProjectLibrary";
 import { StudentWorkspace, type StudentWorkspaceView } from "./features/student/StudentWorkspace";
 import { StudentCourseReader } from "./features/courses/StudentCourseReader";
+import { StudentSubmissionVersionPage } from "./features/courses/StudentSubmissionVersionPage";
+import { StudentAgentPage } from "./features/student/StudentAgentPage";
 import { AdminPanel } from "./features/teacher/AdminPanel";
 import { TeacherPanel } from "./features/teacher/TeacherPanel";
 import { WorkflowBuilder } from "./features/workflows/WorkflowBuilder";
@@ -76,15 +78,15 @@ const { Title, Text } = Typography;
 dayjs.extend(utc);
 dayjs.extend(timezone);
 
-type StudentPage = "workspace" | "courses" | "workflows" | "projects";
+type StudentPage = "workspace" | "courses" | "workflows" | "projects" | "submission-version";
 type TeacherPage = TeacherSectionKey | "workflows" | "projects";
 type AdminPage = AdminSectionKey;
 type WorkspacePage = StudentPage | TeacherPage | AdminPage;
 type ScheduleView = "create" | "records";
-type StudentWorkspaceRoute = StudentWorkspaceView | "workflow";
+type StudentWorkspaceRoute = StudentWorkspaceView | "workflow" | "agent";
 
-const studentPages = new Set<StudentPage>(["workspace", "courses", "workflows", "projects"]);
-const studentWorkspaceRoutes = new Set<StudentWorkspaceRoute>(["notifications", "materials", "text", "image", "video", "workflow"]);
+const studentPages = new Set<StudentPage>(["workspace", "courses", "workflows", "projects", "submission-version"]);
+const studentWorkspaceRoutes = new Set<StudentWorkspaceRoute>(["notifications", "materials", "text", "image", "video", "workflow", "agent"]);
 const teacherPages = new Set<TeacherPage>(["overview", "classes", "students", "courses", "schedules", "submissions", "moderation", "account", "workflows", "projects"]);
 const adminPages = new Set<AdminPage>([
   "overview", "accounts", "models", "privacy", "security", "operations", "extensions",
@@ -96,6 +98,7 @@ function routeState(pathname: string): { mode: AppMode; page: WorkspacePage } {
   if (pathname === "/student/change-password") return { mode: "student-password-change", page: "workspace" };
   if (pathname === "/teacher/login") return { mode: "teacher-login", page: "overview" };
   if (pathname === "/teacher/change-password") return { mode: "teacher-password-change", page: "overview" };
+  if (pathname.startsWith("/student/submissions/")) return { mode: "student", page: "submission-version" };
   if (pathname.startsWith("/student/")) {
     const candidate = pathname.split("/")[2] as StudentPage;
     return { mode: "student", page: studentPages.has(candidate) ? candidate : "workspace" };
@@ -130,6 +133,7 @@ const pageTitles: Record<string, string> = {
   security: "账号安全",
   operations: "运维备份",
   extensions: "扩展授权",
+  "submission-version": "提交版本",
 };
 
 export default function App() {
@@ -183,6 +187,8 @@ export default function App() {
   }, [coursePackages, location.search, page]);
   const selectedMenuKey = mode === "student" && page === "workspace"
     ? `workspace-${studentWorkspaceView}`
+    : mode === "student" && page === "submission-version"
+      ? "courses"
     : selectedCoursePackageId !== null
     ? `course-package-${selectedCoursePackageId}`
     : page === "schedules"
@@ -361,11 +367,12 @@ export default function App() {
     }
     if (page !== "workspace") return;
     const requestedView = location.pathname.split("/")[3] as StudentWorkspaceRoute | undefined;
-    const toolRequired = requestedView === "text" || requestedView === "image" || requestedView === "video" || requestedView === "workflow";
+    const toolRequired = requestedView === "text" || requestedView === "image" || requestedView === "video" || requestedView === "workflow" || requestedView === "agent";
+    const requestedTool = requestedView === "agent" ? "text" : requestedView;
     if (
       !requestedView
       || !studentWorkspaceRoutes.has(requestedView)
-      || (toolRequired && !studentAllowedTools.has(requestedView))
+      || (toolRequired && !studentAllowedTools.has(requestedTool as string))
     ) {
       navigate("/student/workspace/notifications", { replace: true });
     }
@@ -459,7 +466,7 @@ export default function App() {
     return (
       <>
         {error && <WorkspaceError message={error} onRetry={retry} />}
-        {mode === "student" && page === "workspace" && studentWorkspaceView !== "workflow" && (
+        {mode === "student" && page === "workspace" && studentWorkspaceView !== "workflow" && studentWorkspaceView !== "agent" && (
           <StudentWorkspace
             view={studentWorkspaceView}
             onRefresh={() => refresh("student")}
@@ -473,6 +480,10 @@ export default function App() {
           />
         )}
         {mode === "student" && page === "courses" && <StudentCourseReader packages={coursePackages} schedules={courseSchedules} projects={projects} submissions={submissions} onRefresh={() => refresh("student")} />}
+        {mode === "student" && page === "submission-version" && <StudentSubmissionVersionPage />}
+        {mode === "student" && page === "workspace" && studentWorkspaceView === "agent" && studentAllowedTools.has("text") && (
+          <StudentAgentPage onRefresh={() => refresh("student")} />
+        )}
         {mode === "student" && page === "workspace" && studentWorkspaceView === "workflow" && studentAllowedTools.has("workflow") && (
           <WorkflowBuilder onRefresh={() => refresh("student")} provider={provider} classrooms={[]} isTeacher={false} />
         )}
@@ -543,6 +554,7 @@ export default function App() {
         ...(studentAllowedTools.has("image") ? [{ key: "workspace-image", icon: <ImageIcon size={17} />, label: "图片生成" }] : []),
         ...(studentAllowedTools.has("video") ? [{ key: "workspace-video", icon: <Video size={17} />, label: "视频生成" }] : []),
         ...(studentAllowedTools.has("workflow") ? [{ key: "workspace-workflow", icon: <Workflow size={17} />, label: "工作流生成" }] : []),
+        ...(studentAllowedTools.has("text") ? [{ key: "workspace-agent", icon: <Bot size={17} />, label: "AI 助手" }] : []),
       ],
     },
     { key: "courses", icon: <BookOpen size={18} />, label: "课程学习" },
@@ -709,7 +721,7 @@ export default function App() {
             </div>
             <Space size={12} wrap>
               {!online && <Tag color="error" icon={<WifiOff size={14} />}>网络已断开</Tag>}
-              <Tag color={mode === "admin" ? "purple" : mode === "teacher" ? "cyan" : "blue"}>
+              <Tag className="workspaceIdentityChip" color={mode === "admin" ? "purple" : mode === "teacher" ? "cyan" : "blue"}>
                 {mode === "student"
                   ? `${studentProfile?.name || "学生"}${studentProfile?.username ? ` · ${studentProfile.username}` : ""}`
                   : `${teacherProfile?.name || "教师"} · ${teacherProfile?.username || ""}`}
@@ -787,6 +799,7 @@ export default function App() {
           <Route path="/teacher/change-password" element={<TeacherPasswordChangeScreen onBack={backToLaunch} onSuccess={(auth) => enterTeacher(auth, false)} />} />
           <Route path="/student/:page" element={workspace} />
           <Route path="/student/:page/:subpage" element={workspace} />
+          <Route path="/student/submissions/:submissionId/versions/:versionId" element={workspace} />
           <Route path="/teacher/:page" element={workspace} />
           <Route path="/teacher/:page/:subpage" element={workspace} />
           <Route path="/admin/:page" element={workspace} />

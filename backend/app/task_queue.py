@@ -108,6 +108,36 @@ def enqueue_video_poll(background_tasks: BackgroundTasks, task_id: int) -> str:
     return "manual"
 
 
+def enqueue_ai_generation(background_tasks: BackgroundTasks, job_id: int, bind: Any) -> str:
+    organization_id = current_organization_id()
+    organization_code = current_organization_code()
+    if TASK_QUEUE_ENABLED and celery_app is not None:
+        celery_app.send_task(
+            "coderai.execute_ai_generation",
+            args=[job_id, organization_id, organization_code],
+        )
+        return "celery"
+    background_tasks.add_task(
+        _execute_ai_generation_local,
+        job_id,
+        organization_id,
+        organization_code,
+        bind,
+    )
+    return "background"
+
+
+def _execute_ai_generation_local(
+    job_id: int,
+    organization_id: int,
+    organization_code: str,
+    bind: Any,
+) -> None:
+    from backend.app.learning_agent import execute_ai_generation_job
+
+    asyncio.run(execute_ai_generation_job(job_id, organization_id, organization_code, bind))
+
+
 def _poll_video_once(task_id: int, organization_id: int, organization_code: str) -> None:
     from backend.app.models import VideoTask
     from backend.app.services import refresh_video_task
@@ -123,6 +153,12 @@ def _poll_video_once(task_id: int, organization_id: int, organization_code: str)
 
 
 if celery_app is not None:
+
+    @celery_app.task(name="coderai.execute_ai_generation", acks_late=True)
+    def execute_ai_generation_task(job_id: int, organization_id: int, organization_code: str) -> None:
+        from backend.app.learning_agent import execute_ai_generation_job
+
+        asyncio.run(execute_ai_generation_job(job_id, organization_id, organization_code))
 
     @celery_app.task(name="coderai.convert_slides", acks_late=True)
     def convert_slides_task(material_id: int, organization_id: int, organization_code: str) -> None:
@@ -205,6 +241,9 @@ if celery_app is not None:
                     before = create_retention_request(tenant_db)
                     if before.status == "pending":
                         created += 1
+                    from backend.app.learning_agent import expire_agent_artifacts
+
+                    expire_agent_artifacts(tenant_db)
                 finally:
                     tenant_db.close()
         return created

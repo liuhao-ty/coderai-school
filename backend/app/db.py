@@ -110,6 +110,8 @@ def init_db():
         backup_database_before_course_package_author_migration()
         backup_database_before_course_package_teacher_migration()
         backup_database_before_curriculum_migration()
+        backup_database_before_submission_file_migration()
+        backup_database_before_agent_submission_migration()
         backup_database_before_account_migration()
         Base.metadata.create_all(bind=engine)
         migrate_sqlite_schema()
@@ -188,6 +190,8 @@ def migrate_sqlite_schema():
             "task_submissions", "submission_versions", "feedback_templates", "assets",
             "workflows", "workflow_runs", "video_tasks", "ai_providers",
             "ai_provider_routes", "usage_logs", "provider_acceptance_runs",
+            "submission_attachments", "agent_conversations", "agent_messages",
+            "ai_generation_jobs", "agent_artifacts",
             "moderation_logs", "app_settings", "privacy_policies", "guardian_consents",
             "teacher_audit_logs", "auth_login_attempts", "teacher_sessions", "student_sessions",
         )
@@ -282,6 +286,7 @@ def migrate_sqlite_schema():
         ensure_column(conn, "task_submissions", "is_featured", "BOOLEAN DEFAULT 0")
         ensure_column(conn, "task_submissions", "rubric_snapshot_json", "TEXT DEFAULT '[]'")
         ensure_column(conn, "task_submissions", "max_score_snapshot", "INTEGER DEFAULT 100")
+        migrate_submission_attachment_schema(conn)
         ensure_column(conn, "usage_logs", "user_id", "INTEGER")
         ensure_column(conn, "usage_logs", "classroom_id", "INTEGER")
         ensure_column(conn, "usage_logs", "provider_id", "INTEGER")
@@ -292,17 +297,20 @@ def migrate_sqlite_schema():
         ensure_column(conn, "ai_providers", "last_test_message", "TEXT DEFAULT ''")
         ensure_column(conn, "ai_providers", "last_tested_at", "DATETIME")
         ensure_column(conn, "ai_providers", "created_at", "DATETIME")
+        ensure_column(conn, "ai_providers", "student_selectable", "BOOLEAN DEFAULT 0")
         ensure_column(conn, "video_tasks", "provider_id", "INTEGER")
         ensure_column(conn, "video_tasks", "retry_count", "INTEGER DEFAULT 0")
         ensure_column(conn, "video_tasks", "timeout_at", "DATETIME")
         ensure_column(conn, "video_tasks", "last_checked_at", "DATETIME")
         ensure_column(conn, "video_tasks", "download_url_expires_at", "DATETIME")
+        ensure_column(conn, "video_tasks", "generation_job_id", "INTEGER")
         ensure_column(conn, "teacher_sessions", "user_id", "INTEGER")
         ensure_column(conn, "teacher_audit_logs", "actor_user_id", "INTEGER")
         ensure_column(conn, "teacher_audit_logs", "actor_username", "VARCHAR(80) DEFAULT ''")
         ensure_column(conn, "teacher_audit_logs", "actor_name", "VARCHAR(120) DEFAULT ''")
         ensure_column(conn, "course_packages", "author_user_id", "INTEGER")
         ensure_column(conn, "course_packages", "school_stages_json", "TEXT DEFAULT '[\"primary_lower\",\"primary_upper\",\"secondary\"]'")
+        migrate_submission_file_schema(conn)
         conn.execute(text("DROP INDEX IF EXISTS ux_users_username_nocase"))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_users_org_username_nocase ON users(organization_id, username COLLATE NOCASE) WHERE username != ''"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_teacher_sessions_user_id ON teacher_sessions(user_id)"))
@@ -321,6 +329,7 @@ def migrate_sqlite_schema():
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_course_package_teachers_teacher_id ON course_package_teachers(teacher_id)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_course_packages_author_user_id ON course_packages(author_user_id)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_video_tasks_provider_id ON video_tasks(provider_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_video_tasks_generation_job_id ON video_tasks(generation_job_id)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_target_student_id ON tasks(target_student_id)"))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_tasks_course_schedule_id ON tasks(course_schedule_id) WHERE course_schedule_id IS NOT NULL"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_projects_curriculum_course_id ON projects(curriculum_course_id)"))
@@ -537,6 +546,279 @@ def ensure_column(conn, table_name: str, column_name: str, column_sql: str):
         conn.exec_driver_sql(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}")
 
 
+def migrate_submission_file_schema(conn) -> None:
+    ensure_column(conn, "projects", "original_file_name", "VARCHAR(255) DEFAULT ''")
+    ensure_column(conn, "projects", "mime_type", "VARCHAR(120) DEFAULT ''")
+    ensure_column(conn, "projects", "file_size", "INTEGER DEFAULT 0")
+    ensure_column(
+        conn,
+        "curriculum_courses",
+        "submission_extensions_json",
+        "TEXT DEFAULT '[\".md\",\".txt\",\".pdf\",\".zip\",\".sb3\",\".py\",\".html\",\".css\",\".js\",\".ts\",\".json\",\".csv\",\".docx\",\".pptx\",\".xlsx\",\".png\",\".jpg\",\".jpeg\",\".webp\",\".mp4\"]'",
+    )
+    ensure_column(conn, "curriculum_courses", "submission_max_bytes", "INTEGER DEFAULT 20971520")
+    deduplicate_task_submissions(conn)
+    conn.execute(text(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_task_submissions_org_task_user "
+        "ON task_submissions(organization_id, task_id, user_id)"
+    ))
+    conn.execute(text(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_submission_versions_org_submission_version "
+        "ON submission_versions(organization_id, submission_id, version_number)"
+    ))
+
+
+def migrate_submission_attachment_schema(conn) -> None:
+    ensure_column(conn, "projects", "original_file_name", "VARCHAR(255) DEFAULT ''")
+    ensure_column(conn, "projects", "mime_type", "VARCHAR(120) DEFAULT ''")
+    ensure_column(conn, "projects", "file_size", "INTEGER DEFAULT 0")
+    deduplicate_task_submissions(conn)
+    submission_info = conn.execute(text("PRAGMA table_info(task_submissions)")).fetchall()
+    version_info = conn.execute(text("PRAGMA table_info(submission_versions)")).fetchall()
+    submission_project = next((row for row in submission_info if row[1] == "project_id"), None)
+    version_project = next((row for row in version_info if row[1] == "project_id"), None)
+    needs_rebuild = bool(
+        (submission_project and int(submission_project[3] or 0) == 1)
+        or (version_project and int(version_project[3] or 0) == 1)
+    )
+    if needs_rebuild:
+        conn.exec_driver_sql("DROP TABLE IF EXISTS submission_attachments")
+        conn.exec_driver_sql("ALTER TABLE submission_versions RENAME TO submission_versions_pre_attachment")
+        conn.exec_driver_sql("ALTER TABLE task_submissions RENAME TO task_submissions_pre_attachment")
+        conn.exec_driver_sql(
+            """
+            CREATE TABLE task_submissions (
+                id INTEGER PRIMARY KEY,
+                organization_id INTEGER NOT NULL DEFAULT 1,
+                owner_teacher_id INTEGER,
+                task_id INTEGER NOT NULL,
+                project_id INTEGER,
+                source_type VARCHAR(20) DEFAULT 'project',
+                user_id INTEGER NOT NULL,
+                classroom_id INTEGER,
+                status VARCHAR(30) DEFAULT 'submitted',
+                feedback TEXT DEFAULT '',
+                score INTEGER,
+                version_count INTEGER DEFAULT 1,
+                is_late BOOLEAN DEFAULT 0,
+                is_featured BOOLEAN DEFAULT 0,
+                rubric_snapshot_json TEXT DEFAULT '[]',
+                max_score_snapshot INTEGER DEFAULT 100,
+                created_at DATETIME,
+                updated_at DATETIME,
+                FOREIGN KEY(task_id) REFERENCES tasks(id),
+                FOREIGN KEY(project_id) REFERENCES projects(id),
+                FOREIGN KEY(user_id) REFERENCES users(id),
+                FOREIGN KEY(classroom_id) REFERENCES classrooms(id),
+                CONSTRAINT ux_task_submissions_org_task_user UNIQUE (organization_id, task_id, user_id)
+            )
+            """
+        )
+        conn.exec_driver_sql(
+            """
+            INSERT INTO task_submissions (
+                id, organization_id, owner_teacher_id, task_id, project_id, source_type,
+                user_id, classroom_id, status, feedback, score, version_count, is_late,
+                is_featured, rubric_snapshot_json, max_score_snapshot, created_at, updated_at
+            )
+            SELECT id, COALESCE(organization_id, 1), owner_teacher_id, task_id, project_id, 'project',
+                user_id, classroom_id, status, feedback, score, COALESCE(version_count, 1),
+                COALESCE(is_late, 0), COALESCE(is_featured, 0), COALESCE(rubric_snapshot_json, '[]'),
+                COALESCE(max_score_snapshot, 100), created_at, updated_at
+            FROM task_submissions_pre_attachment
+            """
+        )
+        conn.exec_driver_sql(
+            """
+            CREATE TABLE submission_versions (
+                id INTEGER PRIMARY KEY,
+                organization_id INTEGER NOT NULL DEFAULT 1,
+                submission_id INTEGER NOT NULL,
+                version_number INTEGER DEFAULT 1,
+                project_id INTEGER,
+                source_type VARCHAR(20) DEFAULT 'project',
+                project_title VARCHAR(160) DEFAULT '',
+                project_summary TEXT DEFAULT '',
+                project_file_path TEXT DEFAULT '',
+                file_name_snapshot VARCHAR(255) DEFAULT '',
+                mime_type_snapshot VARCHAR(120) DEFAULT '',
+                file_size_snapshot INTEGER DEFAULT 0,
+                is_late BOOLEAN DEFAULT 0,
+                review_status VARCHAR(30) DEFAULT 'submitted',
+                feedback_snapshot TEXT DEFAULT '',
+                score_snapshot INTEGER,
+                max_score_snapshot INTEGER DEFAULT 100,
+                created_at DATETIME,
+                FOREIGN KEY(submission_id) REFERENCES task_submissions(id),
+                FOREIGN KEY(project_id) REFERENCES projects(id),
+                CONSTRAINT ux_submission_versions_org_submission_version UNIQUE (organization_id, submission_id, version_number)
+            )
+            """
+        )
+        conn.exec_driver_sql(
+            """
+            INSERT INTO submission_versions (
+                id, organization_id, submission_id, version_number, project_id, source_type,
+                project_title, project_summary, project_file_path, file_name_snapshot,
+                mime_type_snapshot, file_size_snapshot, is_late, review_status,
+                feedback_snapshot, score_snapshot, max_score_snapshot, created_at
+            )
+            SELECT version.id, COALESCE(version.organization_id, 1), version.submission_id,
+                version.version_number, version.project_id, 'project', version.project_title,
+                version.project_summary, version.project_file_path,
+                COALESCE((SELECT original_file_name FROM projects WHERE projects.id = version.project_id), ''),
+                COALESCE((SELECT mime_type FROM projects WHERE projects.id = version.project_id), ''),
+                COALESCE((SELECT file_size FROM projects WHERE projects.id = version.project_id), 0),
+                COALESCE(version.is_late, 0),
+                CASE WHEN version.version_number = submission.version_count THEN submission.status ELSE 'submitted' END,
+                CASE WHEN version.version_number = submission.version_count THEN submission.feedback ELSE '' END,
+                CASE WHEN version.version_number = submission.version_count THEN submission.score ELSE NULL END,
+                COALESCE(submission.max_score_snapshot, 100), version.created_at
+            FROM submission_versions_pre_attachment AS version
+            JOIN task_submissions AS submission ON submission.id = version.submission_id
+            """
+        )
+        conn.exec_driver_sql("DROP TABLE submission_versions_pre_attachment")
+        conn.exec_driver_sql("DROP TABLE task_submissions_pre_attachment")
+
+    conn.exec_driver_sql(
+        """
+        CREATE TABLE IF NOT EXISTS submission_attachments (
+            id INTEGER PRIMARY KEY,
+            organization_id INTEGER NOT NULL DEFAULT 1,
+            submission_id INTEGER NOT NULL,
+            version_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            classroom_id INTEGER,
+            title VARCHAR(160) DEFAULT '',
+            file_path TEXT DEFAULT '',
+            original_file_name VARCHAR(255) DEFAULT '',
+            mime_type VARCHAR(120) DEFAULT '',
+            file_extension VARCHAR(20) DEFAULT '',
+            file_size INTEGER DEFAULT 0,
+            checksum_sha256 VARCHAR(64) DEFAULT '',
+            safety_status VARCHAR(30) DEFAULT 'approved',
+            created_at DATETIME,
+            FOREIGN KEY(submission_id) REFERENCES task_submissions(id),
+            FOREIGN KEY(version_id) REFERENCES submission_versions(id),
+            FOREIGN KEY(user_id) REFERENCES users(id),
+            FOREIGN KEY(classroom_id) REFERENCES classrooms(id),
+            CONSTRAINT ux_submission_attachments_org_version UNIQUE (organization_id, version_id)
+        )
+        """
+    )
+
+    ensure_column(conn, "task_submissions", "source_type", "VARCHAR(20) DEFAULT 'project'")
+    ensure_column(conn, "submission_versions", "source_type", "VARCHAR(20) DEFAULT 'project'")
+    ensure_column(conn, "submission_versions", "review_status", "VARCHAR(30) DEFAULT 'submitted'")
+    ensure_column(conn, "submission_versions", "feedback_snapshot", "TEXT DEFAULT ''")
+    ensure_column(conn, "submission_versions", "score_snapshot", "INTEGER")
+    ensure_column(conn, "submission_versions", "max_score_snapshot", "INTEGER DEFAULT 100")
+    ensure_column(conn, "submission_versions", "file_name_snapshot", "VARCHAR(255) DEFAULT ''")
+    ensure_column(conn, "submission_versions", "mime_type_snapshot", "VARCHAR(120) DEFAULT ''")
+    ensure_column(conn, "submission_versions", "file_size_snapshot", "INTEGER DEFAULT 0")
+    conn.execute(text("UPDATE task_submissions SET source_type = 'project' WHERE source_type IS NULL OR source_type = ''"))
+    conn.execute(text("UPDATE submission_versions SET source_type = 'project' WHERE source_type IS NULL OR source_type = ''"))
+    conn.execute(text(
+        "UPDATE submission_versions SET "
+        "file_name_snapshot = COALESCE((SELECT original_file_name FROM projects WHERE projects.id = submission_versions.project_id), ''), "
+        "mime_type_snapshot = COALESCE((SELECT mime_type FROM projects WHERE projects.id = submission_versions.project_id), ''), "
+        "file_size_snapshot = COALESCE((SELECT file_size FROM projects WHERE projects.id = submission_versions.project_id), 0) "
+        "WHERE project_id IS NOT NULL AND (file_name_snapshot = '' OR mime_type_snapshot = '' OR file_size_snapshot = 0)"
+    ))
+    conn.execute(text(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_task_submissions_org_task_user "
+        "ON task_submissions(organization_id, task_id, user_id)"
+    ))
+    conn.execute(text(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_submission_versions_org_submission_version "
+        "ON submission_versions(organization_id, submission_id, version_number)"
+    ))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_submission_attachments_organization_id ON submission_attachments(organization_id)"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_submission_attachments_submission_id ON submission_attachments(submission_id)"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_submission_attachments_version_id ON submission_attachments(version_id)"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_submission_attachments_user_id ON submission_attachments(user_id)"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_submission_attachments_classroom_id ON submission_attachments(classroom_id)"))
+
+
+def backup_database_before_agent_submission_migration() -> None:
+    if not IS_SQLITE or not DB_PATH.is_file() or DB_PATH.stat().st_size == 0:
+        return
+    backup_dir = DATA_DIR / "migration-backups"
+    backup_path = backup_dir / "coderai-before-agent-submission-attachments.db"
+    if backup_path.exists():
+        return
+    source = sqlite3.connect(DB_PATH)
+    try:
+        tables = {row[0] for row in source.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()}
+        if "task_submissions" not in tables:
+            return
+        submission_columns = {row[1] for row in source.execute("PRAGMA table_info(task_submissions)").fetchall()}
+        if "source_type" in submission_columns and "agent_conversations" in tables:
+            return
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        destination = sqlite3.connect(backup_path)
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+    finally:
+        source.close()
+
+
+def deduplicate_task_submissions(conn) -> None:
+    rows = conn.execute(text(
+        "SELECT id, organization_id, task_id, user_id "
+        "FROM task_submissions "
+        "ORDER BY organization_id, task_id, user_id, COALESCE(updated_at, created_at) DESC, id DESC"
+    )).mappings().all()
+    grouped: dict[tuple[int, int, int], list[int]] = {}
+    for row in rows:
+        key = (int(row["organization_id"]), int(row["task_id"]), int(row["user_id"]))
+        grouped.setdefault(key, []).append(int(row["id"]))
+    for submission_ids in grouped.values():
+        if len(submission_ids) < 2:
+            continue
+        canonical_id = submission_ids[0]
+        for duplicate_id in submission_ids[1:]:
+            conn.execute(
+                text(
+                    "UPDATE submission_versions SET version_number = -(1000000000 + id) "
+                    "WHERE submission_id = :duplicate_id"
+                ),
+                {"duplicate_id": duplicate_id},
+            )
+            conn.execute(
+                text("UPDATE submission_versions SET submission_id = :canonical_id WHERE submission_id = :duplicate_id"),
+                {"canonical_id": canonical_id, "duplicate_id": duplicate_id},
+            )
+            conn.execute(text("DELETE FROM task_submissions WHERE id = :duplicate_id"), {"duplicate_id": duplicate_id})
+    canonical_ids = conn.execute(text("SELECT id FROM task_submissions ORDER BY id")).fetchall()
+    for canonical_row in canonical_ids:
+        canonical_id = int(canonical_row[0])
+        versions = conn.execute(
+            text(
+                "SELECT id FROM submission_versions "
+                "WHERE submission_id = :submission_id ORDER BY COALESCE(created_at, '1970-01-01'), id"
+            ),
+            {"submission_id": canonical_id},
+        ).fetchall()
+        for version in versions:
+            conn.execute(
+                text("UPDATE submission_versions SET version_number = :version_number WHERE id = :version_id"),
+                {"version_number": -(1_000_000_000 + int(version[0])), "version_id": int(version[0])},
+            )
+        for version_number, version in enumerate(versions, start=1):
+            conn.execute(
+                text("UPDATE submission_versions SET version_number = :version_number WHERE id = :version_id"),
+                {"version_number": version_number, "version_id": int(version[0])},
+            )
+        conn.execute(
+            text("UPDATE task_submissions SET version_count = :version_count WHERE id = :submission_id"),
+            {"version_count": max(len(versions), 1), "submission_id": canonical_id},
+        )
+
+
 def backup_database_before_organization_migration() -> None:
     if not IS_SQLITE or not DB_PATH.is_file() or DB_PATH.stat().st_size == 0:
         return
@@ -695,6 +977,52 @@ def backup_database_before_curriculum_migration() -> None:
                         archive.write(item, (Path("assets") / item.relative_to(asset_root)).as_posix())
     finally:
         snapshot_path.unlink(missing_ok=True)
+
+
+def backup_database_before_submission_file_migration() -> None:
+    if not IS_SQLITE or not DB_PATH.is_file() or DB_PATH.stat().st_size == 0:
+        return
+    backup_dir = DATA_DIR / "migration-backups"
+    backup_path = backup_dir / "coderai-before-submission-files.db"
+    if backup_path.exists():
+        return
+    source = sqlite3.connect(DB_PATH)
+    try:
+        tables = {
+            row[0]
+            for row in source.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        }
+        if "task_submissions" not in tables or "curriculum_courses" not in tables:
+            return
+        project_columns = {
+            row[1] for row in source.execute("PRAGMA table_info(projects)").fetchall()
+        }
+        course_columns = {
+            row[1] for row in source.execute("PRAGMA table_info(curriculum_courses)").fetchall()
+        }
+        submission_columns = {
+            row[1] for row in source.execute("PRAGMA table_info(task_submissions)").fetchall()
+        }
+        duplicate = None
+        if {"organization_id", "task_id", "user_id"}.issubset(submission_columns):
+            duplicate = source.execute(
+                "SELECT 1 FROM task_submissions GROUP BY organization_id, task_id, user_id HAVING COUNT(*) > 1 LIMIT 1"
+            ).fetchone()
+        needs_migration = (
+            "original_file_name" not in project_columns
+            or "submission_extensions_json" not in course_columns
+            or bool(duplicate)
+        )
+        if not needs_migration:
+            return
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        destination = sqlite3.connect(backup_path)
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+    finally:
+        source.close()
 
 
 def migrate_legacy_curriculum(db) -> None:

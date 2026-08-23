@@ -1,7 +1,7 @@
 # CoderAI 学堂架构
 
-更新时间：2026-08-14（北京时间）
-目标版本：Windows 客户端 `0.2.0-beta.6`，云端 API `0.2.0-beta.4`
+更新时间：2026-08-23（北京时间）
+目标版本：Windows 客户端 `0.2.0-beta.7`，云端 API `0.2.0-beta.5`
 
 ## 1. 部署边界
 
@@ -77,20 +77,21 @@ Operations: Prometheus + Alertmanager + independent backup storage
 
 - SQLAlchemy 2 定义模型
 - Alembic 管理云端结构，入口为 `alembic.ini`
-- `backend/migrations/versions/20260720_0001_cloud_schema.py` 是首个云端基线，`20260726_0002_student_course_projects.py` 增加学生工程包作品关联，`20260727_0003_workspace_answers.py` 增加问卷式工程包答案存储
+- `backend/migrations/versions/20260720_0001_cloud_schema.py` 是首个云端基线，`20260726_0002_student_course_projects.py` 增加学生工程包作品关联，`20260727_0003_workspace_answers.py` 增加问卷式工程包答案存储，`20260815_0004_submission_files_concurrency.py` 增加提交规则和并发唯一键，`20260823_0005_submission_attachments.py` 增加独立附件及版本快照，`20260823_0006_agent_generation.py` 增加 Agent、异步任务和视频任务关联
 - 云端 `CODERAI_AUTO_CREATE_SCHEMA=false`，容器启动前执行 `alembic upgrade head`
-- SQLite 幂等兼容迁移只服务本地开发和历史数据读取
+- SQLite 幂等兼容迁移只服务本地开发和历史数据读取；提交迁移会先生成独立快照，再合并历史重复提交并重新编号版本
+- `task_submissions` 以“机构 + 任务 + 学生”唯一，`submission_versions` 以“机构 + 提交 + 版本号”唯一；PostgreSQL 写入使用事务级 advisory lock 串行化同一学生对同一任务的并发提交
 
 ### 对象存储
 
-- 课程封面、PPT 原件/PDF 预览、Markdown、作品、素材、视频和审核文件存入 S3 兼容存储
+- 课程封面、PPT 原件/PDF 预览、Markdown、作品、提交附件、Agent 临时文件、视频和审核文件存入 S3 兼容存储
 - 数据库只保存 `object://bucket/key` 内部引用
 - 前端继续使用原有鉴权文件接口，不接触本地路径、对象密钥或真实存储地址
 - 上传记录 SHA-256；迁移、备份和恢复演练再次校验内容
 
 ### Redis 与 Celery
 
-- PPTX 转 PDF、工作流执行、视频轮询和每日数据保留扫描由 Celery 处理
+- PPTX 转 PDF、文字/图片/Agent 生成、工作流执行、视频轮询和每日数据保留扫描由 Celery 处理；本地开发使用 FastAPI `BackgroundTasks` 回退
 - 任务携带机构 ID 和机构代码，并在 Worker 中恢复租户上下文
 - 任务启用延迟确认、Worker 丢失重投、单任务预取和有限并发
 - LibreOffice 仅安装在云端应用/Worker 镜像，不要求学生电脑安装
@@ -102,15 +103,26 @@ Operations: Prometheus + Alertmanager + independent backup storage
 - 轮换时临时提供 `CODERAI_SECRET_KEY_PREVIOUS`，执行 `rotate-secrets` 后移除旧密钥
 - Windows DPAPI 密文不能在 Linux 解密，迁移命令清空并停用旧服务商，要求管理员重新录入
 - 后端统一处理超时、限流、余额不足、审核拒绝和服务能力缺失
+- 文字与 Agent 默认单次服务商超时为 120 秒，图片默认为 180 秒；客户端只提交短请求并轮询持久化任务状态
 - 用量、服务商、能力、状态和班级快照写入机构内日志，不记录明文密钥或生成正文
+- `local_openai_compatible` 可连接 API 容器能够访问的 Ollama、LM Studio 或私有 OpenAI 兼容推理地址，API Key 可为空；它不会在学生电脑或云端自动安装模型
+- MiniMax 视频生成由内置受信任适配器处理任务提交、查询和结果保存，不再以 `planned` 占位
+- 即梦通过火山方舟 Seedance 异步任务协议提交和查询，成品先写入机构对象存储，再通过鉴权接口预览
+- `AgentConversation`、`AgentMessage` 和滚动摘要只在单个会话内形成记忆；模型显式选择受管理员白名单控制，工具建议必须由学生确认且再次经过课堂工具权限校验
+- Agent 对话文字不进入作品库；临时图片和视频默认保留 7 天，学生确认“保存到我的作品”后才创建正式作品
+- 可安装插件 v1 只运行签名后的声明式文字工具，不执行第三方 Python、JavaScript、EXE 或安装脚本；新模型和视频协议必须实现受信任后端适配器，详见 `docs/PLUGIN_PROTOCOL.md`
 
 ## 7. 课程与作品
 
 - 新课程层级为“课程包 -> 课程 -> PPT、工程包.md、成果包.md”
 - 三类资料均可为空；有至少一门课程即可发布课程包
-- 教师只能预览 PDF，不能下载 PPTX/PDF；Markdown 可预览和下载
+- 教师可在预览抽屉中全屏播放转换后的 PDF 并退出全屏，但不能下载 PPTX/PDF；Markdown 可预览和下载
 - 学生端只获得工程包；PPT/PDF 和成果包不返回学生课程响应，直连接口同样拒绝
-- 工程包在线保存到学生在该课程下的唯一文字作品，管理员原始 Markdown 保持只读，作品可复用现有提交与批改链路
+- 工程包在线保存到学生在该课程下的唯一文字作品，源码与 GFM 预览同步显示，管理员原始 Markdown 保持只读，作品可复用现有提交与批改链路
+- 管理员为每门课程配置允许提交的扩展名和 1 至 20 MB 单文件上限；学生可以选择本机文件，服务端流式写入临时文件并校验扩展名、文件头、UTF-8 文本和 ZIP 结构后转入受管对象存储
+- 本机文件直接创建 `SubmissionAttachment` 并关联提交版本，不创建 `Project`、不进入学生或教师作品库；图片附件继续进入内容安全复核
+- 提交版本固化标题、Markdown、文件引用和元数据、逾期状态、评分及反馈；历史页和鉴权文件接口不读取作品当前内容替代快照
+- 普通项目响应不返回本地路径或对象存储键，学生通过鉴权项目文件接口查看或下载已保存文件
 - 课程包授权与作者相互独立，作者可选教师或管理员
 - 排课以课程为原子，支持学员和班级目标；已有提交保存评分规则快照
 - 图片、视频和工作流结果通过统一作品与审核链路保存
@@ -120,6 +132,7 @@ Operations: Prometheus + Alertmanager + independent backup storage
 - 隐私政策版本化，支持监护人授权和云端 AI 数据处理开关
 - 联系方式与 AI API Key 使用同一云端密钥保护接口加密，但用途与数据表隔离
 - 默认保留 365 天；扫描只生成预览或待审批请求，不直接删除
+- 个人导出、删除和到期保留覆盖提交附件、Agent 会话、消息、异步任务和临时文件；共享作品文件仍按引用关系保护
 - 管理员可设置例外、审批请求并输入精确确认文本执行
 - 删除前对象进入隔离区；数据库失败时恢复对象，成功后再清除隔离副本
 - 审计记录在到期处理时脱敏，而不是保留可识别个人信息
@@ -135,6 +148,7 @@ Operations: Prometheus + Alertmanager + independent backup storage
 - `/api/version` 返回版本、最低客户端版本、渠道、提交和部署模式
 - `/metrics` 只在内部网络由 Prometheus 抓取，Caddy 对公网返回 404
 - 每个 API worker 通过可配置并发闸门限制 GET/HEAD 请求，避免旧客户端突发读取耗尽数据库连接池
+- 本机已覆盖 10 名不同学生同时写入和同一学生重复并发提交；云端可用人数仍需在真实 PostgreSQL、对象存储、网关和目标 ECS 规格下压测确认
 - 桌面请求携带客户端版本；API 结构化日志记录版本，Caddy 访问日志删除授权、Cookie 和师生会话令牌
 - Alertmanager 可通过 `CODERAI_ALERT_WEBHOOK_URL` 接入 HTTPS Webhook
 - 无域名部署使用固定公网 IPv4 和 Let's Encrypt `shortlived` IP 证书；systemd 每 12 小时续期并让 Caddy 重载

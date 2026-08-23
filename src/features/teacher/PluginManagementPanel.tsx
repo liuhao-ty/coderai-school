@@ -4,6 +4,8 @@ import {
   Button,
   Card,
   Col,
+  Descriptions,
+  Divider,
   Form,
   Input,
   List,
@@ -26,6 +28,14 @@ import { explainError } from "../../lib/errors";
 
 
 const { Text } = Typography;
+
+function pluginStatusLabel(status: string) {
+  if (status === "ready") return "已就绪";
+  if (status === "disabled") return "已停用";
+  if (status === "invalid") return "校验失败";
+  if (status === "legacy_manifest") return "协议过旧";
+  return status;
+}
 
 type PluginTool = {
   id: string;
@@ -215,7 +225,7 @@ export function PluginManagementPanel({ licenseAllowsPlugins }: { licenseAllowsP
                   <Space wrap>
                     <Text strong>{plugin.name}</Text>
                     <Tag color={plugin.status === "ready" ? "green" : plugin.status === "disabled" ? "default" : "red"}>
-                      {plugin.status}
+                      {pluginStatusLabel(plugin.status)}
                     </Tag>
                     {plugin.builtin
                       ? <Tag color="cyan">内置信任</Tag>
@@ -344,11 +354,58 @@ export function PluginManagementPanel({ licenseAllowsPlugins }: { licenseAllowsP
     </Row>
   );
 
+  const specificationTab = (
+    <Space direction="vertical" size={16} className="fullWidth">
+      <Alert
+        type="info"
+        showIcon
+        message="第三方安装包使用声明式插件协议 v1；本地模型和视频适配器属于受信任系统适配器，不通过普通插件包执行代码。"
+      />
+      <Descriptions bordered size="small" column={{ xs: 1, md: 2 }}>
+        <Descriptions.Item label="安装包">`.coderai-plugin` 或 ZIP</Descriptions.Item>
+        <Descriptions.Item label="签名">受信任发布者 Ed25519</Descriptions.Item>
+        <Descriptions.Item label="当前动作">`text.generate`</Descriptions.Item>
+        <Descriptions.Item label="当前权限">`ai.text`、`projects.write`</Descriptions.Item>
+        <Descriptions.Item label="大小限制">安装包 5 MB，解压后 20 MB</Descriptions.Item>
+        <Descriptions.Item label="文件数量">最多 50 个声明文件</Descriptions.Item>
+      </Descriptions>
+      <Divider orientation="left">当前可以安装</Divider>
+      <List
+        size="small"
+        dataSource={[
+          "课堂文字工具：使用提示词模板调用系统已配置的文字模型。",
+          "文字作品工具：将生成结果保存到学生作品库。",
+          "签名升级包：版本号高于已安装版本时进行完整性校验后升级。",
+        ]}
+        renderItem={(item) => <List.Item>{item}</List.Item>}
+      />
+      <Divider orientation="left">普通插件不能执行</Divider>
+      <Text type="secondary">
+        Python、JavaScript、EXE、Shell、动态库、安装脚本、任意网络请求、本机进程、环境变量、数据库和任意文件访问均不开放。
+      </Text>
+      <Divider orientation="left">开发流程</Divider>
+      <List
+        size="small"
+        dataSource={[
+          "1. 编写只包含声明式工具定义的 plugin.json。",
+          "2. 在项目目录外生成并保管 Ed25519 发布私钥。",
+          "3. 使用 tools/plugin_packager.py 构建签名安装包。",
+          "4. 管理员登记发布者公钥，再上传安装包完成签名、版本、权限和哈希校验。",
+        ]}
+        renderItem={(item) => <List.Item>{item}</List.Item>}
+      />
+      <Text copyable={{ text: "python tools/plugin_packager.py --help" }} code>
+        python tools/plugin_packager.py --help
+      </Text>
+    </Space>
+  );
+
   return (
     <Card title={<IconTitle icon={<PackageCheck size={18} />} text="签名插件" />}>
       <Tabs
         items={[
           { key: "packages", label: "插件安装包", children: packageTab },
+          { key: "specification", label: "安装规范", children: specificationTab },
           { key: "publishers", label: "信任发布者", children: publisherTab }
         ]}
       />

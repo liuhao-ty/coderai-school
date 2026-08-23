@@ -36,6 +36,7 @@ export function projectTypeLabel(type: string) {
   if (type === "video") return "视频作品";
   if (type === "workflow") return "工作流作品";
   if (type === "plugin_text") return "插件文字作品";
+  if (type === "uploaded_file") return "本机文件作品";
   return type || "未分类作品";
 }
 

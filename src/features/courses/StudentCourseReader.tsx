@@ -1,13 +1,16 @@
-import { Alert, App, Button, Checkbox, Drawer, Empty, Input, List, Pagination, Radio, Segmented, Select, Space, Tag, Typography } from "antd";
-import { BookOpen, CheckCircle2, Clock3, Download, Edit3, Eye, FileText, Save, Send } from "lucide-react";
+import { Alert, App, Button, Checkbox, Collapse, Drawer, Empty, Input, List, Pagination, Radio, Segmented, Select, Space, Tag, Typography, Upload } from "antd";
+import { BookOpen, CheckCircle2, Clock3, Download, Edit3, Eye, FileText, FileUp, Save, Send } from "lucide-react";
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { useNavigate } from "react-router-dom";
 
+import { LiveMarkdownEditor } from "../../components/LiveMarkdownEditor";
 import type {
   CoursePackageItem,
   CourseScheduleItem,
   Project,
+  SubmissionVersion,
   TaskSubmission,
 } from "../../domain-types";
 import { api } from "../../lib/api";
@@ -15,10 +18,16 @@ import { saveBlobFile } from "../../lib/downloads";
 import { explainError } from "../../lib/errors";
 import { formatBeijingTime } from "../../lib/format";
 import { schoolStageLabel } from "../../lib/schoolStages";
+import {
+  defaultSubmissionExtensions,
+  formatMegabytes,
+  maximumSubmissionFileBytes,
+} from "../../lib/submissionFiles";
 
 
 const { Text, Title, Paragraph } = Typography;
 type WorkspaceMode = "fill" | "source" | "preview";
+type SubmissionSource = "library" | "local";
 type CourseWorkspaceField = {
   id: string;
   type: "text" | "textarea" | "radio" | "checkbox";
@@ -84,6 +93,7 @@ export function StudentCourseReader({
   onRefresh: () => Promise<void>;
 }) {
   const { message, modal } = App.useApp();
+  const navigate = useNavigate();
   const orderedSchedules = useMemo(
     () => [...schedules].sort((left, right) => {
       const statusOrder: Record<CourseScheduleItem["status"], number> = {
@@ -119,6 +129,9 @@ export function StudentCourseReader({
   );
   const [selectedScheduleId, setSelectedScheduleId] = useState<number | null>(orderedSchedules[0]?.id ?? null);
   const [selectedProjectId, setSelectedProjectId] = useState<number | undefined>();
+  const [submissionSource, setSubmissionSource] = useState<SubmissionSource>("library");
+  const [localSubmissionFile, setLocalSubmissionFile] = useState<File | null>(null);
+  const [localSubmissionTitle, setLocalSubmissionTitle] = useState("");
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("preview");
   const [workspaceText, setWorkspaceText] = useState("");
@@ -132,6 +145,8 @@ export function StudentCourseReader({
   const [workspaceLoading, setWorkspaceLoading] = useState(false);
   const [workspaceError, setWorkspaceError] = useState("");
   const [busy, setBusy] = useState("");
+  const [submissionVersions, setSubmissionVersions] = useState<SubmissionVersion[]>([]);
+  const [submissionVersionsLoading, setSubmissionVersionsLoading] = useState(false);
   const workspaceDirty = workspaceText !== savedWorkspaceText
     || answersFingerprint(workspaceAnswers) !== answersFingerprint(savedWorkspaceAnswers);
   const workspaceFormMarkdown = useMemo(
@@ -175,7 +190,27 @@ export function StudentCourseReader({
     setWorkspaceProjectId(null);
     setWorkspaceUpdatedAt(null);
     setWorkspaceError("");
+    setSubmissionSource("library");
+    setLocalSubmissionFile(null);
+    setLocalSubmissionTitle("");
   }, [selectedCourse?.id]);
+
+  useEffect(() => {
+    setSubmissionVersions([]);
+  }, [submission?.id]);
+
+  const loadSubmissionVersions = async () => {
+    if (!submission || submissionVersionsLoading || submissionVersions.length) return;
+    setSubmissionVersionsLoading(true);
+    try {
+      const response = await api.get(`/api/submissions/${submission.id}/versions`);
+      setSubmissionVersions(response.data.versions || []);
+    } catch (error) {
+      message.error(explainError(error));
+    } finally {
+      setSubmissionVersionsLoading(false);
+    }
+  };
 
   const resetWorkspace = () => {
     setWorkspaceOpen(false);
@@ -366,6 +401,48 @@ export function StudentCourseReader({
     }
   };
 
+  const chooseLocalSubmissionFile = (file: File) => {
+    const allowedExtensions = selectedCourse?.submission_extensions?.length
+      ? selectedCourse.submission_extensions
+      : defaultSubmissionExtensions;
+    const maximumBytes = selectedCourse?.submission_max_bytes || maximumSubmissionFileBytes;
+    const extension = file.name.match(/\.[^.]+$/)?.[0]?.toLowerCase() || "";
+    if (!allowedExtensions.includes(extension)) {
+      message.error(`当前课程不接受 ${extension || "无扩展名"} 文件`);
+      return Upload.LIST_IGNORE;
+    }
+    if (file.size > maximumBytes) {
+      message.error(`当前课程的作品文件不能超过 ${formatMegabytes(maximumBytes)}`);
+      return Upload.LIST_IGNORE;
+    }
+    setLocalSubmissionFile(file);
+    setLocalSubmissionTitle(file.name.replace(/\.[^.]+$/, "").slice(0, 160));
+    return Upload.LIST_IGNORE;
+  };
+
+  const uploadAndSubmitLocalFile = async () => {
+    if (!selectedSchedule || !localSubmissionFile || !localSubmissionTitle.trim()) return;
+    setBusy("upload-submit");
+    try {
+      const formData = new FormData();
+      formData.append("file", localSubmissionFile);
+      formData.append("title", localSubmissionTitle.trim());
+      const response = await api.post(
+        `/api/course-schedules/${selectedSchedule.id}/submissions/file`,
+        formData,
+      );
+      if (response.data.moderation_pending) message.warning(response.data.message || "文件已提交，正在等待安全复核");
+      else message.success(response.data.message || (submission ? "本机文件已提交为新版本" : "本机文件已提交"));
+      setLocalSubmissionFile(null);
+      setLocalSubmissionTitle("");
+      await onRefresh();
+    } catch (error) {
+      message.error(explainError(error));
+    } finally {
+      setBusy("");
+    }
+  };
+
   return (
     <div className="page">
       <div className="pageTitle">
@@ -475,30 +552,118 @@ export function StudentCourseReader({
                   </div>
 
                   {submission && (
-                    <Alert
-                      className="mb16"
-                      type={submission.status === "reviewed" ? "success" : submission.status === "returned" ? "warning" : "info"}
-                      showIcon
-                      message={submission.status === "reviewed" ? `老师已批改${submission.score != null ? `：${submission.score}/${submission.max_score} 分` : ""}` : submission.status === "returned" ? "老师已退回修改" : "作品已提交，等待老师批改"}
-                      description={submission.feedback || `当前提交版本：${submission.version_count}`}
-                    />
+                    <>
+                      <Alert
+                        className="mb16"
+                        type={submission.status === "reviewed" ? "success" : submission.status === "returned" ? "warning" : "info"}
+                        showIcon
+                        message={submission.status === "reviewed" ? `老师已批改${submission.score != null ? `：${submission.score}/${submission.max_score} 分` : ""}` : submission.status === "returned" ? "老师已退回修改" : "作品已提交，等待老师批改"}
+                        description={submission.feedback || `当前提交版本：${submission.version_count}`}
+                      />
+                      <Collapse
+                        className="submissionHistoryCollapse mb16"
+                        onChange={(keys) => { if (keys.length) void loadSubmissionVersions(); }}
+                        items={[{
+                          key: "history",
+                          label: `提交历史（${submission.version_count}）`,
+                          children: (
+                            <List
+                              loading={submissionVersionsLoading}
+                              dataSource={submissionVersions}
+                              locale={{ emptyText: "暂无历史版本" }}
+                              renderItem={(version) => (
+                                <List.Item
+                                  actions={[
+                                    <Button
+                                      key="open"
+                                      size="small"
+                                      icon={<Eye size={14} />}
+                                      onClick={() => navigate(`/student/submissions/${submission.id}/versions/${version.id}`)}
+                                    >
+                                      查看该版本
+                                    </Button>,
+                                  ]}
+                                >
+                                  <Space wrap>
+                                    <Text strong>第 {version.version_number} 版</Text>
+                                    <Text>{version.project_title}</Text>
+                                    <Text type="secondary">{formatBeijingTime(version.created_at)}</Text>
+                                    {version.is_late && <Tag color="orange">逾期</Tag>}
+                                  </Space>
+                                </List.Item>
+                              )}
+                            />
+                          ),
+                        }]}
+                      />
+                    </>
                   )}
 
                   {selectedSchedule.status !== "scheduled" && selectedSchedule.status !== "canceled" && (
-                    <Space wrap className="studentSubmitBar">
-                      <Select
-                        showSearch
-                        optionFilterProp="label"
-                        value={selectedProjectId}
-                        onChange={setSelectedProjectId}
-                        placeholder="从作品库选择一个作品"
-                        options={projectOptions}
-                        style={{ minWidth: 300 }}
+                    <div className="studentSubmitPanel">
+                      <Segmented
+                        value={submissionSource}
+                        onChange={(value) => setSubmissionSource(value as SubmissionSource)}
+                        options={[
+                          { value: "library", label: "从作品库选择" },
+                          { value: "local", label: "选择本机文件" },
+                        ]}
                       />
-                      <Button type="primary" icon={<Send size={15} />} disabled={!selectedProjectId} loading={busy === "submit"} onClick={() => void submitProject()}>{submission ? "提交新版本" : "提交作品"}</Button>
-                    </Space>
+                      {submissionSource === "library" ? (
+                        <Space wrap className="studentSubmitBar">
+                          <Select
+                            showSearch
+                            optionFilterProp="label"
+                            value={selectedProjectId}
+                            onChange={setSelectedProjectId}
+                            placeholder="从作品库选择一个作品"
+                            options={projectOptions}
+                            style={{ minWidth: 300 }}
+                          />
+                          <Button type="primary" icon={<Send size={15} />} disabled={!selectedProjectId} loading={busy === "submit"} onClick={() => void submitProject()}>{submission ? "提交新版本" : "提交作品"}</Button>
+                        </Space>
+                      ) : (
+                        <div className="localSubmissionPanel">
+                          <Upload
+                            accept={(selectedCourse.submission_extensions?.length
+                              ? selectedCourse.submission_extensions
+                              : defaultSubmissionExtensions).join(",")}
+                            showUploadList={false}
+                            beforeUpload={chooseLocalSubmissionFile}
+                          >
+                            <Button icon={<FileUp size={15} />}>选择文件</Button>
+                          </Upload>
+                          <Input
+                            value={localSubmissionTitle}
+                            disabled={!localSubmissionFile}
+                            maxLength={160}
+                            aria-label="本机文件作品名称"
+                            placeholder="选择文件后填写作品名称"
+                            onChange={(event) => setLocalSubmissionTitle(event.target.value)}
+                          />
+                          <div className="localSubmissionFileState">
+                            <Text strong>{localSubmissionFile?.name || "尚未选择文件"}</Text>
+                            <Text type="secondary">
+                              {(selectedCourse.submission_extensions?.length
+                                ? selectedCourse.submission_extensions
+                                : defaultSubmissionExtensions).join("、")}
+                              {` · 上限 ${formatMegabytes(selectedCourse.submission_max_bytes || maximumSubmissionFileBytes)}`}
+                            </Text>
+                          </div>
+                          <Button
+                            type="primary"
+                            icon={<Send size={15} />}
+                            disabled={!localSubmissionFile || !localSubmissionTitle.trim()}
+                            loading={busy === "upload-submit"}
+                            onClick={() => void uploadAndSubmitLocalFile()}
+                          >
+                            {submission ? "提交文件新版本" : "提交本机文件"}
+                          </Button>
+                        </div>
+                      )}
+                    </div>
                   )}
-                  {!projectOptions.length && selectedSchedule.status !== "scheduled" && <Text type="secondary">作品库暂无可提交作品，请先在学习工作台完成并保存作品。</Text>}
+                  {!projectOptions.length && submissionSource === "library" && selectedSchedule.status !== "scheduled" && <Text type="secondary">作品库暂无可提交作品，也可以切换到“选择本机文件”。</Text>}
                 </section>
               </Space>
             ) : filteredSchedules.length
@@ -555,12 +720,11 @@ export function StudentCourseReader({
               <Alert key={warning} type="warning" showIcon message="工程包字段需要检查" description={warning} />
             ))}
             {workspaceMode === "source" ? (
-              <Input.TextArea
-                className="markdownEditor courseWorkspaceEditor"
-                aria-label="工程包 Markdown 编辑器"
+              <LiveMarkdownEditor
                 value={workspaceText}
                 maxLength={500_000}
-                onChange={(event) => setWorkspaceText(event.target.value)}
+                onChange={setWorkspaceText}
+                ariaLabel="工程包 Markdown 编辑器"
                 placeholder="# 我的课堂工程"
               />
             ) : (

@@ -29,7 +29,17 @@ SUPPORTED_VERSIONS = {"0.9", PACKAGE_VERSION}
 MAX_PACKAGE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_EXPANDED_BYTES = 20 * 1024 * 1024 * 1024
 MAX_PACKAGE_MEMBERS = 20_000
-MANAGED_DIRECTORIES = ("projects", "outputs", "assets", "curriculum", "ai_inputs", "plugins", "acceptance")
+MANAGED_DIRECTORIES = (
+    "projects",
+    "outputs",
+    "assets",
+    "curriculum",
+    "ai_inputs",
+    "submissions",
+    "agent",
+    "plugins",
+    "acceptance",
+)
 EXPORT_DIR = DATA_DIR / "exports"
 EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")

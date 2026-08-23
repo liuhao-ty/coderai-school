@@ -23,13 +23,17 @@ import type { MenuProps, TableColumnsType } from "antd";
 import {
   ArrowDown,
   ArrowUp,
+  Bot,
+  CheckCircle2,
   CirclePlus,
   KeyRound,
   Pencil,
   Play,
   Route,
   Save,
+  ServerCog,
   Trash2,
+  Waypoints,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
@@ -62,7 +66,7 @@ function modelFor(provider: ProviderState, capability: ProviderCapability) {
 }
 
 function healthTag(provider: ProviderState) {
-  if (!provider.configured) return <Tag color="red">密钥未配置</Tag>;
+  if (!provider.configured) return <Tag color="red">连接配置不完整</Tag>;
   if (provider.last_test_status === "success") return <Tag color="green">测试通过</Tag>;
   if (provider.last_test_status === "failed") return <Tag color="red">测试失败</Tag>;
   return <Tag>待测试</Tag>;
@@ -126,6 +130,10 @@ export function MultiModelManager({ onRefresh }: { onRefresh: () => Promise<void
     () => new Map(providers.filter((provider) => provider.id).map((provider) => [provider.id as number, provider])),
     [providers],
   );
+  const enabledProviderCount = providers.filter((provider) => provider.enabled !== false).length;
+  const configuredProviderCount = providers.filter((provider) => provider.configured).length;
+  const routedModelCount = capabilities.reduce((sum, capability) => sum + routes[capability].length, 0);
+  const totalUsageCount = providers.reduce((sum, provider) => sum + (provider.usage_count || 0), 0);
 
   const applyPreset = (providerType: string) => {
     const preset = presets.find((item) => item.provider_type === providerType);
@@ -153,6 +161,7 @@ export function MultiModelManager({ onRefresh }: { onRefresh: () => Promise<void
       image_model: preset?.image_model || "gpt-image-1",
       video_model: preset?.video_model || "",
       enabled: true,
+      student_selectable: false,
     });
     setModalOpen(true);
   };
@@ -168,6 +177,7 @@ export function MultiModelManager({ onRefresh }: { onRefresh: () => Promise<void
       image_model: provider.image_model || "",
       video_model: provider.video_model || "",
       enabled: provider.enabled !== false,
+      student_selectable: Boolean(provider.student_selectable),
     });
     setModalOpen(true);
   };
@@ -325,6 +335,7 @@ export function MultiModelManager({ onRefresh }: { onRefresh: () => Promise<void
             ))}
             {!provider.routed_capabilities?.length && <Text type="secondary">未加入路由</Text>}
           </Space>
+          {provider.student_selectable && <Tag color="cyan">学生 Agent 可选</Tag>}
           <Text type="secondary">调用记录 {provider.usage_count || 0}</Text>
           {provider.last_tested_at && <Text type="secondary">测试于 {formatBeijingTime(provider.last_tested_at)}</Text>}
         </Space>
@@ -384,11 +395,30 @@ export function MultiModelManager({ onRefresh }: { onRefresh: () => Promise<void
   }
 
   return (
-    <Space direction="vertical" size={16} className="fullWidth">
+    <div className="modelServiceWorkspace">
       {loadError && <Alert type="error" showIcon message="模型配置加载失败" description={loadError} />}
+      <section className="teachingMetricStrip modelMetricStrip" aria-label="模型服务统计">
+        <div className="teachingMetricItem metricBlue">
+          <span className="teachingMetricIcon"><ServerCog size={22} /></span>
+          <span><Text type="secondary">服务商</Text><strong>{providers.length}</strong></span>
+        </div>
+        <div className="teachingMetricItem metricGreen">
+          <span className="teachingMetricIcon"><CheckCircle2 size={22} /></span>
+          <span><Text type="secondary">配置完整</Text><strong>{configuredProviderCount}</strong></span>
+        </div>
+        <div className="teachingMetricItem metricAmber">
+          <span className="teachingMetricIcon"><Waypoints size={22} /></span>
+          <span><Text type="secondary">路由模型</Text><strong>{routedModelCount}</strong></span>
+        </div>
+        <div className="teachingMetricItem metricCoral">
+          <span className="teachingMetricIcon"><Bot size={22} /></span>
+          <span><Text type="secondary">累计调用</Text><strong>{totalUsageCount}</strong></span>
+        </div>
+      </section>
       <Card
+        className="ledgerPanel modelRoutePanel"
         title={<IconTitle icon={<Route size={18} />} text="能力路由" />}
-        extra={<Button type="primary" icon={<Save size={16} />} loading={savingRoutes} onClick={() => void saveRoutes()}>保存路由</Button>}
+        extra={<Space wrap><Tag color={enabledProviderCount ? "green" : "orange"}>{enabledProviderCount} 个服务已启用</Tag><Button type="primary" icon={<Save size={16} />} loading={savingRoutes} onClick={() => void saveRoutes()}>保存路由</Button></Space>}
       >
         <div className="routeGrid">
           {capabilities.map((capability) => (
@@ -444,6 +474,7 @@ export function MultiModelManager({ onRefresh }: { onRefresh: () => Promise<void
       </Card>
 
       <Card
+        className="ledgerPanel providerLedgerPanel"
         title={<IconTitle icon={<KeyRound size={18} />} text="服务商与模型配置" />}
         extra={<Button type="primary" icon={<CirclePlus size={16} />} onClick={openCreate}>添加服务</Button>}
       >
@@ -480,6 +511,13 @@ export function MultiModelManager({ onRefresh }: { onRefresh: () => Promise<void
                   <Tag color={capabilityColors[capability as ProviderCapability]} key={capability}>{capabilityLabel(capability)}</Tag>
                 ))}
               </Space>
+              {selectedPreset.provider_type === "local_openai_compatible" && (
+                <Alert
+                  type="info"
+                  showIcon
+                  message="Base URL 必须能从 CoderAI 云端 API 容器访问；学生电脑上的 localhost 不会被云端自动发现。"
+                />
+              )}
             </div>
           )}
           <Row gutter={12}>
@@ -494,22 +532,39 @@ export function MultiModelManager({ onRefresh }: { onRefresh: () => Promise<void
               </Form.Item>
             </Col>
           </Row>
+          <Form.Item
+            name="student_selectable"
+            label="学生 Agent 模型选择"
+            valuePropName="checked"
+            extra="开启后，学生可在 AI 助手会话中显式选择该文字模型；关闭不影响自动路由。"
+          >
+            <Switch disabled={!selectedPreset?.capabilities.includes("text")} />
+          </Form.Item>
           <Form.Item name="base_url" label="Base URL" rules={[{ required: true, message: "请输入 Base URL" }]}>
             <Input placeholder="https://api.example.com/v1" />
           </Form.Item>
-          <Form.Item name="api_key" label={`API Key${editingProvider ? `（${editingProvider.api_key_masked || "未配置"}）` : ""}`}>
-            <Input.Password placeholder={editingProvider ? "留空保留原密钥" : "输入 API Key"} autoComplete="new-password" />
+          <Form.Item name="api_key" label={`API Key${selectedPreset?.requires_api_key === false ? "（可选）" : ""}${editingProvider ? `（${editingProvider.api_key_masked || "未配置"}）` : ""}`}>
+            <Input.Password
+              placeholder={selectedPreset?.requires_api_key === false
+                ? "Ollama / LM Studio 通常可留空"
+                : editingProvider ? "留空保留原密钥" : "输入 API Key"}
+              autoComplete="new-password"
+            />
           </Form.Item>
           <Row gutter={12}>
             <Col xs={24} md={8}>
               <Form.Item name="text_model" label="文字模型">
-                <Select
-                  showSearch
-                  optionFilterProp="label"
-                  placeholder="选择文字模型"
-                  disabled={!selectedPreset?.capabilities.includes("text")}
-                  options={modelOptions("text")}
-                />
+                {selectedPreset?.provider_type === "local_openai_compatible" ? (
+                  <Input placeholder="例如 qwen2.5-coder:7b" />
+                ) : (
+                  <Select
+                    showSearch
+                    optionFilterProp="label"
+                    placeholder="选择文字模型"
+                    disabled={!selectedPreset?.capabilities.includes("text")}
+                    options={modelOptions("text")}
+                  />
+                )}
               </Form.Item>
             </Col>
             <Col xs={24} md={8}>
@@ -541,6 +596,6 @@ export function MultiModelManager({ onRefresh }: { onRefresh: () => Promise<void
           </div>
         </Form>
       </Modal>
-    </Space>
+    </div>
   );
 }

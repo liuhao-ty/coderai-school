@@ -1,3 +1,4 @@
+import asyncio
 import io
 import base64
 import hashlib
@@ -12,6 +13,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
+from alembic import command
+from alembic.config import Config
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from fastapi import HTTPException
@@ -20,9 +23,10 @@ from sqlalchemy.orm import sessionmaker
 
 from backend.app.auth import PASSWORD_CHANGE_REQUIRED_KEY, PASSWORD_SETTING_KEY, SECRET_SETTING_KEY, set_setting
 from backend.app import db as db_module
+from backend.app import services as services_module
 from backend.app.db import Base, CLOUD_MODE, get_db
 from backend.app.main import app, submit_project_for_task
-from backend.app.models import AIProvider, AppSetting, Asset, Classroom, ClassroomTeacher, Course, CourseMaterial, CoursePackage, CoursePackageTeacher, CurriculumCourse, GuardianConsent, Lesson, ModerationLog, PrivacyPolicy, Project, ProviderAcceptanceRun, SubmissionVersion, Task, TaskSubmission, TeacherAuditLog, TeacherSession, UsageLog, User, VideoTask, Workflow, WorkflowRun, now
+from backend.app.models import AIGenerationJob, AIProvider, AgentArtifact, AgentConversation, AppSetting, Asset, Classroom, ClassroomTeacher, Course, CourseMaterial, CoursePackage, CoursePackageTeacher, CurriculumCourse, GuardianConsent, Lesson, ModerationLog, PrivacyPolicy, Project, ProviderAcceptanceRun, SubmissionAttachment, SubmissionVersion, Task, TaskSubmission, TeacherAuditLog, TeacherSession, UsageLog, User, VideoTask, Workflow, WorkflowRun, now
 from backend.app.licensing import canonical_license_payload
 from backend.app.plugins import canonical_plugin_manifest
 from backend.app.secrets import decrypt_secret, encrypt_secret, is_encrypted_secret, migrate_provider_secrets
@@ -35,6 +39,7 @@ from backend.app.services import (
     generate_zhipu_image,
     moderate_image_output,
     run_moderation,
+    sync_agent_video_job,
     to_submission_dict,
 )
 
@@ -149,9 +154,58 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200, response.text)
         return teacher_id, {"X-CoderAI-Teacher-Token": response.json()["token"]}
 
+    async def _create_active_course_schedule(
+        self,
+        *,
+        submission_extensions: list[str] | None = None,
+        submission_max_bytes: int = 20 * 1024 * 1024,
+    ) -> tuple[dict, int]:
+        classrooms = (await self.client.get("/api/classrooms", headers=self.teacher_headers)).json()["classrooms"]
+        class_a_id = next(item["id"] for item in classrooms if item["name"] == "Class A")
+        package = await self.client.post(
+            "/api/course-packages",
+            headers=self.teacher_headers,
+            json={
+                "title": f"并发提交课程包 {now().timestamp()}",
+                "author_user_id": self.admin_user_id,
+                "school_stages": ["primary_lower", "primary_upper", "secondary"],
+            },
+        )
+        self.assertEqual(package.status_code, 200, package.text)
+        package_id = package.json()["package"]["id"]
+        course = await self.client.post(
+            f"/api/course-packages/{package_id}/courses",
+            headers=self.teacher_headers,
+            json={
+                "title": "本机作品提交",
+                "rubric": [{"criterion": "完成度", "max_score": 100}],
+                "submission_extensions": submission_extensions or [".md", ".zip", ".sb3"],
+                "submission_max_bytes": submission_max_bytes,
+            },
+        )
+        self.assertEqual(course.status_code, 200, course.text)
+        course_id = course.json()["course"]["id"]
+        published = await self.client.post(f"/api/course-packages/{package_id}/publish", headers=self.teacher_headers)
+        self.assertEqual(published.status_code, 200, published.text)
+        scheduled = await self.client.post(
+            "/api/course-schedules/batch",
+            headers=self.teacher_headers,
+            json={
+                "items": [{
+                    "course_id": course_id,
+                    "target_type": "classroom",
+                    "target_id": class_a_id,
+                    "starts_at": (now() - timedelta(minutes=5)).isoformat(),
+                }],
+            },
+        )
+        self.assertEqual(scheduled.status_code, 200, scheduled.text)
+        return scheduled.json()["schedules"][0], class_a_id
+
     async def test_version_reports_deployment_mode(self):
         response = await self.client.get("/api/version")
         self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["version"], "0.2.0-beta.5")
         self.assertEqual(response.json()["deployment_mode"], "cloud" if CLOUD_MODE else "local")
 
     def _configure_minimax_video_provider(self):
@@ -291,6 +345,13 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_plugin_and_course_package_security_checks(self):
         self.assertEqual((await self.client.get("/api/plugins/publishers", headers=self.student_a_headers)).status_code, 403)
+        plugins = (await self.client.get("/api/plugins", headers=self.teacher_headers)).json()["plugins"]
+        local_adapter = next(item for item in plugins if item["id"] == "local-model-adapter")
+        video_adapter = next(item for item in plugins if item["id"] == "video-generation-adapter")
+        self.assertEqual(local_adapter["status"], "ready")
+        self.assertTrue(local_adapter["enabled"])
+        self.assertEqual(video_adapter["status"], "ready")
+        self.assertEqual(video_adapter["entry"], "adapter://minimax-video")
 
         malicious_course = await self.client.post(
             "/api/courses/import",
@@ -1390,11 +1451,27 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(external_file.exists())
 
     async def test_submission_versions_late_status_and_access_control(self):
+        storage_root = Path(self.temp_dir.name) / "version-storage"
+        original_file = storage_root / "projects" / "original.md"
+        current_file = storage_root / "projects" / "current.txt"
+        original_file.parent.mkdir(parents=True)
+        original_file.write_text("# immutable first file", encoding="utf-8")
+        current_file.write_text("current file content", encoding="utf-8")
         project = await self.client.post(
             "/api/projects", headers=self.student_a_headers,
             json={"title": "Versioned Work", "project_type": "text", "summary": "first version"},
         )
         project_id = project.json()["project"]["id"]
+        db = self.Session()
+        try:
+            stored_project = db.get(Project, project_id)
+            stored_project.file_path = str(original_file)
+            stored_project.original_file_name = "first-homework.md"
+            stored_project.mime_type = "text/markdown"
+            stored_project.file_size = original_file.stat().st_size
+            db.commit()
+        finally:
+            db.close()
         task = await self.client.post(
             "/api/classes/tasks", headers=self.teacher_headers,
             json={"title": "Versioned Task", "status": "published", "due_at": "2020-01-01T08:00:00"},
@@ -1403,6 +1480,17 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
         first = self._create_historical_submission(task_id, project_id)
         self.assertTrue(first["is_late"])
         submission_id = first["id"]
+
+        db = self.Session()
+        try:
+            stored_project = db.get(Project, project_id)
+            stored_project.file_path = str(current_file)
+            stored_project.original_file_name = "current-homework.txt"
+            stored_project.mime_type = "text/plain"
+            stored_project.file_size = current_file.stat().st_size
+            db.commit()
+        finally:
+            db.close()
 
         await self.client.put(
             f"/api/projects/{project_id}", headers=self.student_a_headers,
@@ -1414,6 +1502,31 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item["version_number"] for item in versions.json()["versions"]], [2, 1])
         self.assertEqual(versions.json()["versions"][0]["project_summary"], "second version")
         self.assertEqual(versions.json()["versions"][1]["project_summary"], "first version")
+        first_version = versions.json()["versions"][1]
+        self.assertEqual(first_version["file"]["original_file_name"], "first-homework.md")
+        self.assertEqual(first_version["file"]["mime_type"], "text/markdown")
+        detail = await self.client.get(
+            f"/api/submission-versions/{first_version['id']}",
+            headers=self.student_a_headers,
+        )
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertEqual(detail.json()["version"]["project_summary"], "first version")
+        self.assertEqual(detail.json()["version"]["file"]["original_file_name"], "first-homework.md")
+        self.assertEqual(
+            (await self.client.get(
+                f"/api/submission-versions/{first_version['id']}",
+                headers=self.teacher_headers,
+            )).status_code,
+            200,
+        )
+        with patch("backend.app.main.DATA_DIR", storage_root):
+            first_file = await self.client.get(
+                f"/api/submission-versions/{first_version['id']}/file",
+                headers=self.student_a_headers,
+            )
+        self.assertEqual(first_file.status_code, 200, first_file.text)
+        self.assertEqual(first_file.content, b"# immutable first file")
+        self.assertEqual(first_file.headers["content-type"], "text/markdown; charset=utf-8")
         self.assertEqual(
             (await self.client.get(f"/api/submissions/{submission_id}/versions", headers=self.student_b_headers)).status_code,
             403,
@@ -1793,7 +1906,799 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
         qwen = next(item for item in presets if item["provider_type"] == "qwen")
         volcengine = next(item for item in presets if item["provider_type"] == "volcengine_jimeng")
         self.assertEqual(qwen["capabilities"], ["text", "image"])
-        self.assertNotIn("video", volcengine["capabilities"])
+        self.assertIn("video", volcengine["capabilities"])
+        self.assertEqual(volcengine["models"]["video"][0]["durations"], [5, 10])
+        self.assertTrue(volcengine["models"]["video"][0]["supports_image"])
+
+    async def test_jimeng_seedance_submit_and_query_contract(self):
+        calls: list[tuple[str, str, dict]] = []
+
+        class FakeResponse:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self.payload
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                self.timeout = kwargs.get("timeout", args[0] if args else None)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def post(self, url, **kwargs):
+                calls.append(("POST", url, kwargs))
+                return FakeResponse({"id": "seedance-task-1"})
+
+            async def get(self, url, **kwargs):
+                calls.append(("GET", url, kwargs))
+                return FakeResponse({
+                    "id": "seedance-task-1",
+                    "status": "succeeded",
+                    "content": {"video_url": "https://cdn.test/seedance.mp4"},
+                })
+
+        provider = AIProvider(
+            name="Seedance Test",
+            provider_type="volcengine_jimeng",
+            base_url="https://ark.test/api/v3",
+            api_key="volc-video-key",
+            video_model="doubao-seedance-1-0-lite-t2v-250428",
+        )
+        with patch("backend.app.services.httpx.AsyncClient", FakeClient):
+            task_id = await services_module._submit_jimeng_video(provider, "课堂机器人旋转", None, 10)
+            result = await services_module._query_jimeng_video(provider, task_id)
+
+        self.assertEqual(task_id, "seedance-task-1")
+        self.assertEqual(calls[0][0:2], ("POST", "https://ark.test/api/v3/contents/generations/tasks"))
+        self.assertEqual(calls[0][2]["headers"]["Authorization"], "Bearer volc-video-key")
+        self.assertEqual(calls[0][2]["json"]["model"], provider.video_model)
+        self.assertEqual(calls[0][2]["json"]["content"][0]["type"], "text")
+        self.assertIn("--duration 10", calls[0][2]["json"]["content"][0]["text"])
+        self.assertEqual(
+            calls[1][0:2],
+            ("GET", "https://ark.test/api/v3/contents/generations/tasks/seedance-task-1"),
+        )
+        self.assertEqual(result["content"]["video_url"], "https://cdn.test/seedance.mp4")
+
+    async def test_local_openai_compatible_provider_runs_without_api_key(self):
+        created = await self.client.post(
+            "/api/settings/providers",
+            headers=self.teacher_headers,
+            json={
+                "name": "校内 Ollama",
+                "provider_type": "local_openai_compatible",
+                "base_url": "http://ollama.school.test/v1",
+                "api_key": "",
+                "text_model": "qwen2.5-coder:7b",
+                "image_model": "",
+                "video_model": "",
+                "enabled": True,
+            },
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        provider = created.json()["provider"]
+        self.assertTrue(provider["configured"])
+        self.assertFalse(provider["requires_api_key"])
+        self.assertEqual(provider["api_key_masked"], "无需配置")
+        routed = await self.client.put(
+            "/api/settings/provider-routes",
+            headers=self.teacher_headers,
+            json={"routes": {"text": [provider["id"]], "image": [], "video": []}},
+        )
+        self.assertEqual(routed.status_code, 200, routed.text)
+
+        calls = []
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def post(self, url, **kwargs):
+                calls.append((url, kwargs["headers"]))
+                return httpx.Response(
+                    200,
+                    request=httpx.Request("POST", url),
+                    json={"choices": [{"message": {"content": "本地模型响应"}}]},
+                )
+
+        with patch("backend.app.services.httpx.AsyncClient", FakeClient):
+            generated = await self.client.post(
+                "/api/text/generate",
+                headers=self.student_a_headers,
+                json={"prompt": "生成课堂步骤", "mode": "story", "age_level": "primary_lower", "save_project": False},
+            )
+        self.assertEqual(generated.status_code, 200, generated.text)
+        self.assertEqual(generated.json()["text"], "本地模型响应")
+        self.assertEqual(calls[0][0], "http://ollama.school.test/v1/chat/completions")
+        self.assertNotIn("Authorization", calls[0][1])
+
+    async def test_async_text_jobs_are_idempotent_and_agent_conversations_are_private(self):
+        created_provider = await self.client.post(
+            "/api/settings/providers",
+            headers=self.teacher_headers,
+            json={
+                "name": "Agent Classroom Model",
+                "provider_type": "openai_compatible",
+                "base_url": "https://agent-model.test/v1",
+                "api_key": "agent-secret",
+                "text_model": "agent-text",
+                "image_model": "",
+                "video_model": "",
+                "enabled": True,
+                "student_selectable": True,
+            },
+        )
+        self.assertEqual(created_provider.status_code, 200, created_provider.text)
+        provider_id = created_provider.json()["provider"]["id"]
+        routed = await self.client.put(
+            "/api/settings/provider-routes",
+            headers=self.teacher_headers,
+            json={"routes": {"text": [provider_id], "image": [], "video": []}},
+        )
+        self.assertEqual(routed.status_code, 200, routed.text)
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def post(self, url, **kwargs):
+                prompt = kwargs["json"]["messages"][-1]["content"]
+                content = (
+                    "Agent私密回复。[[TOOL:image|画一个课堂机器人]]"
+                    if "最近对话" in prompt
+                    else "常规生成结果"
+                )
+                return httpx.Response(
+                    200,
+                    request=httpx.Request("POST", url),
+                    json={"choices": [{"message": {"content": content}}]},
+                )
+
+        request = {
+            "client_request_id": "text-job-0001",
+            "capability": "text",
+            "prompt": "这是一个超过二十四个中文字符的文字作品标题，用于验证标题不会被旧逻辑截断",
+            "mode": "general",
+            "save_project": True,
+        }
+        with patch("backend.app.services.httpx.AsyncClient", FakeClient):
+            first = await self.client.post("/api/ai/jobs", headers=self.student_a_headers, json=request)
+            second = await self.client.post("/api/ai/jobs", headers=self.student_a_headers, json=request)
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(first.json()["job"]["status"], "queued")
+        self.assertEqual(second.json()["job"]["id"], first.json()["job"]["id"])
+        completed = await self.client.get(
+            f"/api/ai/jobs/{first.json()['job']['id']}",
+            headers=self.student_a_headers,
+        )
+        self.assertEqual(completed.json()["job"]["status"], "succeeded")
+        db = self.Session()
+        try:
+            self.assertEqual(db.query(AIGenerationJob).filter(AIGenerationJob.client_request_id == "text-job-0001").count(), 1)
+            generated_project = db.get(Project, completed.json()["job"]["project_id"])
+            self.assertIn("用于验证标题不会被旧逻辑截断", generated_project.title)
+        finally:
+            db.close()
+
+        models = await self.client.get("/api/agent/models", headers=self.student_a_headers)
+        self.assertEqual(models.status_code, 200, models.text)
+        self.assertEqual(models.json()["models"][0]["provider_id"], provider_id)
+        conversation = await self.client.post(
+            "/api/agent/conversations",
+            headers=self.student_a_headers,
+            json={"title": "新对话", "selected_provider_id": provider_id},
+        )
+        conversation_id = conversation.json()["conversation"]["id"]
+        with patch("backend.app.services.httpx.AsyncClient", FakeClient):
+            reply = await self.client.post(
+                f"/api/agent/conversations/{conversation_id}/messages",
+                headers=self.student_a_headers,
+                json={"content": "帮我规划机器人作品", "client_request_id": "agent-msg-0001"},
+            )
+        self.assertEqual(reply.status_code, 200, reply.text)
+        self.assertEqual(reply.json()["job"]["status"], "queued")
+        completed_reply = await self.client.get(
+            f"/api/ai/jobs/{reply.json()['job']['id']}",
+            headers=self.student_a_headers,
+        )
+        self.assertEqual(completed_reply.json()["job"]["status"], "succeeded")
+        detail = await self.client.get(f"/api/agent/conversations/{conversation_id}", headers=self.student_a_headers)
+        self.assertEqual([item["role"] for item in detail.json()["messages"]], ["user", "assistant"])
+        self.assertEqual(detail.json()["messages"][1]["tool_suggestion"]["capability"], "image")
+        self.assertEqual(
+            (await self.client.get(f"/api/agent/conversations/{conversation_id}", headers=self.student_b_headers)).status_code,
+            404,
+        )
+        moderation = await self.client.get("/api/moderation/logs", headers=self.teacher_headers)
+        self.assertFalse(any("Agent私密回复" in item["input_text"] for item in moderation.json()["logs"]))
+
+    async def test_async_ai_job_timeout_retry_cancel_and_student_isolation(self):
+        provider_response = await self.client.post(
+            "/api/settings/providers",
+            headers=self.teacher_headers,
+            json={
+                "name": "Async Retry Model",
+                "provider_type": "openai_compatible",
+                "base_url": "https://async-model.test/v1",
+                "api_key": "async-secret",
+                "text_model": "async-text",
+                "image_model": "",
+                "video_model": "",
+                "enabled": True,
+                "student_selectable": True,
+            },
+        )
+        provider_id = provider_response.json()["provider"]["id"]
+        await self.client.put(
+            "/api/settings/provider-routes",
+            headers=self.teacher_headers,
+            json={"routes": {"text": [provider_id], "image": [], "video": []}},
+        )
+
+        class TimeoutClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def post(self, url, **kwargs):
+                raise httpx.ReadTimeout("provider timeout", request=httpx.Request("POST", url))
+
+        request = {
+            "client_request_id": "async-timeout-0001",
+            "capability": "text",
+            "prompt": "测试异步超时恢复",
+            "mode": "general",
+            "save_project": False,
+        }
+        with patch("backend.app.services.httpx.AsyncClient", TimeoutClient):
+            submitted = await self.client.post("/api/ai/jobs", headers=self.student_a_headers, json=request)
+        self.assertEqual(submitted.status_code, 200, submitted.text)
+        job_id = submitted.json()["job"]["id"]
+        timed_out = await self.client.get(f"/api/ai/jobs/{job_id}", headers=self.student_a_headers)
+        self.assertEqual(timed_out.json()["job"]["status"], "timed_out")
+        self.assertEqual(timed_out.json()["job"]["error_code"], "AI_TIMEOUT")
+        self.assertEqual(
+            (await self.client.get(f"/api/ai/jobs/{job_id}", headers=self.student_b_headers)).status_code,
+            404,
+        )
+        self.assertEqual(
+            (await self.client.post(f"/api/ai/jobs/{job_id}/retry", headers=self.student_b_headers)).status_code,
+            404,
+        )
+
+        class SuccessClient(TimeoutClient):
+            async def post(self, url, **kwargs):
+                return httpx.Response(
+                    200,
+                    request=httpx.Request("POST", url),
+                    json={"choices": [{"message": {"content": "重试成功"}}]},
+                )
+
+        with patch("backend.app.services.httpx.AsyncClient", SuccessClient):
+            retried = await self.client.post(f"/api/ai/jobs/{job_id}/retry", headers=self.student_a_headers)
+        self.assertEqual(retried.status_code, 200, retried.text)
+        completed = await self.client.get(f"/api/ai/jobs/{job_id}", headers=self.student_a_headers)
+        self.assertEqual(completed.json()["job"]["status"], "succeeded")
+        self.assertEqual(completed.json()["job"]["retry_count"], 1)
+        self.assertEqual(completed.json()["job"]["result"]["text"], "重试成功")
+
+        db = self.Session()
+        try:
+            queued = AIGenerationJob(
+                user_id=1,
+                client_request_id="queued-cancel-0001",
+                capability="text",
+                operation="generate",
+                status="queued",
+                request_json='{"prompt":"cancel"}',
+            )
+            db.add(queued)
+            db.commit()
+            queued_id = queued.id
+        finally:
+            db.close()
+        canceled = await self.client.post(f"/api/ai/jobs/{queued_id}/cancel", headers=self.student_a_headers)
+        self.assertEqual(canceled.json()["job"]["status"], "canceled")
+
+    async def test_agent_model_whitelist_saved_workflow_and_artifact_lifecycle(self):
+        hidden_provider = await self.client.post(
+            "/api/settings/providers",
+            headers=self.teacher_headers,
+            json={
+                "name": "Teacher Only Model",
+                "provider_type": "openai_compatible",
+                "base_url": "https://teacher-only.test/v1",
+                "api_key": "teacher-only-secret",
+                "text_model": "teacher-only-text",
+                "image_model": "",
+                "video_model": "",
+                "enabled": True,
+                "student_selectable": False,
+            },
+        )
+        hidden_id = hidden_provider.json()["provider"]["id"]
+        forbidden_model = await self.client.post(
+            "/api/agent/conversations",
+            headers=self.student_a_headers,
+            json={"title": "Forbidden", "selected_provider_id": hidden_id},
+        )
+        self.assertEqual(forbidden_model.status_code, 403, forbidden_model.text)
+        self.assertEqual(forbidden_model.json()["detail"]["code"], "AGENT_MODEL_FORBIDDEN")
+
+        conversation = await self.client.post(
+            "/api/agent/conversations",
+            headers=self.student_a_headers,
+            json={"title": "Workflow Agent", "selected_provider_id": None},
+        )
+        conversation_id = conversation.json()["conversation"]["id"]
+        missing_workflow = await self.client.post(
+            f"/api/agent/conversations/{conversation_id}/tools",
+            headers=self.student_a_headers,
+            json={
+                "capability": "workflow",
+                "prompt": "运行课堂计划",
+                "client_request_id": "workflow-missing-0001",
+            },
+        )
+        self.assertEqual(missing_workflow.status_code, 422, missing_workflow.text)
+        self.assertEqual(missing_workflow.json()["detail"]["code"], "WORKFLOW_SELECTION_REQUIRED")
+
+        workflow = await self.client.post(
+            "/api/workflows",
+            headers=self.student_a_headers,
+            json={
+                "name": "Agent 课堂计划",
+                "definition": {
+                    "nodes": [
+                        {"id": "input", "type": "input", "label": "输入"},
+                        {"id": "plan", "type": "text.generate", "label": "计划", "params": {"mode": "general"}},
+                    ],
+                    "edges": [{"id": "input-plan", "source": "input", "target": "plan"}],
+                },
+            },
+        )
+        self.assertEqual(workflow.status_code, 200, workflow.text)
+        project_count_before = len((await self.client.get("/api/projects", headers=self.student_a_headers)).json()["projects"])
+        with patch("backend.app.main.generate_text", AsyncMock(return_value="真实 DAG 执行结果")):
+            run = await self.client.post(
+                f"/api/agent/conversations/{conversation_id}/tools",
+                headers=self.student_a_headers,
+                json={
+                    "capability": "workflow",
+                    "prompt": "运行课堂计划",
+                    "client_request_id": "workflow-agent-0001",
+                    "workflow_id": workflow.json()["workflow"]["id"],
+                },
+            )
+        self.assertEqual(run.status_code, 200, run.text)
+        job = await self.client.get(
+            f"/api/ai/jobs/{run.json()['job']['id']}",
+            headers=self.student_a_headers,
+        )
+        self.assertEqual(job.json()["job"]["status"], "succeeded")
+        self.assertEqual(job.json()["job"]["result"]["text"], "真实 DAG 执行结果")
+        project_count_after = len((await self.client.get("/api/projects", headers=self.student_a_headers)).json()["projects"])
+        self.assertEqual(project_count_after, project_count_before)
+
+        storage_root = Path(self.temp_dir.name) / "agent-storage"
+        artifact_file = storage_root / "agent" / "temporary.png"
+        expired_file = storage_root / "agent" / "expired.png"
+        artifact_file.parent.mkdir(parents=True)
+        artifact_file.write_bytes(b"\x89PNG\r\n\x1a\nagent")
+        expired_file.write_bytes(b"\x89PNG\r\n\x1a\nexpired")
+        db = self.Session()
+        try:
+            artifact = AgentArtifact(
+                conversation_id=conversation_id,
+                user_id=1,
+                artifact_type="image",
+                title="Agent 临时图片",
+                file_path=str(artifact_file),
+                original_file_name="temporary.png",
+                mime_type="image/png",
+                file_size=artifact_file.stat().st_size,
+                status="available",
+                expires_at=now() + timedelta(days=1),
+            )
+            expired_artifact = AgentArtifact(
+                conversation_id=conversation_id,
+                user_id=1,
+                artifact_type="image",
+                title="到期图片",
+                file_path=str(expired_file),
+                original_file_name="expired.png",
+                mime_type="image/png",
+                file_size=expired_file.stat().st_size,
+                status="available",
+                expires_at=now() - timedelta(seconds=1),
+            )
+            db.add_all([artifact, expired_artifact])
+            db.commit()
+            artifact_id = artifact.id
+            expired_artifact_id = expired_artifact.id
+        finally:
+            db.close()
+        self.assertEqual(
+            (await self.client.get(f"/api/agent/artifacts/{artifact_id}/file", headers=self.student_b_headers)).status_code,
+            404,
+        )
+        with patch("backend.app.storage.DATA_DIR", storage_root):
+            saved = await self.client.post(
+                f"/api/agent/artifacts/{artifact_id}/save-project",
+                headers=self.student_a_headers,
+                json={"title": "保存后的 Agent 图片"},
+            )
+            self.assertEqual(saved.status_code, 200, saved.text)
+            db = self.Session()
+            try:
+                stored_artifact = db.get(AgentArtifact, artifact_id)
+                stored_artifact.expires_at = now() - timedelta(seconds=1)
+                db.commit()
+            finally:
+                db.close()
+            detail = await self.client.get(
+                f"/api/agent/conversations/{conversation_id}",
+                headers=self.student_a_headers,
+            )
+        saved_artifact = next(item for item in detail.json()["artifacts"] if item["id"] == artifact_id)
+        expired_artifact_payload = next(
+            item for item in detail.json()["artifacts"] if item["id"] == expired_artifact_id
+        )
+        self.assertEqual(saved_artifact["status"], "saved")
+        self.assertEqual(expired_artifact_payload["status"], "expired")
+        self.assertTrue(artifact_file.exists())
+        self.assertFalse(expired_file.exists())
+
+    async def test_agent_video_job_status_artifact_and_cancel_are_synchronized(self):
+        storage_root = Path(self.temp_dir.name) / "agent-video-storage"
+        video_file = storage_root / "agent" / "completed.mp4"
+        video_file.parent.mkdir(parents=True)
+        video_file.write_bytes(b"\x00\x00\x00\x18ftypmp42agent-video")
+        db = self.Session()
+        try:
+            conversation = AgentConversation(user_id=1, title="Agent Video")
+            db.add(conversation)
+            db.flush()
+            success_job = AIGenerationJob(
+                user_id=1,
+                conversation_id=conversation.id,
+                client_request_id="agent-video-success",
+                capability="video",
+                operation="agent_tool",
+                status="running",
+                request_json='{"prompt":"课堂视频"}',
+            )
+            timeout_job = AIGenerationJob(
+                user_id=1,
+                conversation_id=conversation.id,
+                client_request_id="agent-video-timeout",
+                capability="video",
+                operation="agent_tool",
+                status="running",
+                request_json='{"prompt":"超时视频"}',
+            )
+            cancel_job = AIGenerationJob(
+                user_id=1,
+                conversation_id=conversation.id,
+                client_request_id="agent-video-cancel",
+                capability="video",
+                operation="agent_tool",
+                status="running",
+                request_json='{"prompt":"取消视频"}',
+            )
+            db.add_all([success_job, timeout_job, cancel_job])
+            db.flush()
+            success_task = VideoTask(
+                user_id=1,
+                generation_job_id=success_job.id,
+                prompt="课堂视频",
+                status="success",
+                file_path=str(video_file),
+            )
+            timeout_task = VideoTask(
+                user_id=1,
+                generation_job_id=timeout_job.id,
+                prompt="超时视频",
+                status="timed_out",
+                error_message="超过 30 分钟",
+            )
+            old_failed_task = VideoTask(
+                user_id=1,
+                generation_job_id=cancel_job.id,
+                prompt="旧重试",
+                status="failed",
+            )
+            active_retry_task = VideoTask(
+                user_id=1,
+                generation_job_id=cancel_job.id,
+                prompt="当前重试",
+                status="processing",
+            )
+            db.add_all([success_task, timeout_task, old_failed_task, active_retry_task])
+            db.flush()
+            with patch("backend.app.storage.DATA_DIR", storage_root):
+                sync_agent_video_job(db, success_task)
+            sync_agent_video_job(db, timeout_task)
+            db.commit()
+            success_job_id = success_job.id
+            timeout_job_id = timeout_job.id
+            cancel_job_id = cancel_job.id
+            active_retry_task_id = active_retry_task.id
+            old_failed_task_id = old_failed_task.id
+        finally:
+            db.close()
+
+        db = self.Session()
+        try:
+            completed_job = db.get(AIGenerationJob, success_job_id)
+            self.assertEqual(completed_job.status, "succeeded")
+            artifact = db.query(AgentArtifact).filter(AgentArtifact.generation_job_id == success_job_id).one()
+            self.assertEqual(artifact.artifact_type, "video")
+            self.assertEqual(artifact.file_path, str(video_file))
+            timed_out_job = db.get(AIGenerationJob, timeout_job_id)
+            self.assertEqual(timed_out_job.status, "timed_out")
+            self.assertEqual(timed_out_job.error_code, "VIDEO_TIMED_OUT")
+        finally:
+            db.close()
+
+        canceled = await self.client.post(
+            f"/api/ai/jobs/{cancel_job_id}/cancel",
+            headers=self.student_a_headers,
+        )
+        self.assertEqual(canceled.status_code, 200, canceled.text)
+        self.assertEqual(canceled.json()["job"]["status"], "canceled")
+        db = self.Session()
+        try:
+            self.assertEqual(db.get(VideoTask, active_retry_task_id).status, "canceled")
+            self.assertEqual(db.get(VideoTask, old_failed_task_id).status, "failed")
+        finally:
+            db.close()
+
+    async def test_student_uploads_local_file_as_version_attachment_without_project(self):
+        schedule, _ = await self._create_active_course_schedule(
+            submission_extensions=[".md", ".png"],
+            submission_max_bytes=1024 * 1024,
+        )
+        storage_root = Path(self.temp_dir.name) / "storage"
+        storage_root.mkdir()
+        with (
+            patch("backend.app.storage.STORAGE_BACKEND", "local"),
+            patch("backend.app.storage.DATA_DIR", storage_root),
+            patch("backend.app.main.DATA_DIR", storage_root),
+        ):
+            uploaded = await self.client.post(
+                f"/api/course-schedules/{schedule['id']}/submissions/file",
+                headers=self.student_a_headers,
+                data={"title": "本机 Markdown 作业"},
+                files={"file": ("homework.md", "# 我的作业\n\n完成。".encode(), "text/markdown")},
+            )
+            self.assertEqual(uploaded.status_code, 200, uploaded.text)
+            body = uploaded.json()
+            self.assertFalse(body["moderation_pending"])
+            self.assertIsNone(body["project"])
+            self.assertIsNone(body["submission"]["project_id"])
+            self.assertEqual(body["submission"]["source_type"], "attachment")
+            self.assertEqual(body["attachment"]["original_file_name"], "homework.md")
+            self.assertEqual(body["version"]["source_type"], "attachment")
+            version_detail = await self.client.get(
+                f"/api/submission-versions/{body['version']['id']}",
+                headers=self.student_a_headers,
+            )
+            self.assertEqual(version_detail.status_code, 200, version_detail.text)
+            self.assertEqual(version_detail.json()["version"]["file"]["original_file_name"], "homework.md")
+            self.assertEqual(version_detail.json()["version"]["file"]["mime_type"], "text/markdown")
+            self.assertEqual(
+                (await self.client.get(
+                    f"/api/submission-versions/{body['version']['id']}",
+                    headers=self.teacher_headers,
+                )).status_code,
+                200,
+            )
+            downloaded = await self.client.get(
+                f"/api/submission-versions/{body['version']['id']}/file?download=true",
+                headers=self.student_a_headers,
+            )
+            self.assertEqual(downloaded.status_code, 200, downloaded.text)
+            self.assertEqual(downloaded.content, "# 我的作业\n\n完成。".encode())
+            self.assertIn("attachment", downloaded.headers.get("content-disposition", ""))
+            self.assertIn("homework.md", downloaded.headers.get("content-disposition", ""))
+            self.assertEqual(
+                (await self.client.get(
+                    f"/api/submission-versions/{body['version']['id']}/file",
+                    headers=self.student_b_headers,
+                )).status_code,
+                403,
+            )
+            db = self.Session()
+            try:
+                self.assertEqual(db.query(Project).filter(Project.title == "本机 Markdown 作业").count(), 0)
+                self.assertEqual(db.query(SubmissionAttachment).count(), 1)
+            finally:
+                db.close()
+
+            pending_image = await self.client.post(
+                f"/api/course-schedules/{schedule['id']}/submissions/file",
+                headers=self.student_a_headers,
+                data={"title": "本机图片"},
+                files={"file": ("drawing.png", b"\x89PNG\r\n\x1a\n" + b"0" * 32, "image/png")},
+            )
+            self.assertEqual(pending_image.status_code, 200, pending_image.text)
+            self.assertTrue(pending_image.json()["moderation_pending"])
+            self.assertIsNotNone(pending_image.json()["submission"])
+            self.assertIsNone(pending_image.json()["project"])
+            self.assertEqual(pending_image.json()["attachment"]["safety_status"], "pending")
+
+            rejected = await self.client.post(
+                f"/api/course-schedules/{schedule['id']}/submissions/file",
+                headers=self.student_a_headers,
+                data={"title": "禁止文件"},
+                files={"file": ("program.exe", b"MZ" + b"0" * 20, "application/octet-stream")},
+            )
+            self.assertEqual(rejected.status_code, 422, rejected.text)
+            self.assertEqual(rejected.json()["detail"]["code"], "SUBMISSION_FILE_INVALID")
+
+    async def test_student_local_file_rejects_unsafe_archives_and_oversized_content(self):
+        schedule, _ = await self._create_active_course_schedule(
+            submission_extensions=[".md", ".zip"],
+            submission_max_bytes=1024 * 1024,
+        )
+        unsafe_archive = io.BytesIO()
+        with zipfile.ZipFile(unsafe_archive, "w") as archive:
+            archive.writestr("project/readme.txt", "safe")
+            archive.writestr("project/start.cmd", "echo unsafe")
+
+        cases = (
+            ("unsafe.zip", unsafe_archive.getvalue(), "application/zip", 422, "SUBMISSION_FILE_INVALID"),
+            ("fake.zip", b"not-a-zip", "application/zip", 422, "SUBMISSION_FILE_INVALID"),
+            ("disguised.md", b"MZ" + b"0" * 32, "text/markdown", 422, "SUBMISSION_FILE_INVALID"),
+            ("oversized.md", b"a" * (1024 * 1024 + 1), "text/markdown", 413, "SUBMISSION_FILE_TOO_LARGE"),
+        )
+        for filename, content, content_type, expected_status, expected_code in cases:
+            with self.subTest(filename=filename):
+                response = await self.client.post(
+                    f"/api/course-schedules/{schedule['id']}/submissions/file",
+                    headers=self.student_a_headers,
+                    data={"title": filename},
+                    files={"file": (filename, content, content_type)},
+                )
+                self.assertEqual(response.status_code, expected_status, response.text)
+                self.assertEqual(response.json()["detail"]["code"], expected_code)
+
+    async def test_same_student_concurrent_submissions_create_sequential_versions(self):
+        schedule, class_a_id = await self._create_active_course_schedule()
+        db = self.Session()
+        try:
+            projects = [
+                Project(
+                    title=f"同生并发作品 {index}",
+                    project_type="text",
+                    user_id=1,
+                    classroom_id=class_a_id,
+                    owner_name="Student A",
+                    summary=f"版本 {index}",
+                )
+                for index in range(1, 3)
+            ]
+            db.add_all(projects)
+            db.commit()
+            project_ids = [project.id for project in projects]
+        finally:
+            db.close()
+
+        responses = await asyncio.gather(*[
+            self.client.post(
+                f"/api/course-schedules/{schedule['id']}/submissions",
+                headers=self.student_a_headers,
+                json={"project_id": project_id},
+            )
+            for project_id in project_ids
+        ])
+        self.assertTrue(all(response.status_code == 200 for response in responses), [response.text for response in responses])
+        task_id = responses[0].json()["submission"]["task_id"]
+        db = self.Session()
+        try:
+            submissions = db.query(TaskSubmission).filter(TaskSubmission.task_id == task_id, TaskSubmission.user_id == 1).all()
+            self.assertEqual(len(submissions), 1)
+            self.assertEqual(submissions[0].version_count, 2)
+            versions = db.query(SubmissionVersion).filter(
+                SubmissionVersion.submission_id == submissions[0].id,
+            ).order_by(SubmissionVersion.version_number).all()
+            self.assertEqual([item.version_number for item in versions], [1, 2])
+            self.assertEqual({item.project_id for item in versions}, set(project_ids))
+        finally:
+            db.close()
+
+    async def test_ten_students_can_submit_course_projects_concurrently(self):
+        schedule, class_a_id = await self._create_active_course_schedule()
+        password = "Student#2026"
+        db = self.Session()
+        try:
+            students = [db.get(User, 1)]
+            for index in range(2, 11):
+                student = User(
+                    name=f"Load Student {index}",
+                    role="student",
+                    username=f"load.student.{index}",
+                    password_hash=test_password_hash(password),
+                    classroom_id=class_a_id,
+                    access_code=f"LOAD-{index}",
+                    age_level="primary_upper",
+                    active=True,
+                    registered_at=now(),
+                )
+                db.add(student)
+                students.append(student)
+            db.flush()
+            projects = []
+            for student in students:
+                project = Project(
+                    title=f"并发作品 {student.id}",
+                    project_type="text",
+                    user_id=student.id,
+                    classroom_id=class_a_id,
+                    owner_name=student.name,
+                    summary="并发提交测试",
+                )
+                db.add(project)
+                projects.append(project)
+            db.commit()
+            student_rows = [(student.id, student.username) for student in students]
+            project_ids = [project.id for project in projects]
+        finally:
+            db.close()
+
+        headers = [self.student_a_headers]
+        for _, username in student_rows[1:]:
+            login = await self.client.post(
+                "/api/auth/student-login",
+                json={"username": username, "password": password},
+            )
+            self.assertEqual(login.status_code, 200, login.text)
+            headers.append({"X-CoderAI-Student-Token": login.json()["token"]})
+
+        responses = await asyncio.gather(*[
+            self.client.post(
+                f"/api/course-schedules/{schedule['id']}/submissions",
+                headers=student_headers,
+                json={"project_id": project_id},
+            )
+            for student_headers, project_id in zip(headers, project_ids, strict=True)
+        ])
+        self.assertTrue(all(response.status_code == 200 for response in responses), [response.text for response in responses])
+        db = self.Session()
+        try:
+            task_id = responses[0].json()["submission"]["task_id"]
+            rows = db.query(TaskSubmission).filter(TaskSubmission.task_id == task_id).all()
+            self.assertEqual(len(rows), 10)
+            self.assertEqual(len({row.user_id for row in rows}), 10)
+            self.assertTrue(all(row.version_count == 1 for row in rows))
+        finally:
+            db.close()
 
     async def test_multiple_provider_crud_routes_and_capability_test(self):
         deepseek_payload = {
@@ -4521,6 +5426,132 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("guardian_contact_masked", student_consents[0])
             self.assertNotIn("guardian@example.test", archive.read("data/guardian_consents.json").decode("utf-8"))
 
+    async def test_privacy_export_and_delete_cover_submission_attachments_and_agent_data(self):
+        workspace = Path(self.temp_dir.name) / "privacy-agent-workspace"
+        export_dir = workspace / "exports" / "privacy"
+        trash_dir = workspace / ".privacy-trash"
+        cache_dir = workspace / "cache" / "workflows"
+        attachment_file = workspace / "submissions" / "student-a.md"
+        artifact_file = workspace / "agent" / "student-a.png"
+        attachment_file.parent.mkdir(parents=True)
+        artifact_file.parent.mkdir(parents=True)
+        attachment_file.write_text("# external submission attachment", encoding="utf-8")
+        artifact_file.write_bytes(b"\x89PNG\r\n\x1a\nprivate-agent-artifact")
+
+        project = await self.client.post(
+            "/api/projects",
+            headers=self.student_a_headers,
+            json={"title": "Privacy linked project", "project_type": "text", "summary": "private"},
+        )
+        task = await self.client.post(
+            "/api/classes/tasks",
+            headers=self.teacher_headers,
+            json={"title": "Privacy attachment task"},
+        )
+        submission = self._create_historical_submission(task.json()["task"]["id"], project.json()["project"]["id"])
+        db = self.Session()
+        try:
+            version = db.query(SubmissionVersion).filter(
+                SubmissionVersion.submission_id == submission["id"],
+            ).one()
+            attachment = SubmissionAttachment(
+                submission_id=submission["id"],
+                version_id=version.id,
+                user_id=1,
+                classroom_id=1,
+                title="外部附件",
+                file_path=str(attachment_file),
+                original_file_name="student-a.md",
+                mime_type="text/markdown",
+                file_extension=".md",
+                file_size=attachment_file.stat().st_size,
+                checksum_sha256=hashlib.sha256(attachment_file.read_bytes()).hexdigest(),
+                safety_status="approved",
+            )
+            conversation = AgentConversation(user_id=1, title="Private Agent conversation")
+            db.add_all([attachment, conversation])
+            db.flush()
+            job = AIGenerationJob(
+                user_id=1,
+                conversation_id=conversation.id,
+                client_request_id="privacy-agent-job",
+                capability="image",
+                operation="agent_tool",
+                status="succeeded",
+                request_json='{"prompt":"private agent prompt"}',
+                result_json="{}",
+            )
+            db.add(job)
+            db.flush()
+            artifact = AgentArtifact(
+                conversation_id=conversation.id,
+                generation_job_id=job.id,
+                user_id=1,
+                artifact_type="image",
+                title="Private Agent artifact",
+                file_path=str(artifact_file),
+                original_file_name="student-a.png",
+                mime_type="image/png",
+                file_size=artifact_file.stat().st_size,
+                status="available",
+                expires_at=now() + timedelta(days=1),
+            )
+            db.add(artifact)
+            db.commit()
+            attachment_id = attachment.id
+            conversation_id = conversation.id
+            job_id = job.id
+            artifact_id = artifact.id
+        finally:
+            db.close()
+
+        patches = (
+            patch("backend.app.privacy.DATA_DIR", workspace),
+            patch("backend.app.privacy.EXPORT_DIR", export_dir),
+            patch("backend.app.privacy.TRASH_DIR", trash_dir),
+            patch("backend.app.privacy.WORKFLOW_CACHE_DIR", cache_dir),
+        )
+        with patches[0], patches[1], patches[2], patches[3]:
+            exported = await self.client.get("/api/privacy/students/1/export", headers=self.teacher_headers)
+            self.assertEqual(exported.status_code, 200, exported.text)
+            with zipfile.ZipFile(io.BytesIO(exported.content)) as archive:
+                names = set(archive.namelist())
+                self.assertIn("data/submission_attachments.json", names)
+                self.assertIn("data/agent_conversations.json", names)
+                self.assertIn("data/ai_generation_jobs.json", names)
+                self.assertIn("data/agent_artifacts.json", names)
+                self.assertTrue(any(name.endswith("submissions/student-a.md") for name in names))
+                self.assertTrue(any(name.endswith("agent/student-a.png") for name in names))
+                self.assertIn("private agent prompt", archive.read("data/ai_generation_jobs.json").decode("utf-8"))
+
+            preflight = await self.client.get(
+                "/api/privacy/students/1/deletion-preflight",
+                headers=self.teacher_headers,
+            )
+            self.assertEqual(preflight.status_code, 200, preflight.text)
+            self.assertEqual(preflight.json()["preflight"]["counts"]["submission_attachments"], 1)
+            self.assertEqual(preflight.json()["preflight"]["counts"]["agent_conversations"], 1)
+            deleted = await self.client.post(
+                "/api/privacy/students/1/delete",
+                headers=self.teacher_headers,
+                json={
+                    "preflight_token": preflight.json()["preflight_token"],
+                    "confirm_student_name": "Student A",
+                },
+            )
+            self.assertEqual(deleted.status_code, 200, deleted.text)
+
+        self.assertFalse(attachment_file.exists())
+        self.assertFalse(artifact_file.exists())
+        db = self.Session()
+        try:
+            self.assertIsNone(db.get(SubmissionAttachment, attachment_id))
+            self.assertIsNone(db.get(AgentConversation, conversation_id))
+            self.assertIsNone(db.get(AIGenerationJob, job_id))
+            self.assertIsNone(db.get(AgentArtifact, artifact_id))
+        finally:
+            db.close()
+
     async def test_student_data_delete_preflight_snapshot_rollback_and_cleanup(self):
         workspace = Path(self.temp_dir.name) / "delete-workspace"
         export_root = workspace / "exports"
@@ -5384,11 +6415,78 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
                 summary="Old audit",
                 created_at=old,
             )
-            db.add_all([project, audit])
+            task = Task(title="Expired attachment task", owner_teacher_id=self.admin_user_id)
+            conversation = AgentConversation(user_id=student.id, title="Expired Agent conversation", updated_at=old)
+            db.add_all([project, audit, task, conversation])
+            db.flush()
+            submission = TaskSubmission(
+                owner_teacher_id=self.admin_user_id,
+                task_id=task.id,
+                project_id=None,
+                source_type="attachment",
+                user_id=student.id,
+                classroom_id=student.classroom_id,
+                status="submitted",
+                version_count=1,
+                created_at=old,
+                updated_at=old,
+            )
+            job = AIGenerationJob(
+                user_id=student.id,
+                conversation_id=conversation.id,
+                client_request_id="expired-agent-job",
+                capability="image",
+                operation="agent_tool",
+                status="succeeded",
+                request_json="{}",
+                result_json="{}",
+                created_at=old,
+                updated_at=old,
+                completed_at=old,
+            )
+            db.add_all([submission, job])
+            db.flush()
+            version = SubmissionVersion(
+                submission_id=submission.id,
+                version_number=1,
+                source_type="attachment",
+                project_title="Expired attachment",
+                created_at=old,
+            )
+            db.add(version)
+            db.flush()
+            attachment = SubmissionAttachment(
+                submission_id=submission.id,
+                version_id=version.id,
+                user_id=student.id,
+                classroom_id=student.classroom_id,
+                title="Expired attachment",
+                original_file_name="expired.md",
+                mime_type="text/markdown",
+                safety_status="approved",
+                created_at=old,
+            )
+            artifact = AgentArtifact(
+                conversation_id=conversation.id,
+                generation_job_id=job.id,
+                user_id=student.id,
+                artifact_type="image",
+                title="Expired artifact",
+                status="expired",
+                expires_at=old,
+                created_at=old,
+            )
+            db.add_all([attachment, artifact])
             db.commit()
             project_id = project.id
             audit_id = audit.id
             student_id = student.id
+            submission_id = submission.id
+            version_id = version.id
+            attachment_id = attachment.id
+            conversation_id = conversation.id
+            job_id = job.id
+            artifact_id = artifact.id
         finally:
             db.close()
 
@@ -5407,6 +6505,8 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(excluded.status_code, 200, excluded.text)
         self.assertEqual(excluded.json()["preview"]["counts"]["projects"], 0)
+        self.assertEqual(excluded.json()["preview"]["counts"]["submission_attachments"], 0)
+        self.assertEqual(excluded.json()["preview"]["counts"]["agent_conversations"], 0)
         self.assertFalse(excluded.json()["preview"]["automatic_deletion"])
 
         removed = await self.client.delete(
@@ -5421,6 +6521,11 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(requested.status_code, 200, requested.text)
         request_payload = requested.json()["request"]
         self.assertEqual(request_payload["preview"]["counts"]["projects"], 1)
+        self.assertEqual(request_payload["preview"]["counts"]["task_submissions"], 1)
+        self.assertEqual(request_payload["preview"]["counts"]["submission_attachments"], 1)
+        self.assertEqual(request_payload["preview"]["counts"]["agent_conversations"], 1)
+        self.assertEqual(request_payload["preview"]["counts"]["ai_generation_jobs"], 1)
+        self.assertEqual(request_payload["preview"]["counts"]["agent_artifacts"], 1)
         request_id = request_payload["id"]
 
         approved = await self.client.post(
@@ -5447,6 +6552,12 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
         db = self.Session()
         try:
             self.assertIsNone(db.get(Project, project_id))
+            self.assertIsNone(db.get(TaskSubmission, submission_id))
+            self.assertIsNone(db.get(SubmissionVersion, version_id))
+            self.assertIsNone(db.get(SubmissionAttachment, attachment_id))
+            self.assertIsNone(db.get(AgentConversation, conversation_id))
+            self.assertIsNone(db.get(AIGenerationJob, job_id))
+            self.assertIsNone(db.get(AgentArtifact, artifact_id))
             redacted = db.get(TeacherAuditLog, audit_id)
             self.assertEqual(redacted.actor_username, "")
             self.assertEqual(redacted.target_id, "retention-redacted")
@@ -5455,6 +6566,148 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AccountMigrationTests(unittest.TestCase):
+    @staticmethod
+    def _create_legacy_submission_schema(database_path: Path) -> None:
+        connection = sqlite3.connect(database_path)
+        try:
+            connection.executescript("""
+                CREATE TABLE curriculum_courses (id INTEGER PRIMARY KEY);
+                CREATE TABLE projects (id INTEGER PRIMARY KEY);
+                CREATE TABLE task_submissions (
+                    id INTEGER PRIMARY KEY,
+                    organization_id INTEGER NOT NULL,
+                    task_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    version_count INTEGER NOT NULL DEFAULT 1,
+                    created_at DATETIME,
+                    updated_at DATETIME
+                );
+                CREATE TABLE submission_versions (
+                    id INTEGER PRIMARY KEY,
+                    organization_id INTEGER NOT NULL,
+                    submission_id INTEGER NOT NULL,
+                    version_number INTEGER NOT NULL,
+                    created_at DATETIME
+                );
+                INSERT INTO task_submissions VALUES (1, 1, 8, 12, 1, '2026-08-01 10:00:00', '2026-08-01 10:00:00');
+                INSERT INTO task_submissions VALUES (2, 1, 8, 12, 1, '2026-08-01 11:00:00', '2026-08-01 11:00:00');
+                INSERT INTO task_submissions VALUES (3, 1, 9, 12, 2, '2026-08-01 12:00:00', '2026-08-01 12:00:00');
+                INSERT INTO submission_versions VALUES (1, 1, 1, 1, '2026-08-01 10:00:00');
+                INSERT INTO submission_versions VALUES (2, 1, 2, 1, '2026-08-01 11:00:00');
+                INSERT INTO submission_versions VALUES (3, 1, 3, 1, '2026-08-01 12:00:00');
+                INSERT INTO submission_versions VALUES (4, 1, 3, 1, '2026-08-01 12:01:00');
+            """)
+            connection.commit()
+        finally:
+            connection.close()
+
+    def test_submission_sqlite_migration_is_backed_up_idempotent_and_merges_duplicates(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            database_path = root / "coderai.db"
+            self._create_legacy_submission_schema(database_path)
+            with patch.object(db_module, "DATA_DIR", root), patch.object(db_module, "DB_PATH", database_path):
+                db_module.backup_database_before_submission_file_migration()
+                backup_path = root / "migration-backups" / "coderai-before-submission-files.db"
+                self.assertTrue(backup_path.is_file())
+                first_hash = hashlib.sha256(backup_path.read_bytes()).hexdigest()
+                db_module.backup_database_before_submission_file_migration()
+                self.assertEqual(hashlib.sha256(backup_path.read_bytes()).hexdigest(), first_hash)
+
+            migration_engine = create_engine(f"sqlite:///{database_path}")
+            with migration_engine.begin() as connection:
+                db_module.migrate_submission_file_schema(connection)
+                db_module.migrate_submission_file_schema(connection)
+            migration_engine.dispose()
+
+            connection = sqlite3.connect(database_path)
+            try:
+                project_columns = {row[1] for row in connection.execute("PRAGMA table_info(projects)")}
+                course_columns = {row[1] for row in connection.execute("PRAGMA table_info(curriculum_courses)")}
+                self.assertTrue({"original_file_name", "mime_type", "file_size"}.issubset(project_columns))
+                self.assertTrue({"submission_extensions_json", "submission_max_bytes"}.issubset(course_columns))
+                submission_rows = connection.execute(
+                    "SELECT id, task_id, user_id, version_count FROM task_submissions ORDER BY id"
+                ).fetchall()
+                self.assertEqual(submission_rows, [(2, 8, 12, 2), (3, 9, 12, 2)])
+                versions = connection.execute(
+                    "SELECT submission_id, version_number FROM submission_versions ORDER BY submission_id, version_number"
+                ).fetchall()
+                self.assertEqual(versions, [(2, 1), (2, 2), (3, 1), (3, 2)])
+                unique_indexes = {
+                    row[1] for table in ("task_submissions", "submission_versions")
+                    for row in connection.execute(f"PRAGMA index_list({table})")
+                    if row[2]
+                }
+                self.assertIn("ux_task_submissions_org_task_user", unique_indexes)
+                self.assertIn("ux_submission_versions_org_submission_version", unique_indexes)
+            finally:
+                connection.close()
+
+    def test_alembic_submission_migration_upgrades_legacy_revision(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            database_path = root / "cloud.db"
+            self._create_legacy_submission_schema(database_path)
+            connection = sqlite3.connect(database_path)
+            try:
+                connection.execute("UPDATE submission_versions SET version_number = 2 WHERE id = 4")
+                connection.execute(
+                    "CREATE UNIQUE INDEX ux_submission_versions_org_submission_version "
+                    "ON submission_versions(organization_id, submission_id, version_number)"
+                )
+                connection.execute("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)")
+                connection.execute("INSERT INTO alembic_version VALUES ('20260727_0003')")
+                connection.commit()
+            finally:
+                connection.close()
+
+            config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+            config.set_main_option("script_location", str(Path(__file__).resolve().parents[1] / "backend" / "migrations"))
+            database_url = f"sqlite:///{database_path.as_posix()}"
+            with patch.dict("os.environ", {"CODERAI_DATABASE_URL": database_url}):
+                command.upgrade(config, "head")
+                command.upgrade(config, "head")
+
+            connection = sqlite3.connect(database_path)
+            try:
+                revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()[0]
+                self.assertEqual(revision, "20260823_0006")
+                submission_rows = connection.execute(
+                    "SELECT id, task_id, user_id, version_count FROM task_submissions ORDER BY id"
+                ).fetchall()
+                self.assertEqual(submission_rows, [(2, 8, 12, 2), (3, 9, 12, 2)])
+                versions = connection.execute(
+                    "SELECT submission_id, version_number FROM submission_versions ORDER BY submission_id, version_number"
+                ).fetchall()
+                self.assertEqual(versions, [(2, 1), (2, 2), (3, 1), (3, 2)])
+                submission_columns = {
+                    row[1]: row for row in connection.execute("PRAGMA table_info(task_submissions)")
+                }
+                version_columns = {
+                    row[1]: row for row in connection.execute("PRAGMA table_info(submission_versions)")
+                }
+                self.assertEqual(submission_columns["project_id"][3], 0)
+                self.assertEqual(version_columns["project_id"][3], 0)
+                tables = {
+                    row[0] for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+                self.assertTrue({
+                    "submission_attachments",
+                    "agent_conversations",
+                    "agent_messages",
+                    "ai_generation_jobs",
+                    "agent_artifacts",
+                }.issubset(tables))
+                ai_job_indexes = {
+                    row[1] for row in connection.execute("PRAGMA index_list(ai_generation_jobs)")
+                }
+                self.assertIn("sqlite_autoindex_ai_generation_jobs_1", ai_job_indexes)
+            finally:
+                connection.close()
+
     def test_school_stage_migration_is_backed_up_idempotent_and_preserves_secondary(self):
         with tempfile.TemporaryDirectory() as temp_name:
             root = Path(temp_name)

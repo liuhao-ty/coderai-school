@@ -16,12 +16,17 @@ from backend.app.audit import record_teacher_audit
 from backend.app.auth import require_admin
 from backend.app.db import CLOUD_MODE, DATA_DIR, get_db
 from backend.app.models import (
+    AIGenerationJob,
+    AgentArtifact,
+    AgentConversation,
+    AgentMessage,
     Asset,
     ModerationLog,
     PrivacyPolicy,
     Project,
     RetentionException,
     RetentionRequest,
+    SubmissionAttachment,
     SubmissionVersion,
     TaskSubmission,
     TeacherAuditLog,
@@ -42,6 +47,7 @@ from backend.app.storage import (
 
 router = APIRouter(prefix="/api/privacy/retention", dependencies=[Depends(require_admin)], tags=["retention"])
 FINAL_VIDEO_STATUSES = {"success", "failed", "timed_out", "download_failed", "expired", "canceled"}
+FINAL_AI_JOB_STATUSES = {"succeeded", "failed", "timed_out", "canceled"}
 
 
 class RetentionPreviewRequest(BaseModel):
@@ -87,11 +93,24 @@ def scan_retention(db: Session, retention_days: int | None = None) -> dict[str, 
     days = retention_days or _current_retention_days(db)
     cutoff = now() - timedelta(days=days)
     exceptions = _active_exception_keys(db)
-    submitted_project_ids = {int(item[0]) for item in db.query(TaskSubmission.project_id).distinct().all()}
+    linked_project_ids = {
+        int(item[0])
+        for item in db.query(TaskSubmission.project_id).distinct().all()
+        if item[0] is not None
+    }
+    linked_project_ids.update(
+        int(item[0]) for item in db.query(VideoTask.project_id).distinct().all() if item[0] is not None
+    )
+    linked_project_ids.update(
+        int(item[0]) for item in db.query(AIGenerationJob.project_id).distinct().all() if item[0] is not None
+    )
+    linked_project_ids.update(
+        int(item[0]) for item in db.query(AgentArtifact.saved_project_id).distinct().all() if item[0] is not None
+    )
 
     projects = [
         item for item in db.query(Project).filter(Project.updated_at <= cutoff).order_by(Project.id).all()
-        if item.id not in submitted_project_ids and not _excluded(exceptions, "projects", item.id, item.user_id)
+        if item.id not in linked_project_ids and not _excluded(exceptions, "projects", item.id, item.user_id)
     ]
     project_ids = {item.id for item in projects}
     workflow_runs = [
@@ -102,6 +121,81 @@ def scan_retention(db: Session, retention_days: int | None = None) -> dict[str, 
         item for item in db.query(VideoTask).filter(VideoTask.updated_at <= cutoff, VideoTask.status.in_(FINAL_VIDEO_STATUSES)).order_by(VideoTask.id).all()
         if not _excluded(exceptions, "video_tasks", item.id, item.user_id)
     ]
+    video_task_ids = {item.id for item in video_tasks}
+    protected_job_ids = {
+        int(item[0])
+        for item in db.query(VideoTask.generation_job_id).filter(
+            VideoTask.generation_job_id.is_not(None),
+            ~VideoTask.id.in_(video_task_ids or {-1}),
+        ).all()
+        if item[0] is not None
+    }
+    ai_jobs = [
+        item
+        for item in db.query(AIGenerationJob).filter(
+            AIGenerationJob.updated_at <= cutoff,
+            AIGenerationJob.status.in_(FINAL_AI_JOB_STATUSES),
+        ).order_by(AIGenerationJob.id).all()
+        if item.id not in protected_job_ids
+        and not _excluded(exceptions, "ai_generation_jobs", item.id, item.user_id)
+    ]
+    ai_job_ids = {item.id for item in ai_jobs}
+    conversation_candidates = [
+        item
+        for item in db.query(AgentConversation).filter(AgentConversation.updated_at <= cutoff).order_by(AgentConversation.id).all()
+        if not _excluded(exceptions, "agent_conversations", item.id, item.user_id)
+    ]
+    conversation_ids_with_retained_jobs = {
+        int(item[0])
+        for item in db.query(AIGenerationJob.conversation_id).filter(
+            AIGenerationJob.conversation_id.is_not(None),
+            ~AIGenerationJob.id.in_(ai_job_ids or {-1}),
+        ).all()
+        if item[0] is not None
+    }
+    agent_conversations = [
+        item for item in conversation_candidates if item.id not in conversation_ids_with_retained_jobs
+    ]
+    conversation_ids = {item.id for item in agent_conversations}
+    agent_messages = (
+        db.query(AgentMessage)
+        .filter(AgentMessage.conversation_id.in_(conversation_ids))
+        .order_by(AgentMessage.id)
+        .all()
+        if conversation_ids
+        else []
+    )
+    artifact_filter = AgentArtifact.generation_job_id.in_(ai_job_ids) if ai_job_ids else None
+    if conversation_ids:
+        conversation_filter = AgentArtifact.conversation_id.in_(conversation_ids)
+        artifact_filter = conversation_filter if artifact_filter is None else or_(artifact_filter, conversation_filter)
+    agent_artifacts = (
+        db.query(AgentArtifact).filter(artifact_filter).order_by(AgentArtifact.id).all()
+        if artifact_filter is not None
+        else []
+    )
+    submissions = [
+        item
+        for item in db.query(TaskSubmission).filter(TaskSubmission.updated_at <= cutoff).order_by(TaskSubmission.id).all()
+        if not _excluded(exceptions, "task_submissions", item.id, item.user_id)
+    ]
+    submission_ids = {item.id for item in submissions}
+    submission_versions = (
+        db.query(SubmissionVersion)
+        .filter(SubmissionVersion.submission_id.in_(submission_ids))
+        .order_by(SubmissionVersion.id)
+        .all()
+        if submission_ids
+        else []
+    )
+    submission_attachments = (
+        db.query(SubmissionAttachment)
+        .filter(SubmissionAttachment.submission_id.in_(submission_ids))
+        .order_by(SubmissionAttachment.id)
+        .all()
+        if submission_ids
+        else []
+    )
     usage_logs = [
         item for item in db.query(UsageLog).filter(UsageLog.created_at <= cutoff).order_by(UsageLog.id).all()
         if not _excluded(exceptions, "usage_logs", item.id, item.user_id)
@@ -124,6 +218,13 @@ def scan_retention(db: Session, retention_days: int | None = None) -> dict[str, 
             "projects": [item.id for item in projects],
             "workflow_runs": [item.id for item in workflow_runs],
             "video_tasks": [item.id for item in video_tasks],
+            "task_submissions": [item.id for item in submissions],
+            "submission_versions": [item.id for item in submission_versions],
+            "submission_attachments": [item.id for item in submission_attachments],
+            "ai_generation_jobs": [item.id for item in ai_jobs],
+            "agent_conversations": [item.id for item in agent_conversations],
+            "agent_messages": [item.id for item in agent_messages],
+            "agent_artifacts": [item.id for item in agent_artifacts],
             "usage_logs": [item.id for item in usage_logs],
             "moderation_logs": [item.id for item in moderation_logs],
             "teacher_audit_logs_anonymize": [item.id for item in audit_logs],
@@ -132,6 +233,13 @@ def scan_retention(db: Session, retention_days: int | None = None) -> dict[str, 
             "projects": len(projects),
             "workflow_runs": len(workflow_runs),
             "video_tasks": len(video_tasks),
+            "task_submissions": len(submissions),
+            "submission_versions": len(submission_versions),
+            "submission_attachments": len(submission_attachments),
+            "ai_generation_jobs": len(ai_jobs),
+            "agent_conversations": len(agent_conversations),
+            "agent_messages": len(agent_messages),
+            "agent_artifacts": len(agent_artifacts),
             "usage_logs": len(usage_logs),
             "moderation_logs": len(moderation_logs),
             "teacher_audit_logs_anonymize": len(audit_logs),
@@ -240,12 +348,29 @@ def approve_retention(
 def _candidate_file_references(db: Session, records: dict[str, list[int]]) -> list[str]:
     project_ids = records.get("projects", [])
     video_ids = records.get("video_tasks", [])
+    attachment_ids = records.get("submission_attachments", [])
+    artifact_ids = records.get("agent_artifacts", [])
     candidates: set[str] = set()
     if project_ids:
         candidates.update(str(item[0]) for item in db.query(Project.file_path).filter(Project.id.in_(project_ids)).all() if item[0])
     if video_ids:
         for task in db.query(VideoTask).filter(VideoTask.id.in_(video_ids)).all():
             candidates.update(value for value in (task.source_image_path, task.file_path) if value)
+    if attachment_ids:
+        candidates.update(
+            str(item[0])
+            for item in db.query(SubmissionAttachment.file_path).filter(SubmissionAttachment.id.in_(attachment_ids)).all()
+            if item[0]
+        )
+    if artifact_ids:
+        candidates.update(
+            str(item[0])
+            for item in db.query(AgentArtifact.file_path).filter(
+                AgentArtifact.id.in_(artifact_ids),
+                AgentArtifact.saved_project_id.is_(None),
+            ).all()
+            if item[0]
+        )
     other_references = {
         str(item[0]) for item in db.query(Project.file_path).filter(~Project.id.in_(project_ids or [-1])).all() if item[0]
     }
@@ -256,6 +381,20 @@ def _candidate_file_references(db: Session, records: dict[str, list[int]]) -> li
     )
     other_references.update(
         str(item[0]) for item in db.query(SubmissionVersion.project_file_path).all() if item[0]
+    )
+    other_references.update(
+        str(item[0])
+        for item in db.query(SubmissionAttachment.file_path).filter(
+            ~SubmissionAttachment.id.in_(attachment_ids or [-1])
+        ).all()
+        if item[0]
+    )
+    other_references.update(
+        str(item[0])
+        for item in db.query(AgentArtifact.file_path).filter(
+            ~AgentArtifact.id.in_(artifact_ids or [-1])
+        ).all()
+        if item[0]
     )
     other_references.update(
         value
@@ -318,12 +457,35 @@ def execute_retention(
         else:
             local_root, local_moved = _quarantine_local(file_references, request_id)
         project_ids = records.get("projects", [])
+        attachment_ids = records.get("submission_attachments", [])
+        version_ids = records.get("submission_versions", [])
+        submission_ids = records.get("task_submissions", [])
+        artifact_ids = records.get("agent_artifacts", [])
+        ai_job_ids = records.get("ai_generation_jobs", [])
+        agent_message_ids = records.get("agent_messages", [])
+        conversation_ids = records.get("agent_conversations", [])
+        if attachment_ids:
+            db.query(SubmissionAttachment).filter(SubmissionAttachment.id.in_(attachment_ids)).delete(synchronize_session=False)
+        if version_ids:
+            db.query(SubmissionVersion).filter(SubmissionVersion.id.in_(version_ids)).delete(synchronize_session=False)
+        if submission_ids:
+            db.query(TaskSubmission).filter(TaskSubmission.id.in_(submission_ids)).delete(synchronize_session=False)
+        if artifact_ids:
+            db.query(AgentArtifact).filter(AgentArtifact.id.in_(artifact_ids)).delete(synchronize_session=False)
+        video_ids = records.get("video_tasks", [])
+        if video_ids:
+            db.query(VideoTask).filter(VideoTask.id.in_(video_ids)).delete(synchronize_session=False)
+        if ai_job_ids:
+            db.query(AIGenerationJob).filter(AIGenerationJob.id.in_(ai_job_ids)).delete(synchronize_session=False)
         if project_ids:
             db.query(Asset).filter(Asset.project_id.in_(project_ids)).delete(synchronize_session=False)
             db.query(Project).filter(Project.id.in_(project_ids)).delete(synchronize_session=False)
+        if agent_message_ids:
+            db.query(AgentMessage).filter(AgentMessage.id.in_(agent_message_ids)).delete(synchronize_session=False)
+        if conversation_ids:
+            db.query(AgentConversation).filter(AgentConversation.id.in_(conversation_ids)).delete(synchronize_session=False)
         for model, key in (
             (WorkflowRun, "workflow_runs"),
-            (VideoTask, "video_tasks"),
             (UsageLog, "usage_logs"),
             (ModerationLog, "moderation_logs"),
         ):

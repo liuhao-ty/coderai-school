@@ -1,19 +1,21 @@
 import {
-  Alert, App as AntApp, Button, Card, Col, DatePicker, Drawer, Image as AntImage, Input, List, Popconfirm, Row, Segmented, Select, Space, Spin, Statistic, Tabs, Tag, Typography
+  Alert, App as AntApp, Button, Card, Col, DatePicker, Drawer, Image as AntImage, Input, List, Popconfirm, Row, Segmented, Select, Space, Spin, Table, Tabs, Tag, Typography
 } from "antd";
+import type { TableColumnsType } from "antd";
 import dayjs, { type Dayjs } from "dayjs";
 import {
-  Archive, Download, Edit3, Eye, FileText, Library, RotateCcw, Save, Trash2
+  Archive, CircleCheckBig, Download, Edit3, Eye, FileText, Library, RotateCcw, Save, Shapes, Trash2, UsersRound
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
+import { LiveMarkdownEditor } from "../../components/LiveMarkdownEditor";
 import type { Classroom, Project } from "../../domain-types";
 import { EmptyState } from "../../components/PageState";
 import { api } from "../../lib/api";
 import { saveBlobFile } from "../../lib/downloads";
-import { projectTypeLabel } from "../../lib/domain";
+import { formatFileSize, projectTypeLabel } from "../../lib/domain";
 import { explainBlobError, explainError } from "../../lib/errors";
 import { formatBeijingTime } from "../../lib/format";
 import type { StudentProfile } from "../../types";
@@ -32,14 +34,15 @@ export function ProjectFileStatus({ project, compact = false }: { project: Proje
     return (
       <Space wrap>
         <Tag color="red">文件缺失</Tag>
-        {!compact && <Text copyable>{project.file_path}</Text>}
+        {!compact && project.original_file_name && <Text>{project.original_file_name}</Text>}
       </Space>
     );
   }
   return (
     <Space wrap>
       <Tag color="green">文件正常</Tag>
-      {!compact && <Text copyable>{project.file_path}</Text>}
+      {!compact && project.original_file_name && <Text>{project.original_file_name}</Text>}
+      {!compact && Boolean(project.file_size) && <Text type="secondary">{formatFileSize(project.file_size || 0)}</Text>}
     </Space>
   );
 }
@@ -225,10 +228,10 @@ export function ProjectLibrary({
     }
   };
 
-  const imageDownloadName = (project: Project) => {
-    const path = project.file_path.split(/[?#]/, 1)[0];
-    const extension = path.match(/\.(png|jpe?g|webp|gif)$/i)?.[0] || ".png";
-    const safeTitle = project.title.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").trim() || `image-${project.id}`;
+  const projectDownloadName = (project: Project) => {
+    const sourceName = project.original_file_name || project.file_path.split(/[?#]/, 1)[0];
+    const extension = sourceName.match(/\.[A-Za-z0-9]{1,10}$/)?.[0] || (project.project_type === "image" ? ".png" : "");
+    const safeTitle = project.title.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").trim() || `project-${project.id}`;
     return `${safeTitle}${extension}`;
   };
 
@@ -245,24 +248,25 @@ export function ProjectLibrary({
     anchor.remove();
   };
 
-  const downloadProjectImage = async () => {
-    if (!selectedProject || selectedProject.project_type !== "image") return;
+  const downloadProjectFile = async () => {
+    if (!selectedProject) return;
     if (!(["ok", "remote"] as string[]).includes(selectedProject.file_status)) {
-      message.warning("当前图片没有可下载的文件");
+      message.warning("当前作品没有可下载的文件");
       return;
     }
     setDownloading(true);
     try {
       if (selectedProject.file_status === "remote") {
-        triggerDownload(selectedProject.file_path, imageDownloadName(selectedProject), true);
+        triggerDownload(selectedProject.file_path, projectDownloadName(selectedProject), true);
       } else {
         const response = await api.get(`/api/projects/${selectedProject.id}/file`, { responseType: "blob" });
-        if (await saveBlobFile(response.data, imageDownloadName(selectedProject))) {
-          message.success("原图已保存");
+        if (await saveBlobFile(response.data, projectDownloadName(selectedProject))) {
+          message.success(selectedProject.project_type === "image" ? "原图已保存" : "原文件已保存");
         }
       }
     } catch (error) {
-      message.error(`图片下载失败：${await explainBlobError(error)}`);
+      const subject = selectedProject.project_type === "image" ? "图片" : "文件";
+      message.error(`${subject}下载失败：${await explainBlobError(error)}`);
     } finally {
       setDownloading(false);
     }
@@ -381,13 +385,13 @@ export function ProjectLibrary({
 
   const drawerActions = selectedProject ? (
     <Space wrap>
-      {selectedProject.project_type === "image" && (
+      {selectedProject.file_status !== "none" && (
         <Button
           icon={<Download size={16} />}
           loading={downloading}
           disabled={!(["ok", "remote"] as string[]).includes(selectedProject.file_status)}
-          onClick={() => void downloadProjectImage()}
-        >下载原图</Button>
+          onClick={() => void downloadProjectFile()}
+        >{selectedProject.project_type === "image" ? "下载原图" : "下载原文件"}</Button>
       )}
       {selectedProject.student_archived && <Tag color="default">归档学员历史作品{archivedStudentReadOnly ? " · 只读" : ""}</Tag>}
       {!archivedStudentReadOnly && selectedProject.lifecycle_status === "active" && (
@@ -428,8 +432,79 @@ export function ProjectLibrary({
     </Space>
   ) : null;
 
+  const projectColumns: TableColumnsType<Project> = [
+    {
+      title: "作品",
+      key: "project",
+      width: 260,
+      render: (_, project) => (
+        <div className="projectLedgerIdentity">
+          <Text strong ellipsis={{ tooltip: project.title }}>{project.title}</Text>
+          <Text type="secondary" ellipsis={{ tooltip: project.summary || "暂无摘要" }}>{project.summary || "暂无摘要"}</Text>
+        </div>
+      ),
+    },
+    {
+      title: "类型与状态",
+      key: "state",
+      width: 160,
+      render: (_, project) => (
+        <Space wrap size={[4, 4]}>
+          <Tag>{projectTypeLabel(project.project_type)}</Tag>
+          {lifecycleLabel(project)}
+          {moderationLabel(project)}
+        </Space>
+      ),
+    },
+    {
+      title: "学员 / 班级",
+      key: "owner",
+      width: 150,
+      render: (_, project) => (
+        <div className="projectLedgerIdentity">
+          <Text>{project.owner_name || "未归属学生"}</Text>
+          <Text type="secondary">{classroomName(project.classroom_id)}</Text>
+        </div>
+      ),
+    },
+    {
+      title: "最近提交",
+      dataIndex: "latest_submitted_at",
+      key: "submitted",
+      width: 150,
+      render: (value?: string | null) => value ? formatBeijingTime(value) : <Text type="secondary">尚未提交</Text>,
+    },
+    {
+      title: "保存时间",
+      key: "saved",
+      width: 150,
+      render: (_, project) => <Text type="secondary">{formatBeijingTime(project.created_at)}</Text>,
+    },
+    {
+      title: "文件",
+      key: "file",
+      width: 110,
+      render: (_, project) => <ProjectFileStatus project={project} compact />,
+    },
+    {
+      title: "操作",
+      key: "actions",
+      width: 80,
+      render: (_, project) => (
+        <Button
+          type="link"
+          icon={<Eye size={15} />}
+          onClick={(event) => {
+            event.stopPropagation();
+            void openProject(project);
+          }}
+        >预览</Button>
+      ),
+    },
+  ];
+
   return (
-    <div className="page">
+    <div className={`page ${isTeacherView ? "projectLedgerPage" : ""}`}>
       <div className="pageTitle rowTitle">
         <div>
           <Title level={2}>{isTeacherView ? "作品管理" : "作品库"}</Title>
@@ -444,8 +519,7 @@ export function ProjectLibrary({
         </Button>
       </div>
       <Segmented
-        className="mb16"
-        block
+        className="projectScopeSwitcher"
         value={projectScope}
         onChange={(value) => setProjectScope(value as "active" | "archived" | "trash")}
         options={[
@@ -455,39 +529,36 @@ export function ProjectLibrary({
         ]}
       />
       {isTeacherView && (
-        <Space direction="vertical" size={16} className="fullWidth mb16">
-          <Row gutter={[12, 12]}>
-            <Col xs={12} md={6}>
-              <Card className="teacherMetric">
-                <Statistic title="当前分区" value={libraryTotal} />
-              </Card>
-            </Col>
-            <Col xs={12} md={6}>
-              <Card className="teacherMetric">
-                <Statistic title="当前筛选" value={filteredProjects.length} />
-              </Card>
-            </Col>
-            <Col xs={12} md={6}>
-              <Card className="teacherMetric">
-                <Statistic title="学生数" value={new Set(libraryProjects.map((project) => project.user_id).filter(Boolean)).size} />
-              </Card>
-            </Col>
-            <Col xs={12} md={6}>
-              <Card className="teacherMetric">
-                <Statistic title="类型数" value={projectTypes.length} />
-              </Card>
-            </Col>
-          </Row>
-          <Card className="projectFilterPanel">
-            <Row gutter={[12, 12]}>
-              <Col xs={24} md={12} xl={8}>
+        <div className="projectLedgerControls">
+          <section className="teachingMetricStrip projectMetricStrip" aria-label="作品统计">
+            <div className="teachingMetricItem metricBlue">
+              <span className="teachingMetricIcon"><Library size={22} /></span>
+              <span><Text type="secondary">当前分区</Text><strong>{libraryTotal}</strong></span>
+            </div>
+            <div className="teachingMetricItem metricGreen">
+              <span className="teachingMetricIcon"><CircleCheckBig size={22} /></span>
+              <span><Text type="secondary">当前筛选</Text><strong>{filteredProjects.length}</strong></span>
+            </div>
+            <div className="teachingMetricItem metricAmber">
+              <span className="teachingMetricIcon"><UsersRound size={22} /></span>
+              <span><Text type="secondary">学生数</Text><strong>{new Set(libraryProjects.map((project) => project.user_id).filter(Boolean)).size}</strong></span>
+            </div>
+            <div className="teachingMetricItem metricCoral">
+              <span className="teachingMetricIcon"><Shapes size={22} /></span>
+              <span><Text type="secondary">类型数</Text><strong>{projectTypes.length}</strong></span>
+            </div>
+          </section>
+          <div className="projectFilterToolbar" aria-label="作品筛选">
+            <div className="projectFilterSearch">
                 <Input
+                  allowClear
+                  aria-label="搜索作品"
                   placeholder="搜索标题、学生或内容"
                   value={searchText}
                   onChange={(event) => setSearchText(event.target.value)}
                 />
-              </Col>
-              <Col xs={24} sm={12} xl={4}>
+            </div>
+            <div>
                 <Select
                   className="fullWidth"
                   value={typeFilter}
@@ -497,8 +568,8 @@ export function ProjectLibrary({
                     ...projectTypes.map((type) => ({ value: type, label: projectTypeLabel(type) }))
                   ]}
                 />
-              </Col>
-              <Col xs={24} sm={12} xl={6}>
+            </div>
+            <div>
                 <Select
                   className="fullWidth"
                   showSearch
@@ -513,8 +584,8 @@ export function ProjectLibrary({
                     label: `${student.name} · ${student.username}`,
                   }))}
                 />
-              </Col>
-              <Col xs={24} sm={12} xl={6}>
+            </div>
+            <div>
                 <Select
                   className="fullWidth"
                   showSearch
@@ -526,8 +597,8 @@ export function ProjectLibrary({
                   onChange={setClassroomFilter}
                   options={classrooms.map((classroom) => ({ value: classroom.id, label: classroom.name }))}
                 />
-              </Col>
-              <Col xs={24} md={12} xl={10}>
+            </div>
+            <div className="projectFilterDate">
                 <DatePicker.RangePicker
                   className="fullWidth"
                   value={submittedRange}
@@ -535,57 +606,73 @@ export function ProjectLibrary({
                   placeholder={["提交开始日期", "提交结束日期"]}
                   allowClear
                 />
-              </Col>
-            </Row>
-          </Card>
-        </Space>
+            </div>
+          </div>
+        </div>
       )}
-      <List
-        loading={libraryLoading}
-        grid={{ gutter: 16, xs: 1, sm: 2, lg: 3 }}
-        dataSource={filteredProjects}
-        locale={{
-          emptyText: projectScope === "archived"
-            ? <EmptyState title="还没有归档作品" description="归档后的作品会显示在这里" />
-            : projectScope === "trash"
-              ? <EmptyState title="回收站为空" description="移入回收站的作品会暂存在这里" />
-              : <EmptyState title="还没有作品" description="完成一次 AI 创作后，作品会自动保存在这里" />
-        }}
-        renderItem={(project) => (
-          <List.Item>
-            <Card
-              className="projectCard"
-              title={project.title}
-              extra={
-                <Button type="text" icon={<Eye size={16} />} onClick={() => openProject(project)}>
-                  预览
-                </Button>
-              }
-              onClick={() => openProject(project)}
-            >
-              <Space direction="vertical" size={8}>
-                <Space wrap>
-                  <Tag>{projectTypeLabel(project.project_type)}</Tag>
-                  {lifecycleLabel(project)}
-                  {isTeacherView && moderationLabel(project)}
-                  {isTeacherView && <Tag color="blue">{project.owner_name || "未归属学生"}</Tag>}
-                  {isTeacherView && <Tag>{classroomName(project.classroom_id)}</Tag>}
+      {isTeacherView ? (
+        <div className="projectLedgerTable">
+          <Table
+            rowKey="id"
+            loading={libraryLoading}
+            columns={projectColumns}
+            dataSource={filteredProjects}
+            scroll={{ x: 1060 }}
+            pagination={{
+              defaultPageSize: 10,
+              showSizeChanger: true,
+              pageSizeOptions: [10, 20, 50],
+              showTotal: (total) => `共 ${total} 件作品`,
+            }}
+            locale={{
+              emptyText: projectScope === "archived"
+                ? <EmptyState title="还没有归档作品" description="归档后的作品会显示在这里" />
+                : projectScope === "trash"
+                  ? <EmptyState title="回收站为空" description="移入回收站的作品会暂存在这里" />
+                  : <EmptyState title="还没有作品" description="完成一次 AI 创作后，作品会自动保存在这里" />
+            }}
+            onRow={(project) => ({
+              className: "projectLedgerRow",
+              onClick: () => void openProject(project),
+            })}
+          />
+        </div>
+      ) : (
+        <List
+          loading={libraryLoading}
+          grid={{ gutter: 16, xs: 1, sm: 2, lg: 3 }}
+          dataSource={filteredProjects}
+          locale={{
+            emptyText: projectScope === "archived"
+              ? <EmptyState title="还没有归档作品" description="归档后的作品会显示在这里" />
+              : projectScope === "trash"
+                ? <EmptyState title="回收站为空" description="移入回收站的作品会暂存在这里" />
+                : <EmptyState title="还没有作品" description="完成一次 AI 创作后，作品会自动保存在这里" />
+          }}
+          renderItem={(project) => (
+            <List.Item>
+              <Card
+                className="projectCard"
+                title={<span className="projectCardTitle" title={project.title}>{project.title}</span>}
+                extra={<Button type="text" icon={<Eye size={16} />} onClick={() => openProject(project)}>预览</Button>}
+                onClick={() => openProject(project)}
+              >
+                <Space direction="vertical" size={8}>
+                  <Space wrap>
+                    <Tag>{projectTypeLabel(project.project_type)}</Tag>
+                    {lifecycleLabel(project)}
+                  </Space>
+                  <Paragraph ellipsis={{ rows: 4 }}>{project.summary || "暂无摘要"}</Paragraph>
+                  <Text type="secondary">{lifecycleTime(project)}</Text>
+                  <ProjectFileStatus project={project} compact />
                 </Space>
-                <Paragraph ellipsis={{ rows: 4 }}>{project.summary || "暂无摘要"}</Paragraph>
-                {isTeacherView && (
-                  <Text type="secondary">
-                    {project.latest_submitted_at ? `最近提交：${formatBeijingTime(project.latest_submitted_at)}` : "尚未提交"}
-                  </Text>
-                )}
-                <Text type="secondary">{lifecycleTime(project)}</Text>
-                <ProjectFileStatus project={project} compact />
-              </Space>
-            </Card>
-          </List.Item>
-        )}
-      />
+              </Card>
+            </List.Item>
+          )}
+        />
+      )}
       <Drawer
-        title={selectedProject ? selectedProject.title : "作品预览"}
+        title={<span className="projectDrawerTitle">{selectedProject ? selectedProject.title : "作品预览"}</span>}
         open={Boolean(selectedProject)}
         width={760}
         onClose={() => {
@@ -717,10 +804,9 @@ export function ProjectLibrary({
                       </div>
                       <div>
                         <Text strong>Markdown 内容</Text>
-                        <Input.TextArea
-                          className="mt8 markdownEditor"
+                        <LiveMarkdownEditor
                           value={draftSummary}
-                          onChange={(event) => setDraftSummary(event.target.value)}
+                          onChange={setDraftSummary}
                           placeholder={"# 我的AI作品\n\n在这里编辑文字作品内容，支持 Markdown。"}
                         />
                       </div>

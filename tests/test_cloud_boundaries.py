@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import os
 from pathlib import Path
 import tempfile
@@ -18,7 +19,7 @@ from backend.app.licensing import ensure_student_seat_capacity, get_license_stat
 from backend.app.main import app
 from backend.app.models import AIProvider, Organization, User, now
 from backend.app.secrets import AES_GCM_SECRET_PREFIX, decrypt_secret, encrypt_secret, rotate_provider_secrets
-from backend.app.storage import object_exists, owned_object_parts
+from backend.app.storage import object_exists, owned_object_parts, put_file
 from backend.app.tenancy import organization_context, without_tenant_filter
 
 
@@ -198,6 +199,33 @@ class CloudPilotLicenseTests(unittest.TestCase):
 
 
 class ObjectStorageOwnershipTests(unittest.TestCase):
+    def test_put_file_streams_to_tenant_scoped_s3_object(self):
+        content = b"streamed submission file"
+        with tempfile.TemporaryDirectory() as temp_name:
+            source = Path(temp_name) / "homework.md"
+            source.write_bytes(content)
+            with (
+                patch("backend.app.storage.STORAGE_BACKEND", "s3"),
+                patch("backend.app.storage.S3_BUCKET", "coderai-pilot"),
+                patch("backend.app.storage.S3_SSE", ""),
+                patch("backend.app.storage._s3_client") as client,
+                organization_context(7, "pilot-seven"),
+            ):
+                reference = put_file(
+                    "projects/student-12",
+                    source,
+                    filename="homework.md",
+                    content_type="text/markdown",
+                )
+
+        self.assertTrue(reference.startswith("object://coderai-pilot/organizations/7/projects/student-12/"))
+        upload_args = client.return_value.upload_file.call_args
+        self.assertEqual(upload_args.args[0], str(source))
+        self.assertEqual(upload_args.args[1], "coderai-pilot")
+        self.assertTrue(upload_args.args[2].startswith("organizations/7/projects/student-12/"))
+        self.assertEqual(upload_args.kwargs["ExtraArgs"]["ContentType"], "text/markdown")
+        self.assertEqual(upload_args.kwargs["ExtraArgs"]["Metadata"]["sha256"], hashlib.sha256(content).hexdigest())
+
     def test_object_reference_cannot_cross_organization_boundary(self):
         reference = "object://coderai-pilot/organizations/1/projects/example.png"
         with patch("backend.app.storage.S3_BUCKET", "coderai-pilot"):
