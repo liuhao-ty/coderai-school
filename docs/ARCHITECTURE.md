@@ -157,7 +157,8 @@ Operations: Prometheus + Alertmanager + independent backup storage
 ## 10. 发布与回滚
 
 - `main` 的 `1a3848a` 是云端改造前回滚基线
-- 云端 API `0.2.0-beta.4` 和 Windows 客户端 `0.2.0-beta.6` 以提交 `f9db63b` 形成可审查发布快照
+- 云端 API `0.2.0-beta.5` 以提交 `544fbea` 部署，Alembic 已升级至 `20260823_0006`；发布前快照位于 `/srv/coderai/release-backups/pre-544fbea-20260823T051137Z`
+- Windows 客户端当前线上版本仍为 `0.2.0-beta.6`（提交 `f9db63b`）；`0.2.0-beta.7` 尚未打包或上传
 - GitHub Actions 执行 Ruff、依赖审计、后端测试、前端构建、Tauri 测试、E2E、容器集成和 Windows 冒烟构建
 - 正式工作流从 GitHub Secrets 导入 Authenticode PFX 和 Tauri 更新签名私钥
 - 回滚数据库前先停止写入并执行恢复演练；客户端问题通过从回滚提交构建更高补丁版本发布，避免签名更新降级问题

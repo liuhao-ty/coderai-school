@@ -14,9 +14,9 @@ CoderAI 学堂是面向少儿 AI 课程学习的 Windows 桌面应用。当前�
 
 云端生产客户端不会启动本地 FastAPI，也不会在学生电脑保存业务 SQLite。SQLite 和本地文件模式仅用于开发、自动化测试及一次性历史迁移。
 
-当前阿里云单机构技术内测环境已通过固定公网 IPv4 + Let's Encrypt 短期 IP 证书运行，不强制购买域名；`0.2.0-beta.4` API 与 `0.2.0-beta.6` Windows 客户端已部署，增加服务端只读请求并发保护、客户端版本追踪和网关敏感请求头脱敏。发布分支已同步至 GitHub。该环境仍未完成服务器扩容、Windows Authenticode、独立备份、机构真实 AI 密钥和 50 人压测，不得作为生产安全环境或直接按 50 人规模开放。详见 [项目状态](docs/PROJECT_STATUS.md) 与 [云端部署手册](docs/CLOUD_DEPLOYMENT.md)。
+当前阿里云单机构技术内测环境已通过固定公网 IPv4 + Let's Encrypt 短期 IP 证书运行，不强制购买域名；云端 API `0.2.0-beta.5` 已由提交 `544fbea` 部署，Alembic 已升级至 `20260823_0006`，Windows 客户端仍为 `0.2.0-beta.6`。发布分支已同步至 GitHub。该环境仍未完成服务器扩容、Windows Authenticode、独立异地备份、机构真实 AI 调用和 50 人云端写入压测，不得作为生产安全环境或直接按 50 人规模开放。详见 [项目状态](docs/PROJECT_STATUS.md) 与 [云端部署手册](docs/CLOUD_DEPLOYMENT.md)。
 
-当前开发工作区已将教师 PPT 全屏播放、学生本机附件提交、课程级文件类型/大小限制、异步 AI 任务、学习 Agent、即梦 Seedance 视频、本地或私有 OpenAI 兼容模型连接和插件安装规范归入客户端 `0.2.0-beta.7`、API `0.2.0-beta.5`；这些版本尚未提交、打包或部署到上述云端环境。
+当前发布提交已将教师 PPT 全屏播放、学生本机附件提交、课程级文件类型/大小限制、异步 AI 任务、学习 Agent、即梦 Seedance 视频、本地或私有 OpenAI 兼容模型连接和插件安装规范归入客户端 `0.2.0-beta.7`、API `0.2.0-beta.5`。API 和数据库迁移已部署；Windows 客户端 `0.2.0-beta.7` 尚未打包或上传，现有客户端仍不会显示本轮新增界面。
 
 ## 产品能力
 
