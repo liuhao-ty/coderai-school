@@ -1,6 +1,6 @@
 # CoderAI 学堂架构
 
-更新时间：2026-08-23（北京时间）
+更新时间：2026-08-26（北京时间）
 目标版本：Windows 客户端 `0.2.0-beta.7`，云端 API `0.2.0-beta.5`
 
 ## 1. 部署边界
@@ -158,7 +158,7 @@ Operations: Prometheus + Alertmanager + independent backup storage
 
 - `main` 的 `1a3848a` 是云端改造前回滚基线
 - 云端 API `0.2.0-beta.5` 以提交 `544fbea` 部署，Alembic 已升级至 `20260823_0006`；发布前快照位于 `/srv/coderai/release-backups/pre-544fbea-20260823T051137Z`
-- Windows 客户端当前线上版本仍为 `0.2.0-beta.6`（提交 `f9db63b`）；`0.2.0-beta.7` 尚未打包或上传
+- Windows 客户端 `0.2.0-beta.7` 已通过 Tauri 签名更新服务发布；beta.6 及更早安装包继续保留用于人工回滚
 - GitHub Actions 执行 Ruff、依赖审计、后端测试、前端构建、Tauri 测试、E2E、容器集成和 Windows 冒烟构建
 - 正式工作流从 GitHub Secrets 导入 Authenticode PFX 和 Tauri 更新签名私钥
 - 回滚数据库前先停止写入并执行恢复演练；客户端问题通过从回滚提交构建更高补丁版本发布，避免签名更新降级问题

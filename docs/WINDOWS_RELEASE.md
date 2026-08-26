@@ -166,7 +166,7 @@ Tauri 更新不应通过降低版本号回滚。若 `0.2.0-beta.7` 客户端有�
 
 - 尚无真实 Authenticode PFX
 - 已在真实公网 IP 上完成短期 IP 证书签发及真实续期验证
-- `0.2.0-beta.6` Tauri 签名更新文件已上传到 `/desktop-updates/`
+- `0.2.0-beta.7` Tauri 签名更新文件已上传到 `/desktop-updates/`，发布前更新目录备份位于 `/srv/coderai/release-backups/pre-beta7-updater-20260826T125040Z`
 - GitHub 远端已建立，尚未配置受保护 Environment Secrets
 
 因此当前已完成 Tauri updater 签名与公网分发，但仍不能宣称已完成 Authenticode、SmartScreen 或跨版本自动安装验收。
