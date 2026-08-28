@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.app.db import Base
@@ -249,6 +249,12 @@ class Project(TenantScopedMixin, Base):
             "user_id",
             "curriculum_course_id",
             unique=True,
+            sqlite_where=text(
+                "workspace_is_primary = 1 AND user_id IS NOT NULL AND curriculum_course_id IS NOT NULL"
+            ),
+            postgresql_where=text(
+                "workspace_is_primary = true AND user_id IS NOT NULL AND curriculum_course_id IS NOT NULL"
+            ),
         ),
     )
 
@@ -256,6 +262,8 @@ class Project(TenantScopedMixin, Base):
     owner_teacher_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     title: Mapped[str] = mapped_column(String(160), nullable=False)
     project_type: Mapped[str] = mapped_column(String(40), default="text")
+    project_category: Mapped[str] = mapped_column(String(30), default="ai_generated", index=True)
+    workspace_is_primary: Mapped[bool] = mapped_column(Boolean, default=False)
     user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     curriculum_course_id: Mapped[int | None] = mapped_column(
         ForeignKey("curriculum_courses.id", ondelete="SET NULL"),

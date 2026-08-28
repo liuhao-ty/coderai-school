@@ -123,6 +123,7 @@ from backend.app.schemas import (
     CourseUpdateRequest,
     CurriculumCourseOrderRequest,
     CurriculumCourseRequest,
+    StudentCourseWorkspaceSaveAsRequest,
     StudentCourseWorkspaceSaveRequest,
     FeedbackTemplateRequest,
     AssetRegisterRequest,
@@ -175,6 +176,7 @@ from backend.app.services import (
     provider_model_catalog_payload,
     provider_status_payload,
     project_title_from_prompt,
+    require_student_image_teacher_review,
     remove_provider_from_routes,
     run_moderation,
     save_project,
@@ -199,7 +201,7 @@ from backend.app.services import (
 )
 
 
-APP_VERSION = "0.2.0-beta.5"
+APP_VERSION = "0.2.0-beta.6"
 
 app = FastAPI(title="CoderAI 学堂 API", version=APP_VERSION)
 app.include_router(operations_router)
@@ -1755,6 +1757,8 @@ async def image_generate(
         source_image_path,
         user_id=student.id if student else None,
     )
+    if student:
+        result = require_student_image_teacher_review(db, payload.prompt, result, student.id)
     project = None
     if payload.save_project:
         if identity["role"] == "anonymous":
@@ -3003,6 +3007,8 @@ def create_project(
         owner_teacher_id=owner_teacher_id,
         title=payload.title,
         project_type=payload.project_type,
+        project_category="ai_generated",
+        workspace_is_primary=False,
         owner_name=student.name if student else payload.owner_name,
         summary=payload.summary,
         file_path=payload.file_path,
@@ -3021,6 +3027,7 @@ def list_projects(
     student_id: int | None = None,
     classroom_id: int | None = None,
     project_type: str = Query(default="", max_length=40),
+    project_category: str = Query(default="", max_length=30),
     q: str = Query(default="", max_length=160),
     submitted_from: datetime | None = None,
     submitted_to: datetime | None = None,
@@ -3067,6 +3074,14 @@ def list_projects(
         query = query.filter(Project.classroom_id == classroom_id)
     if project_type.strip():
         query = query.filter(Project.project_type == project_type.strip())
+    category = project_category.strip()
+    if category and category not in {"course_workspace", "ai_generated"}:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "PROJECT_CATEGORY_INVALID", "message": "作品分类不合法。"},
+        )
+    if category:
+        query = query.filter(Project.project_category == category)
     keyword = q.strip()
     if keyword:
         pattern = f"%{keyword}%"
@@ -4138,6 +4153,7 @@ def student_course_project(db: Session, course_id: int, student_id: int) -> Proj
     return db.query(Project).filter(
         Project.curriculum_course_id == course_id,
         Project.user_id == student_id,
+        Project.workspace_is_primary.is_(True),
     ).first()
 
 
@@ -4209,21 +4225,19 @@ def get_student_course_workspace(
     return {"workspace": student_course_workspace_payload(db, course, material, student)}
 
 
-@app.put("/api/curriculum-courses/{course_id}/workspace")
-def save_student_course_workspace(
-    course_id: int,
+def validate_student_course_workspace_content(
+    db: Session,
+    course: CurriculumCourse,
+    student: User,
     payload: StudentCourseWorkspaceSaveRequest,
-    student: User = Depends(require_student_account),
-    db: Session = Depends(get_db),
-):
-    course, material, _ = student_course_workspace_context(db, course_id, student)
-    project = student_course_project(db, course.id, student.id)
+    primary_project: Project | None,
+) -> dict[str, Any]:
     try:
         fields = parse_course_fields(payload.content_markdown)
         existing_answers: dict[str, Any] = {}
-        if project and project.workspace_answers_json:
+        if primary_project and primary_project.workspace_answers_json:
             try:
-                decoded = json.loads(project.workspace_answers_json)
+                decoded = json.loads(primary_project.workspace_answers_json)
                 existing_answers = decoded if isinstance(decoded, dict) else {}
             except json.JSONDecodeError:
                 existing_answers = {}
@@ -4240,10 +4254,25 @@ def save_student_course_workspace(
         item for item in (payload.content_markdown, course_answers_text(fields, answers)) if item
     )
     run_moderation(db, moderation_content, user_id=student.id)
+    return answers
+
+
+@app.put("/api/curriculum-courses/{course_id}/workspace")
+def save_student_course_workspace(
+    course_id: int,
+    payload: StudentCourseWorkspaceSaveRequest,
+    student: User = Depends(require_student_account),
+    db: Session = Depends(get_db),
+):
+    course, material, _ = student_course_workspace_context(db, course_id, student)
+    project = student_course_project(db, course.id, student.id)
+    answers = validate_student_course_workspace_content(db, course, student, payload, project)
     if not project:
         project = Project(
             title=f"{course.title} - 工程包"[:160],
             project_type="text",
+            project_category="course_workspace",
+            workspace_is_primary=True,
             user_id=student.id,
             curriculum_course_id=course.id,
             classroom_id=student.classroom_id,
@@ -4268,6 +4297,40 @@ def save_student_course_workspace(
         "workspace": student_course_workspace_payload(db, course, material, student, project),
         "project": to_project_dict(project),
     }
+
+
+@app.post("/api/curriculum-courses/{course_id}/workspace/save-as")
+def save_student_course_workspace_copy(
+    course_id: int,
+    payload: StudentCourseWorkspaceSaveAsRequest,
+    student: User = Depends(require_student_account),
+    db: Session = Depends(get_db),
+):
+    course, _, _ = student_course_workspace_context(db, course_id, student)
+    primary_project = student_course_project(db, course.id, student.id)
+    answers = validate_student_course_workspace_content(db, course, student, payload, primary_project)
+    title = payload.title.strip()
+    if not title:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "COURSE_WORKSPACE_COPY_TITLE_REQUIRED", "message": "请输入副本名称。"},
+        )
+    project = Project(
+        title=title[:160],
+        project_type="text",
+        project_category="course_workspace",
+        workspace_is_primary=False,
+        user_id=student.id,
+        curriculum_course_id=course.id,
+        classroom_id=student.classroom_id,
+        owner_name=student.name,
+        summary=payload.content_markdown,
+        workspace_answers_json=json_dumps(answers),
+    )
+    db.add(project)
+    db.commit()
+    db.refresh(project)
+    return {"project": to_project_dict(project)}
 
 
 @app.put("/api/curriculum-courses/{course_id}")
@@ -6263,6 +6326,12 @@ def restore_system_backup(payload: SystemRestoreRequest, teacher: TeacherSession
                 owner_teacher_id=actor.id,
                 title=title,
                 project_type=str(item.get("project_type") or "text"),
+                project_category=(
+                    str(item.get("project_category"))
+                    if str(item.get("project_category")) in {"course_workspace", "ai_generated"}
+                    else "ai_generated"
+                ),
+                workspace_is_primary=False,
                 user_id=user_id,
                 classroom_id=classroom_id,
                 owner_name=str(item.get("owner_name") or "未归属学生"),

@@ -64,7 +64,7 @@ export function StudentWorkspace({
   const [videoInput, setVideoInput] = useState<{ file_name: string; file_path: string; size: number } | null>(null);
   const [uploadingInput, setUploadingInput] = useState<"image" | "video" | "">("");
   const [generationError, setGenerationError] = useState<{ tool: "text" | "image" | "video"; message: string; code: string; values: any } | null>(null);
-  const completedJobRef = useRef<number | null>(null);
+  const completedJobRef = useRef("");
   const imageResultObjectUrlRef = useRef("");
   const [videoDurations, setVideoDurations] = useState<number[]>([5, 10]);
   const allowedTools = useMemo(() => allowedToolsFromTasks(classTasks), [classTasks]);
@@ -99,9 +99,12 @@ export function StudentWorkspace({
       const job = (response.data.jobs || []).find((item: AIGenerationJob) => item.operation === "generate" && item.capability === view);
       if (!job) return;
       if (job.status === "succeeded") {
-        completedJobRef.current = job.id;
         if (view === "text") setTextResult(String(job.result.text || ""));
-        if (view === "image" && job.result.file_available) await loadJobImage(job.id);
+        if (view === "image") {
+          setGenerationJob(job);
+          completedJobRef.current = `${job.id}:${job.result.moderation_status || "approved"}:${Boolean(job.result.file_available)}`;
+          if (job.result.file_available) await loadJobImage(job.id);
+        }
       }
       if (["queued", "running"].includes(job.status)) {
         setGenerationJob(job);
@@ -121,25 +124,36 @@ export function StudentWorkspace({
 
   useEffect(() => {
     if (!generationJob) return;
-    if (["queued", "running"].includes(generationJob.status)) {
+    const waitingForImageReview = generationJob.status === "succeeded"
+      && generationJob.capability === "image"
+      && generationJob.result.moderation_status === "pending";
+    if (["queued", "running"].includes(generationJob.status) || waitingForImageReview) {
+      if (waitingForImageReview) setLoading("");
       const timer = window.setInterval(() => {
         void api.get(`/api/ai/jobs/${generationJob.id}`).then((response) => {
           setGenerationJob(response.data.job);
         }).catch(() => undefined);
-      }, 1_800);
+      }, waitingForImageReview ? 4_000 : 1_800);
       return () => window.clearInterval(timer);
     }
-    if (completedJobRef.current === generationJob.id) return;
-    completedJobRef.current = generationJob.id;
+    const completionKey = `${generationJob.id}:${generationJob.status}:${generationJob.result.moderation_status || "approved"}:${Boolean(generationJob.result.file_available)}`;
+    if (completedJobRef.current === completionKey) return;
+    completedJobRef.current = completionKey;
     setLoading("");
     if (generationJob.status === "succeeded") {
       setGenerationError(null);
       if (generationJob.capability === "text") setTextResult(String(generationJob.result.text || ""));
-      if (generationJob.capability === "image" && generationJob.result.file_available) {
-        void loadJobImage(generationJob.id).catch((error) => message.error(explainError(error)));
+      if (generationJob.capability === "image") {
+        if (generationJob.result.file_available) {
+          void loadJobImage(generationJob.id).catch((error) => message.error(explainError(error)));
+          message.success("图片已通过教师审批，可以预览");
+        } else if (generationJob.result.moderation_status === "rejected") {
+          message.warning("图片未通过教师审批，不能预览");
+        }
+      } else {
+        message.success("文字作品已保存到作品库");
       }
       void onRefresh();
-      message.success(generationJob.capability === "text" ? "文字作品已保存到作品库" : "图片任务已完成");
     } else {
       const tool = generationJob.capability === "image" ? "image" : "text";
       setGenerationError({
@@ -163,7 +177,7 @@ export function StudentWorkspace({
         mode: values.mode || "general",
         save_project: true,
       });
-      completedJobRef.current = null;
+      completedJobRef.current = "";
       setGenerationJob(res.data.job);
       message.info("文字任务已提交，离开页面后仍会继续执行");
     } catch (error) {
@@ -176,6 +190,8 @@ export function StudentWorkspace({
   const runImage = async (values: { prompt: string; style: string; size: string }) => {
     setLoading("image");
     setGenerationError(null);
+    if (imageResultObjectUrlRef.current) URL.revokeObjectURL(imageResultObjectUrlRef.current);
+    imageResultObjectUrlRef.current = "";
     setImageResultUrl("");
     try {
       const res = await api.post("/api/ai/jobs", {
@@ -187,7 +203,7 @@ export function StudentWorkspace({
         source_image_path: imageInput?.file_path || null,
         save_project: true,
       });
-      completedJobRef.current = null;
+      completedJobRef.current = "";
       setGenerationJob(res.data.job);
       message.info("图片任务已提交，离开页面后仍会继续执行");
     } catch (error) {
@@ -237,7 +253,7 @@ export function StudentWorkspace({
       setLoading(generationJob.capability);
       setGenerationError(null);
       void api.post(`/api/ai/jobs/${generationJob.id}/retry`).then((response) => {
-        completedJobRef.current = null;
+        completedJobRef.current = "";
         setGenerationJob(response.data.job);
       }).catch((error) => {
         setLoading("");
@@ -258,6 +274,16 @@ export function StudentWorkspace({
       const response = await api.post(`/api/ai/jobs/${generationJob.id}/cancel`);
       setGenerationJob(response.data.job);
       message.info("已请求取消生成任务");
+    } catch (error) {
+      message.error(explainError(error));
+    }
+  };
+
+  const refreshGenerationJob = async () => {
+    if (!generationJob) return;
+    try {
+      const response = await api.get(`/api/ai/jobs/${generationJob.id}`);
+      setGenerationJob(response.data.job);
     } catch (error) {
       message.error(explainError(error));
     }
@@ -570,6 +596,19 @@ export function StudentWorkspace({
                 生成并保存
               </Button>
             </Form>
+            {generationJob?.capability === "image" && generationJob.status === "succeeded" && generationJob.result.moderation_status === "pending" && (
+              <Alert
+                className="mt16"
+                type="info"
+                showIcon
+                message="等待教师审批"
+                description="图片已经生成，教师审批通过后才会在这里显示预览。"
+                action={<Button size="small" icon={<RotateCcw size={14} />} onClick={() => void refreshGenerationJob()}>刷新状态</Button>}
+              />
+            )}
+            {generationJob?.capability === "image" && generationJob.status === "succeeded" && generationJob.result.moderation_status === "rejected" && (
+              <Alert className="mt16" type="error" showIcon message="图片未通过教师审批" description={generationJob.result.moderation_reason || "请调整描述后重新生成。"} />
+            )}
             {imageResultUrl && <img className="generatedImage" src={imageResultUrl} alt="AI生成结果" />}
           </Card>
         </Col>

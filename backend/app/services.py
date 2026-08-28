@@ -580,6 +580,50 @@ async def moderate_image_output(
     return {**result, **moderation}
 
 
+def require_student_image_teacher_review(
+    db: Session,
+    prompt: str,
+    result: dict[str, Any],
+    user_id: int,
+) -> dict[str, Any]:
+    """Keep automatic rejection, but require a teacher to release student images."""
+    status = str(result.get("moderation_status") or "pending")
+    if status == "rejected":
+        return result
+
+    mandatory_reason = "学生生成图片须经教师审批后方可预览。"
+    existing_reason = str(result.get("moderation_reason") or "").strip()
+    reason = mandatory_reason if status == "approved" or not existing_reason else f"{existing_reason} {mandatory_reason}"
+    log_id = int(result.get("moderation_log_id") or 0)
+    log = db.get(ModerationLog, log_id) if log_id else None
+    if log:
+        log.user_id = user_id
+        log.owner_teacher_id = resolve_owner_teacher_id(db, user_id)
+        log.classroom_id = resolve_classroom_id(db, user_id)
+        log.status = "pending"
+        log.passed = False
+        log.reason = reason
+        log.review_note = ""
+        log.reviewed_at = None
+        db.commit()
+        db.refresh(log)
+        moderation = {
+            "moderation_status": "pending",
+            "moderation_reason": reason,
+            "moderation_log_id": log.id,
+        }
+    else:
+        moderation = _record_image_moderation(
+            db,
+            prompt,
+            str(result.get("file_path") or result.get("url") or ""),
+            "pending",
+            reason,
+            user_id=user_id,
+        )
+    return {**result, **moderation}
+
+
 def age_generation_policy(age_level: str) -> dict[str, Any]:
     normalized = age_level if age_level in {*SCHOOL_STAGES, "mixed"} else normalize_school_stage(age_level)
     policies = {
@@ -681,6 +725,8 @@ def save_project(
         owner_teacher_id=resolve_owner_teacher_id(db, student.id if student else None, owner_teacher_id),
         title=title[:160],
         project_type=project_type,
+        project_category="ai_generated",
+        workspace_is_primary=False,
         summary=summary,
         file_path=file_path,
         user_id=student.id if student else None,
@@ -2217,6 +2263,8 @@ def to_project_dict(project: Project, latest_submitted_at: datetime | None = Non
         "owner_teacher_id": project.owner_teacher_id,
         "title": project.title,
         "project_type": project.project_type,
+        "project_category": project.project_category,
+        "workspace_is_primary": project.workspace_is_primary,
         "user_id": project.user_id,
         "curriculum_course_id": project.curriculum_course_id,
         "student_archived": bool(project.user and project.user.archived_at),

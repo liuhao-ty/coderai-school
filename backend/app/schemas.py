@@ -277,6 +277,10 @@ class StudentCourseWorkspaceSaveRequest(BaseModel):
     answers: dict[str, str | list[str]] | None = None
 
 
+class StudentCourseWorkspaceSaveAsRequest(StudentCourseWorkspaceSaveRequest):
+    title: str = Field(min_length=1, max_length=160)
+
+
 class CourseScheduleItemRequest(BaseModel):
     course_id: int = Field(ge=1)
     target_type: Literal["student", "classroom"]

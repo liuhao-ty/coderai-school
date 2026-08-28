@@ -112,6 +112,7 @@ def init_db():
         backup_database_before_curriculum_migration()
         backup_database_before_submission_file_migration()
         backup_database_before_agent_submission_migration()
+        backup_database_before_project_category_migration()
         backup_database_before_account_migration()
         Base.metadata.create_all(bind=engine)
         migrate_sqlite_schema()
@@ -232,6 +233,7 @@ def migrate_sqlite_schema():
         ensure_column(conn, "projects", "user_id", "INTEGER")
         ensure_column(conn, "projects", "curriculum_course_id", "INTEGER")
         ensure_column(conn, "projects", "workspace_answers_json", "TEXT DEFAULT '{}'")
+        migrate_project_category_schema(conn)
         ensure_column(conn, "projects", "classroom_id", "INTEGER")
         ensure_column(conn, "projects", "lifecycle_status", "VARCHAR(20) DEFAULT 'active'")
         ensure_column(conn, "projects", "moderation_status", "VARCHAR(20) DEFAULT 'approved'")
@@ -333,11 +335,6 @@ def migrate_sqlite_schema():
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_target_student_id ON tasks(target_student_id)"))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_tasks_course_schedule_id ON tasks(course_schedule_id) WHERE course_schedule_id IS NOT NULL"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_projects_curriculum_course_id ON projects(curriculum_course_id)"))
-        conn.execute(text(
-            "CREATE UNIQUE INDEX IF NOT EXISTS ux_projects_org_student_curriculum_course "
-            "ON projects(organization_id, user_id, curriculum_course_id) "
-            "WHERE user_id IS NOT NULL AND curriculum_course_id IS NOT NULL"
-        ))
         for table_name in (
             "classrooms", "courses", "lessons", "tasks", "projects", "task_submissions",
             "feedback_templates", "assets", "workflows", "workflow_runs", "video_tasks",
@@ -544,6 +541,40 @@ def ensure_column(conn, table_name: str, column_name: str, column_sql: str):
     columns = [row[1] for row in conn.execute(text(f"PRAGMA table_info({table_name})")).fetchall()]
     if column_name not in columns:
         conn.exec_driver_sql(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}")
+
+
+def migrate_project_category_schema(conn) -> None:
+    columns = {row[1] for row in conn.execute(text("PRAGMA table_info(projects)")).fetchall()}
+    category_added = "project_category" not in columns
+    primary_added = "workspace_is_primary" not in columns
+    ensure_column(conn, "projects", "project_category", "VARCHAR(30) NOT NULL DEFAULT 'ai_generated'")
+    ensure_column(conn, "projects", "workspace_is_primary", "BOOLEAN NOT NULL DEFAULT 0")
+    if category_added or primary_added:
+        conn.execute(text(
+            "UPDATE projects SET project_category = CASE "
+            "WHEN curriculum_course_id IS NOT NULL THEN 'course_workspace' "
+            "ELSE 'ai_generated' END"
+        ))
+        conn.execute(text(
+            "UPDATE projects SET workspace_is_primary = CASE "
+            "WHEN curriculum_course_id IS NOT NULL THEN 1 ELSE 0 END"
+        ))
+    conn.execute(text(
+        "UPDATE projects SET project_category = 'ai_generated' "
+        "WHERE project_category IS NULL OR project_category NOT IN ('course_workspace', 'ai_generated')"
+    ))
+    conn.execute(text(
+        "UPDATE projects SET workspace_is_primary = 0 WHERE workspace_is_primary IS NULL"
+    ))
+    conn.execute(text("DROP INDEX IF EXISTS ux_projects_org_student_curriculum_course"))
+    conn.execute(text(
+        "CREATE UNIQUE INDEX ux_projects_org_student_curriculum_course "
+        "ON projects(organization_id, user_id, curriculum_course_id) "
+        "WHERE workspace_is_primary = 1 AND user_id IS NOT NULL AND curriculum_course_id IS NOT NULL"
+    ))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS ix_projects_project_category ON projects(project_category)"
+    ))
 
 
 def migrate_submission_file_schema(conn) -> None:
@@ -755,6 +786,41 @@ def backup_database_before_agent_submission_migration() -> None:
             return
         submission_columns = {row[1] for row in source.execute("PRAGMA table_info(task_submissions)").fetchall()}
         if "source_type" in submission_columns and "agent_conversations" in tables:
+            return
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        destination = sqlite3.connect(backup_path)
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+    finally:
+        source.close()
+
+
+def backup_database_before_project_category_migration() -> None:
+    if not IS_SQLITE or not DB_PATH.is_file() or DB_PATH.stat().st_size == 0:
+        return
+    backup_dir = DATA_DIR / "migration-backups"
+    backup_path = backup_dir / "coderai-before-project-categories.db"
+    if backup_path.exists():
+        return
+    source = sqlite3.connect(DB_PATH)
+    try:
+        table_exists = source.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'projects'"
+        ).fetchone()
+        if not table_exists:
+            return
+        columns = {row[1] for row in source.execute("PRAGMA table_info(projects)").fetchall()}
+        index_sql_row = source.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'ux_projects_org_student_curriculum_course'"
+        ).fetchone()
+        index_sql = str(index_sql_row[0] or "").lower() if index_sql_row else ""
+        if {
+            "project_category",
+            "workspace_is_primary",
+        }.issubset(columns) and "workspace_is_primary = 1" in index_sql:
             return
         backup_dir.mkdir(parents=True, exist_ok=True)
         destination = sqlite3.connect(backup_path)

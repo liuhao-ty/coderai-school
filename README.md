@@ -1,6 +1,6 @@
 # CoderAI 学堂
 
-CoderAI 学堂是面向少儿 AI 课程学习的 Windows 桌面应用。当前开发版本为 Windows 客户端 `0.2.0-beta.7`、云端 API `0.2.0-beta.5`：中国大陆单机构、免费封闭内测、最多 50 人同时在线、必须联网。
+CoderAI 学堂是面向少儿 AI 课程学习的 Windows 桌面应用。当前开发版本为 Windows 客户端 `0.2.0-beta.8`、云端 API `0.2.0-beta.6`：中国大陆单机构、免费封闭内测、最多 50 人同时在线、必须联网。
 
 ## 当前状态
 
@@ -9,8 +9,8 @@ CoderAI 学堂是面向少儿 AI 课程学习的 Windows 桌面应用。当前�
 - 云端 API：FastAPI、PostgreSQL、Alembic、Redis、Celery
 - 文件：S3 兼容对象存储，客户端只通过鉴权接口访问
 - 部署：Docker Compose、Caddy、Prometheus、Alertmanager、独立备份任务
-- Windows 客户端发布版：`0.2.0-beta.7`
-- 云端 API 开发版：`0.2.0-beta.5`
+- Windows 客户端目标版：`0.2.0-beta.8`
+- 云端 API 目标版：`0.2.0-beta.6`
 
 云端生产客户端不会启动本地 FastAPI，也不会在学生电脑保存业务 SQLite。SQLite 和本地文件模式仅用于开发、自动化测试及一次性历史迁移。
 

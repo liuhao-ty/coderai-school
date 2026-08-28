@@ -9,6 +9,7 @@ from typing import Any
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -44,6 +45,7 @@ from backend.app.services import (
     generate_video_task,
     json_dumps,
     project_title_from_prompt,
+    require_student_image_teacher_review,
     run_moderation,
     save_project,
 )
@@ -143,13 +145,35 @@ def _owned_ai_input(student: User, reference: str | None) -> str | None:
     return str(candidate)
 
 
-def _job_payload(job: AIGenerationJob) -> dict[str, Any]:
+def _job_payload(job: AIGenerationJob, db: Session | None = None) -> dict[str, Any]:
     result = _json_object(job.result_json)
     result.pop("file_path", None)
     result.pop("provider_url", None)
-    result["file_available"] = bool(job.project and job.project.file_path and object_exists(job.project.file_path)) or bool(
+    moderation_status = str(result.get("moderation_status") or "approved")
+    moderation_reason = str(result.get("moderation_reason") or "")
+    if job.capability == "image":
+        if job.project:
+            moderation_status = job.project.moderation_status
+            moderation_reason = job.project.moderation_reason
+        elif db and result.get("moderation_log_id"):
+            log = db.get(ModerationLog, int(result["moderation_log_id"]))
+            if log:
+                moderation_status = log.status
+                moderation_reason = log.review_note or log.reason
+        result["moderation_status"] = moderation_status
+        result["moderation_reason"] = moderation_reason
+    project_file_available = bool(
+        job.project
+        and job.project.file_path
+        and moderation_status == "approved"
+        and object_exists(job.project.file_path)
+    )
+    result["file_available"] = project_file_available or bool(
         job.conversation_id
-        and any(item.file_path and object_exists(item.file_path) for item in getattr(job, "artifacts", []))
+        and any(
+            item.status == "available" and item.file_path and object_exists(item.file_path)
+            for item in getattr(job, "artifacts", [])
+        )
     )
     return {
         "id": job.id,
@@ -432,6 +456,12 @@ async def execute_ai_generation_job(
                     image_result = terminal.get("output")
                     if terminal.get("status") != "success" or terminal.get("type") != "image.generate" or not isinstance(image_result, dict):
                         continue
+                    image_result = require_student_image_teacher_review(
+                        db,
+                        str(request.get("prompt") or ""),
+                        image_result,
+                        student.id,
+                    )
                     reference, size, media_type = await _managed_image_reference(image_result, student.id, job.id)
                     artifact = _artifact_for_image(
                         db,
@@ -476,6 +506,7 @@ async def execute_ai_generation_job(
                 else:
                     tool_prompt = str(request.get("prompt") or "")
                     image_result = await generate_image(db, tool_prompt, "明亮课堂插画", "1024x1024", user_id=student.id)
+                    image_result = require_student_image_teacher_review(db, tool_prompt, image_result, student.id)
                     reference, size, media_type = await _managed_image_reference(image_result, student.id, job.id)
                     artifact = _artifact_for_image(
                         db,
@@ -509,15 +540,17 @@ async def execute_ai_generation_job(
                     job.project_id = project.id
                 job.result_json = json_dumps({"text": generated, "project_id": project.id if project else None})
             elif job.capability == "image":
+                image_prompt = str(request.get("prompt") or "")
                 image_result = await generate_image(
                     db,
-                    str(request.get("prompt") or ""),
+                    image_prompt,
                     str(request.get("style") or "classroom-friendly"),
                     str(request.get("size") or "1024x1024"),
                     str(request.get("source_image_path") or "") or None,
                     user_id=student.id,
                     provider_id=job.provider_id,
                 )
+                image_result = require_student_image_teacher_review(db, image_prompt, image_result, student.id)
                 reference, _, _ = await _managed_image_reference(image_result, student.id, 0)
                 project = None
                 if bool(request.get("save_project", True)):
@@ -543,6 +576,7 @@ async def execute_ai_generation_job(
                     "file_path": reference,
                     "moderation_status": str(image_result.get("moderation_status") or "pending"),
                     "moderation_reason": str(image_result.get("moderation_reason") or ""),
+                    "moderation_log_id": image_result.get("moderation_log_id"),
                 })
             else:
                 raise HTTPException(status_code=400, detail={"code": "AI_JOB_CAPABILITY_INVALID", "message": "不支持的 AI 任务类型。"})
@@ -690,13 +724,13 @@ def create_ai_job(
         provider_id=provider_id,
     )
     queue_backend = enqueue_ai_generation(background_tasks, job.id, db.get_bind()) if created else "existing"
-    return {"job": _job_payload(job), "queue_backend": queue_backend}
+    return {"job": _job_payload(job, db), "queue_backend": queue_backend}
 
 
 @router.get("/ai/jobs")
 def list_ai_jobs(student: User = Depends(require_student_account), db: Session = Depends(get_db)):
     rows = db.query(AIGenerationJob).filter(AIGenerationJob.user_id == student.id).order_by(AIGenerationJob.created_at.desc()).limit(100).all()
-    return {"jobs": [_job_payload(item) for item in rows]}
+    return {"jobs": [_job_payload(item, db) for item in rows]}
 
 
 @router.get("/ai/jobs/{job_id}")
@@ -704,7 +738,7 @@ def get_ai_job(job_id: int, student: User = Depends(require_student_account), db
     job = db.query(AIGenerationJob).filter(AIGenerationJob.id == job_id, AIGenerationJob.user_id == student.id).first()
     if not job:
         raise HTTPException(status_code=404, detail={"code": "AI_JOB_NOT_FOUND", "message": "AI 任务不存在。"})
-    return {"job": _job_payload(job)}
+    return {"job": _job_payload(job, db)}
 
 
 @router.get("/ai/jobs/{job_id}/file")
@@ -712,6 +746,22 @@ def get_ai_job_file(job_id: int, student: User = Depends(require_student_account
     job = db.query(AIGenerationJob).filter(AIGenerationJob.id == job_id, AIGenerationJob.user_id == student.id).first()
     if not job:
         raise HTTPException(status_code=404, detail={"code": "AI_JOB_NOT_FOUND", "message": "AI 任务不存在。"})
+    if job.capability == "image":
+        result = _json_object(job.result_json)
+        moderation_status = job.project.moderation_status if job.project else str(result.get("moderation_status") or "pending")
+        if not job.project and result.get("moderation_log_id"):
+            log = db.get(ModerationLog, int(result["moderation_log_id"]))
+            moderation_status = log.status if log else moderation_status
+        if moderation_status == "pending":
+            raise HTTPException(
+                status_code=423,
+                detail={"code": "AI_IMAGE_REVIEW_PENDING", "message": "图片正在等待教师审批，审批通过后才能预览。"},
+            )
+        if moderation_status != "approved":
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "AI_IMAGE_REVIEW_REJECTED", "message": "图片未通过教师审批，不能预览。"},
+            )
     reference = str(_json_object(job.result_json).get("file_path") or "")
     if not reference and job.project:
         reference = job.project.file_path
@@ -742,7 +792,7 @@ def cancel_ai_job(job_id: int, student: User = Depends(require_student_account),
             job.completed_at = now()
         db.commit()
         db.refresh(job)
-    return {"job": _job_payload(job)}
+    return {"job": _job_payload(job, db)}
 
 
 @router.post("/ai/jobs/{job_id}/retry")
@@ -771,7 +821,7 @@ def retry_ai_job(
             assistant.content = ""
     db.commit()
     queue_backend = enqueue_ai_generation(background_tasks, job.id, db.get_bind())
-    return {"job": _job_payload(job), "queue_backend": queue_backend}
+    return {"job": _job_payload(job, db), "queue_backend": queue_backend}
 
 
 def _require_conversation(db: Session, conversation_id: int, student: User) -> AgentConversation:
@@ -871,8 +921,13 @@ def create_agent_message(
             or _json_object(existing.request_json).get("content") != payload.content
         ):
             raise HTTPException(status_code=409, detail={"code": "AI_JOB_IDEMPOTENCY_CONFLICT", "message": "请求编号已用于另一条消息。"})
-        return {"job": _job_payload(existing), "queue_backend": "existing"}
-    next_sequence = (db.query(AgentMessage.sequence).filter(AgentMessage.conversation_id == conversation.id).order_by(AgentMessage.sequence.desc()).scalar() or 0) + 1
+        return {"job": _job_payload(existing, db), "queue_backend": "existing"}
+    next_sequence = (
+        db.query(func.max(AgentMessage.sequence))
+        .filter(AgentMessage.conversation_id == conversation.id)
+        .scalar()
+        or 0
+    ) + 1
     user_message = AgentMessage(
         conversation_id=conversation.id,
         user_id=student.id,
@@ -905,7 +960,7 @@ def create_agent_message(
         assistant_message_id=assistant.id,
     )
     queue_backend = enqueue_ai_generation(background_tasks, job.id, db.get_bind())
-    return {"job": _job_payload(job), "user_message": _message_payload(user_message), "assistant_message": _message_payload(assistant), "queue_backend": queue_backend}
+    return {"job": _job_payload(job, db), "user_message": _message_payload(user_message), "assistant_message": _message_payload(assistant), "queue_backend": queue_backend}
 
 
 @router.post("/agent/conversations/{conversation_id}/tools")
@@ -938,7 +993,7 @@ def run_agent_tool(
         conversation_id=conversation.id,
     )
     queue_backend = enqueue_ai_generation(background_tasks, job.id, db.get_bind()) if created else "existing"
-    return {"job": _job_payload(job), "queue_backend": queue_backend}
+    return {"job": _job_payload(job, db), "queue_backend": queue_backend}
 
 
 @router.get("/agent/artifacts/{artifact_id}/file")

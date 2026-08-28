@@ -9,8 +9,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class PublicIpDeploymentConfigTests(unittest.TestCase):
     def test_release_versions_are_synchronized(self):
-        client_version = "0.2.0-beta.7"
-        api_version = "0.2.0-beta.5"
+        client_version = "0.2.0-beta.8"
+        api_version = "0.2.0-beta.6"
         package = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
         package_lock = json.loads((ROOT / "package-lock.json").read_text(encoding="utf-8"))
         tauri = json.loads((ROOT / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8"))

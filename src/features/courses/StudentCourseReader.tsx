@@ -1,5 +1,5 @@
-import { Alert, App, Button, Checkbox, Collapse, Drawer, Empty, Input, List, Pagination, Radio, Segmented, Select, Space, Tag, Typography, Upload } from "antd";
-import { BookOpen, CheckCircle2, Clock3, Download, Edit3, Eye, FileText, FileUp, Save, Send } from "lucide-react";
+import { Alert, App, Button, Checkbox, Collapse, Drawer, Empty, Input, List, Modal, Pagination, Radio, Segmented, Select, Space, Tag, Typography, Upload } from "antd";
+import { BookOpen, CheckCircle2, Clock3, Copy, Download, Edit3, Eye, FileText, FileUp, Save, Send } from "lucide-react";
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -144,6 +144,8 @@ export function StudentCourseReader({
   const [workspaceUpdatedAt, setWorkspaceUpdatedAt] = useState<string | null>(null);
   const [workspaceLoading, setWorkspaceLoading] = useState(false);
   const [workspaceError, setWorkspaceError] = useState("");
+  const [saveAsOpen, setSaveAsOpen] = useState(false);
+  const [saveAsTitle, setSaveAsTitle] = useState("");
   const [busy, setBusy] = useState("");
   const [submissionVersions, setSubmissionVersions] = useState<SubmissionVersion[]>([]);
   const [submissionVersionsLoading, setSubmissionVersionsLoading] = useState(false);
@@ -190,6 +192,8 @@ export function StudentCourseReader({
     setWorkspaceProjectId(null);
     setWorkspaceUpdatedAt(null);
     setWorkspaceError("");
+    setSaveAsOpen(false);
+    setSaveAsTitle("");
     setSubmissionSource("library");
     setLocalSubmissionFile(null);
     setLocalSubmissionTitle("");
@@ -223,6 +227,8 @@ export function StudentCourseReader({
     setWorkspaceProjectId(null);
     setWorkspaceUpdatedAt(null);
     setWorkspaceError("");
+    setSaveAsOpen(false);
+    setSaveAsTitle("");
   };
 
   const requestWorkspaceClose = () => {
@@ -268,21 +274,24 @@ export function StudentCourseReader({
     }
   };
 
+  const currentWorkspaceAnswers = () => {
+    const currentFieldIds = new Set(
+      [...workspaceText.matchAll(/\{\{field\b[^{}]*\}\}/g)]
+        .map((match) => match[0].match(/\bid\s*=\s*"([^"]+)"/)?.[1])
+        .filter((fieldId): fieldId is string => Boolean(fieldId)),
+    );
+    return Object.fromEntries(
+      Object.entries(workspaceAnswers).filter(([fieldId]) => currentFieldIds.has(fieldId)),
+    );
+  };
+
   const saveWorkspace = async () => {
     if (!selectedCourse) return;
     setBusy("workspace-save");
     try {
-      const currentFieldIds = new Set(
-        [...workspaceText.matchAll(/\{\{field\b[^{}]*\}\}/g)]
-          .map((match) => match[0].match(/\bid\s*=\s*"([^"]+)"/)?.[1])
-          .filter((fieldId): fieldId is string => Boolean(fieldId)),
-      );
-      const currentAnswers = Object.fromEntries(
-        Object.entries(workspaceAnswers).filter(([fieldId]) => currentFieldIds.has(fieldId)),
-      );
       const response = await api.put<{ workspace: CourseWorkspace }>(
         `/api/curriculum-courses/${selectedCourse.id}/workspace`,
-        { content_markdown: workspaceText, answers: currentAnswers },
+        { content_markdown: workspaceText, answers: currentWorkspaceAnswers() },
       );
       const workspace = response.data.workspace;
       setWorkspaceText(workspace.content_markdown);
@@ -295,6 +304,32 @@ export function StudentCourseReader({
       setWorkspaceUpdatedAt(workspace.updated_at ?? null);
       if (workspace.project_id) setSelectedProjectId(workspace.project_id);
       message.success("工程包已保存到我的作品");
+      await onRefresh();
+    } catch (error) {
+      message.error(explainError(error));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const openSaveAs = () => {
+    if (!selectedCourse) return;
+    setSaveAsTitle(`${selectedCourse.title} - 工程包副本`.slice(0, 160));
+    setSaveAsOpen(true);
+  };
+
+  const saveWorkspaceAsCopy = async () => {
+    if (!selectedCourse || !saveAsTitle.trim()) return;
+    setBusy("workspace-save-as");
+    try {
+      await api.post(`/api/curriculum-courses/${selectedCourse.id}/workspace/save-as`, {
+        title: saveAsTitle.trim(),
+        content_markdown: workspaceText,
+        answers: currentWorkspaceAnswers(),
+      });
+      setSaveAsOpen(false);
+      setSaveAsTitle("");
+      message.success("已另存为新的工程包副本");
       await onRefresh();
     } catch (error) {
       message.error(explainError(error));
@@ -679,15 +714,24 @@ export function StudentCourseReader({
         onClose={requestWorkspaceClose}
         width={900}
         extra={(
-          <Button
-            type="primary"
-            icon={<Save size={15} />}
-            disabled={workspaceLoading || Boolean(workspaceError) || !workspaceDirty}
-            loading={busy === "workspace-save"}
-            onClick={() => void saveWorkspace()}
-          >
-            保存
-          </Button>
+          <Space wrap>
+            <Button
+              icon={<Copy size={15} />}
+              disabled={workspaceLoading || Boolean(workspaceError) || Boolean(busy)}
+              onClick={openSaveAs}
+            >
+              另存为
+            </Button>
+            <Button
+              type="primary"
+              icon={<Save size={15} />}
+              disabled={workspaceLoading || Boolean(workspaceError) || !workspaceDirty}
+              loading={busy === "workspace-save"}
+              onClick={() => void saveWorkspace()}
+            >
+              保存
+            </Button>
+          </Space>
         )}
       >
         {workspaceLoading && <Alert type="info" showIcon message="正在加载工程包" />}
@@ -741,6 +785,34 @@ export function StudentCourseReader({
           </Space>
         )}
       </Drawer>
+      <Modal
+        title="另存为工程包副本"
+        open={saveAsOpen}
+        okText="保存副本"
+        cancelText="取消"
+        confirmLoading={busy === "workspace-save-as"}
+        okButtonProps={{ disabled: !saveAsTitle.trim() }}
+        onOk={() => void saveWorkspaceAsCopy()}
+        onCancel={() => {
+          if (busy !== "workspace-save-as") setSaveAsOpen(false);
+        }}
+      >
+        <Space direction="vertical" size={8} className="fullWidth">
+          <Text type="secondary">副本会保存到作品库，不会替换当前课程的主工程包。</Text>
+          <Input
+            autoFocus
+            maxLength={160}
+            showCount
+            aria-label="工程包副本名称"
+            value={saveAsTitle}
+            placeholder="输入副本名称"
+            onChange={(event) => setSaveAsTitle(event.target.value)}
+            onPressEnter={() => {
+              if (saveAsTitle.trim() && busy !== "workspace-save-as") void saveWorkspaceAsCopy();
+            }}
+          />
+        </Space>
+      </Modal>
     </div>
   );
 }

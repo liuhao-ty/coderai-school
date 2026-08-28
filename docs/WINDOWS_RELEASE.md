@@ -1,6 +1,6 @@
 # Windows 桌面签名发布
 
-适用版本：`0.2.0-beta.7`
+适用版本：`0.2.0-beta.8`
 
 ## 发布产物
 
@@ -99,8 +99,8 @@ Secrets：
 3. 从审核后的发布提交创建标签：
 
 ```powershell
-git tag -s v0.2.0-beta.7 -m "CoderAI 学堂 0.2.0-beta.7"
-git push origin v0.2.0-beta.7
+git tag -s v0.2.0-beta.8 -m "CoderAI 学堂 0.2.0-beta.8"
+git push origin v0.2.0-beta.8
 ```
 
 4. `release-windows.yml` 导入 PFX，构建签名 NSIS 和 Tauri 更新产物。
@@ -152,11 +152,11 @@ Get-AuthenticodeSignature .\CoderAI*.exe | Format-List Status,StatusMessage,Sign
 
 ## 客户端回滚
 
-Tauri 更新不应通过降低版本号回滚。若 `0.2.0-beta.7` 客户端有严重问题：
+Tauri 更新不应通过降低版本号回滚。若 `0.2.0-beta.8` 客户端有严重问题：
 
 1. 立即停止更新清单下发。
 2. 从已知良好的回滚提交修复或还原代码。
-3. 使用更高版本号（例如 `0.2.0-beta.8`）重新签名发布。
+3. 使用更高版本号重新签名发布。
 4. 必要时向灰度用户提供上一稳定安装包的人工卸载重装流程。
 5. 数据库/接口不兼容时先执行服务端回滚评估，不能只替换客户端。
 

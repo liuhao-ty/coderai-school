@@ -1,7 +1,7 @@
 # CoderAI 学堂架构
 
-更新时间：2026-08-26（北京时间）
-目标版本：Windows 客户端 `0.2.0-beta.7`，云端 API `0.2.0-beta.5`
+更新时间：2026-08-28（北京时间）
+目标版本：Windows 客户端 `0.2.0-beta.8`，云端 API `0.2.0-beta.6`
 
 ## 1. 部署边界
 
@@ -77,10 +77,11 @@ Operations: Prometheus + Alertmanager + independent backup storage
 
 - SQLAlchemy 2 定义模型
 - Alembic 管理云端结构，入口为 `alembic.ini`
-- `backend/migrations/versions/20260720_0001_cloud_schema.py` 是首个云端基线，`20260726_0002_student_course_projects.py` 增加学生工程包作品关联，`20260727_0003_workspace_answers.py` 增加问卷式工程包答案存储，`20260815_0004_submission_files_concurrency.py` 增加提交规则和并发唯一键，`20260823_0005_submission_attachments.py` 增加独立附件及版本快照，`20260823_0006_agent_generation.py` 增加 Agent、异步任务和视频任务关联
+- `backend/migrations/versions/20260720_0001_cloud_schema.py` 是首个云端基线，`20260726_0002_student_course_projects.py` 增加学生工程包作品关联，`20260727_0003_workspace_answers.py` 增加问卷式工程包答案存储，`20260815_0004_submission_files_concurrency.py` 增加提交规则和并发唯一键，`20260823_0005_submission_attachments.py` 增加独立附件及版本快照，`20260823_0006_agent_generation.py` 增加 Agent、异步任务和视频任务关联，`20260826_0007_project_categories.py` 增加作品来源分类及工程包副本约束
 - 云端 `CODERAI_AUTO_CREATE_SCHEMA=false`，容器启动前执行 `alembic upgrade head`
 - SQLite 幂等兼容迁移只服务本地开发和历史数据读取；提交迁移会先生成独立快照，再合并历史重复提交并重新编号版本
 - `task_submissions` 以“机构 + 任务 + 学生”唯一，`submission_versions` 以“机构 + 提交 + 版本号”唯一；PostgreSQL 写入使用事务级 advisory lock 串行化同一学生对同一任务的并发提交
+- `projects.project_category` 区分课程工程包和 AI 生成内容；每名学生每门课程仅允许一个 `workspace_is_primary=true` 的主工程包，另存副本保留课程来源但不参与主工程包唯一约束
 
 ### 对象存储
 
@@ -109,7 +110,9 @@ Operations: Prometheus + Alertmanager + independent backup storage
 - MiniMax 视频生成由内置受信任适配器处理任务提交、查询和结果保存，不再以 `planned` 占位
 - 即梦通过火山方舟 Seedance 异步任务协议提交和查询，成品先写入机构对象存储，再通过鉴权接口预览
 - `AgentConversation`、`AgentMessage` 和滚动摘要只在单个会话内形成记忆；模型显式选择受管理员白名单控制，工具建议必须由学生确认且再次经过课堂工具权限校验
+- Agent 消息序号按会话内最大序号递增，连续多轮消息保持唯一顺序并将已完成历史继续注入当前会话上下文
 - Agent 对话文字不进入作品库；临时图片和视频默认保留 7 天，学生确认“保存到我的作品”后才创建正式作品
+- 学生生成图片保留自动拒绝能力，但自动通过不等于学生可见；图片、Agent 图片工具和 Agent 工作流图片统一进入教师审批，任务文件接口以作品或审核记录的当前状态再次校验
 - 可安装插件 v1 只运行签名后的声明式文字工具，不执行第三方 Python、JavaScript、EXE 或安装脚本；新模型和视频协议必须实现受信任后端适配器，详见 `docs/PLUGIN_PROTOCOL.md`
 
 ## 7. 课程与作品
@@ -122,6 +125,7 @@ Operations: Prometheus + Alertmanager + independent backup storage
 - 管理员为每门课程配置允许提交的扩展名和 1 至 20 MB 单文件上限；学生可以选择本机文件，服务端流式写入临时文件并校验扩展名、文件头、UTF-8 文本和 ZIP 结构后转入受管对象存储
 - 本机文件直接创建 `SubmissionAttachment` 并关联提交版本，不创建 `Project`、不进入学生或教师作品库；图片附件继续进入内容安全复核
 - 提交版本固化标题、Markdown、文件引用和元数据、逾期状态、评分及反馈；历史页和鉴权文件接口不读取作品当前内容替代快照
+- 提交版本文件统一通过受鉴权 Blob 读取，支持图片、视频、PDF、Markdown 和文本在线预览，其余类型只提供原生下载；教师批改列表按提交懒加载折叠历史，附件提交不再尝试访问空的作品 ID
 - 普通项目响应不返回本地路径或对象存储键，学生通过鉴权项目文件接口查看或下载已保存文件
 - 课程包授权与作者相互独立，作者可选教师或管理员
 - 排课以课程为原子，支持学员和班级目标；已有提交保存评分规则快照

@@ -1268,6 +1268,12 @@ textarea {
   border-color: var(--line);
 }
 
+.submissionHistoryPreview {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+
 .submissionVersionTitle {
   display: flex;
   align-items: flex-start;
@@ -1280,6 +1286,28 @@ textarea {
   background: #fff;
   border: 1px solid var(--line);
   border-radius: 8px;
+}
+
+.submissionVersionFilePreview {
+  min-width: 0;
+}
+
+.submissionMarkdownFilePreview,
+.submissionPlainTextPreview {
+  max-height: min(58vh, 620px);
+  overflow: auto;
+}
+
+.submissionPlainTextPreview {
+  margin: 0;
+  padding: 16px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: Consolas, "Microsoft YaHei", monospace;
+  line-height: 1.65;
+  background: #f7f9fc;
+  border: 1px solid var(--line);
+  border-radius: 6px;
 }
 
 .submissionPdfPreview,
@@ -2853,12 +2881,27 @@ body {
 .projectScopeSwitcher {
   width: min(420px, 100%);
   padding: 3px;
-  margin-bottom: 16px;
   background: #fff;
   border: 1px solid var(--line);
 }
 
-.projectScopeSwitcher .ant-segmented-item-label {
+.projectLibrarySwitchers {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.projectCategorySwitcher {
+  width: min(330px, 100%);
+  padding: 3px;
+  background: #fff;
+  border: 1px solid var(--line);
+}
+
+.projectScopeSwitcher .ant-segmented-item-label,
+.projectCategorySwitcher .ant-segmented-item-label {
   min-height: 30px;
   line-height: 30px;
 }

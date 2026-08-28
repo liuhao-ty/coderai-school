@@ -205,7 +205,7 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
     async def test_version_reports_deployment_mode(self):
         response = await self.client.get("/api/version")
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["version"], "0.2.0-beta.5")
+        self.assertEqual(response.json()["version"], "0.2.0-beta.6")
         self.assertEqual(response.json()["deployment_mode"], "cloud" if CLOUD_MODE else "local")
 
     def _configure_minimax_video_provider(self):
@@ -2051,6 +2051,8 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(routed.status_code, 200, routed.text)
 
+        agent_prompts: list[str] = []
+
         class FakeClient:
             def __init__(self, *args, **kwargs):
                 pass
@@ -2063,6 +2065,8 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
 
             async def post(self, url, **kwargs):
                 prompt = kwargs["json"]["messages"][-1]["content"]
+                if "最近对话" in prompt:
+                    agent_prompts.append(prompt)
                 content = (
                     "Agent私密回复。[[TOOL:image|画一个课堂机器人]]"
                     if "最近对话" in prompt
@@ -2125,6 +2129,26 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
         detail = await self.client.get(f"/api/agent/conversations/{conversation_id}", headers=self.student_a_headers)
         self.assertEqual([item["role"] for item in detail.json()["messages"]], ["user", "assistant"])
         self.assertEqual(detail.json()["messages"][1]["tool_suggestion"]["capability"], "image")
+        with patch("backend.app.services.httpx.AsyncClient", FakeClient):
+            second_reply = await self.client.post(
+                f"/api/agent/conversations/{conversation_id}/messages",
+                headers=self.student_a_headers,
+                json={"content": "继续细化第二步", "client_request_id": "agent-msg-0002"},
+            )
+        self.assertEqual(second_reply.status_code, 200, second_reply.text)
+        completed_second_reply = await self.client.get(
+            f"/api/ai/jobs/{second_reply.json()['job']['id']}",
+            headers=self.student_a_headers,
+        )
+        self.assertEqual(completed_second_reply.json()["job"]["status"], "succeeded")
+        second_detail = await self.client.get(f"/api/agent/conversations/{conversation_id}", headers=self.student_a_headers)
+        self.assertEqual(
+            [item["role"] for item in second_detail.json()["messages"]],
+            ["user", "assistant", "user", "assistant"],
+        )
+        self.assertEqual([item["sequence"] for item in second_detail.json()["messages"]], [1, 2, 3, 4])
+        self.assertIn("帮我规划机器人作品", agent_prompts[-1])
+        self.assertIn("Agent私密回复", agent_prompts[-1])
         self.assertEqual(
             (await self.client.get(f"/api/agent/conversations/{conversation_id}", headers=self.student_b_headers)).status_code,
             404,
@@ -2480,7 +2504,7 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
             db.close()
 
     async def test_student_uploads_local_file_as_version_attachment_without_project(self):
-        schedule, _ = await self._create_active_course_schedule(
+        schedule, classroom_id = await self._create_active_course_schedule(
             submission_extensions=[".md", ".png"],
             submission_max_bytes=1024 * 1024,
         )
@@ -2512,13 +2536,26 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(version_detail.status_code, 200, version_detail.text)
             self.assertEqual(version_detail.json()["version"]["file"]["original_file_name"], "homework.md")
             self.assertEqual(version_detail.json()["version"]["file"]["mime_type"], "text/markdown")
-            self.assertEqual(
-                (await self.client.get(
-                    f"/api/submission-versions/{body['version']['id']}",
-                    headers=self.teacher_headers,
-                )).status_code,
-                200,
+            teacher_id, staff_headers = await self._create_staff_teacher("attachment.preview", [classroom_id])
+            assigned = await self.client.put(
+                f"/api/course-packages/{schedule['package_id']}/teachers",
+                headers=self.teacher_headers,
+                json={"teacher_ids": [teacher_id]},
             )
+            self.assertEqual(assigned.status_code, 200, assigned.text)
+            for headers in (self.student_a_headers, staff_headers, self.teacher_headers):
+                inline_preview = await self.client.get(
+                    f"/api/submission-versions/{body['version']['id']}",
+                    headers=headers,
+                )
+                self.assertEqual(inline_preview.status_code, 200, inline_preview.text)
+                file_preview = await self.client.get(
+                    f"/api/submission-versions/{body['version']['id']}/file",
+                    headers=headers,
+                )
+                self.assertEqual(file_preview.status_code, 200, file_preview.text)
+                self.assertEqual(file_preview.content, "# 我的作业\n\n完成。".encode())
+                self.assertNotIn("attachment", file_preview.headers.get("content-disposition", ""))
             downloaded = await self.client.get(
                 f"/api/submission-versions/{body['version']['id']}/file?download=true",
                 headers=self.student_a_headers,
@@ -4100,7 +4137,59 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bypass.status_code, 403)
         self.assertEqual(bypass.json()["detail"]["code"], "PROJECT_TYPE_RESTRICTED")
 
-    async def test_remote_image_url_is_saved_and_video_cancel_is_isolated(self):
+    async def test_async_student_image_requires_teacher_approval_before_preview(self):
+        review_root = Path(self.temp_dir.name) / "async-image-review"
+        review_root.mkdir()
+        image_file = review_root / "generated.png"
+        image_file.write_bytes(b"\x89PNG\r\n\x1a\nasync-review")
+        mocked_image = AsyncMock(return_value={
+            "url": "",
+            "file_path": str(image_file),
+            "moderation_status": "approved",
+            "moderation_reason": "automatic review passed",
+            "moderation_log_id": None,
+        })
+        with (
+            patch("backend.app.learning_agent.generate_image", mocked_image),
+            patch("backend.app.storage.DATA_DIR", review_root),
+        ):
+            submitted = await self.client.post(
+                "/api/ai/jobs",
+                headers=self.student_a_headers,
+                json={
+                    "client_request_id": "image-review-0001",
+                    "capability": "image",
+                    "prompt": "课堂机器人插画",
+                    "style": "明亮卡通",
+                    "size": "1024x1024",
+                    "save_project": True,
+                },
+            )
+            self.assertEqual(submitted.status_code, 200, submitted.text)
+            job_id = submitted.json()["job"]["id"]
+            completed = await self.client.get(f"/api/ai/jobs/{job_id}", headers=self.student_a_headers)
+            self.assertEqual(completed.json()["job"]["status"], "succeeded")
+            self.assertEqual(completed.json()["job"]["result"]["moderation_status"], "pending")
+            self.assertFalse(completed.json()["job"]["result"]["file_available"])
+            locked = await self.client.get(f"/api/ai/jobs/{job_id}/file", headers=self.student_a_headers)
+            self.assertEqual(locked.status_code, 423, locked.text)
+            self.assertEqual(locked.json()["detail"]["code"], "AI_IMAGE_REVIEW_PENDING")
+
+            moderation_log_id = completed.json()["job"]["result"]["moderation_log_id"]
+            approved = await self.client.post(
+                f"/api/moderation/images/{moderation_log_id}/review",
+                headers=self.teacher_headers,
+                json={"status": "approved", "note": "教师确认可展示"},
+            )
+            self.assertEqual(approved.status_code, 200, approved.text)
+            released = await self.client.get(f"/api/ai/jobs/{job_id}", headers=self.student_a_headers)
+            self.assertEqual(released.json()["job"]["result"]["moderation_status"], "approved")
+            self.assertTrue(released.json()["job"]["result"]["file_available"])
+            preview = await self.client.get(f"/api/ai/jobs/{job_id}/file", headers=self.student_a_headers)
+            self.assertEqual(preview.status_code, 200, preview.text)
+            self.assertEqual(preview.content, image_file.read_bytes())
+
+    async def test_remote_image_url_waits_for_review_and_video_cancel_is_isolated(self):
         mocked_image = AsyncMock(return_value={
             "url": "https://example.test/generated.png", "file_path": "", "moderation_status": "approved",
             "moderation_reason": "automatic review passed", "moderation_log_id": None,
@@ -4111,7 +4200,10 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
                 json={"prompt": "robot", "style": "custom", "size": "512x512", "save_project": True},
             )
         self.assertEqual(image_response.status_code, 200)
-        self.assertEqual(image_response.json()["project"]["file_path"], "https://example.test/generated.png")
+        self.assertEqual(image_response.json()["moderation_status"], "pending")
+        self.assertEqual(image_response.json()["file_path"], "")
+        self.assertEqual(image_response.json()["project"]["file_path"], "")
+        self.assertEqual(image_response.json()["project"]["file_status"], "moderation_hidden")
 
         db = self.Session()
         try:
@@ -6336,6 +6428,8 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
             workspace_project = saved_workspace.json()["project"]
             project_id = workspace_project["id"]
             self.assertEqual(workspace_project["curriculum_course_id"], course_id)
+            self.assertEqual(workspace_project["project_category"], "course_workspace")
+            self.assertTrue(workspace_project["workspace_is_primary"])
             self.assertEqual(workspace_project["summary"], first_content)
             self.assertEqual(saved_workspace.json()["workspace"]["project_id"], project_id)
             self.assertTrue(saved_workspace.json()["workspace"]["saved"])
@@ -6357,10 +6451,74 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(updated_workspace.json()["workspace"]["project_id"], project_id)
             self.assertEqual(updated_workspace.json()["workspace"]["content_markdown"], second_content)
             self.assertEqual(updated_workspace.json()["workspace"]["answers"]["project_name"], "AI 花园第二版")
+
+            saved_copy = await self.client.post(
+                f"/api/curriculum-courses/{course_id}/workspace/save-as",
+                headers=self.student_a_headers,
+                json={
+                    "title": "AI 花园实验副本",
+                    "content_markdown": second_content,
+                    "answers": {"project_name": "副本一", "direction": "科技"},
+                },
+            )
+            self.assertEqual(saved_copy.status_code, 200, saved_copy.text)
+            copy_project = saved_copy.json()["project"]
+            self.assertNotEqual(copy_project["id"], project_id)
+            self.assertEqual(copy_project["project_category"], "course_workspace")
+            self.assertFalse(copy_project["workspace_is_primary"])
+            second_copy = await self.client.post(
+                f"/api/curriculum-courses/{course_id}/workspace/save-as",
+                headers=self.student_a_headers,
+                json={
+                    "title": "AI 花园展示副本",
+                    "content_markdown": second_content + "\n\n展示版。",
+                    "answers": {"project_name": "副本二", "direction": "自然"},
+                },
+            )
+            self.assertEqual(second_copy.status_code, 200, second_copy.text)
+            self.assertEqual((await self.client.post(
+                f"/api/curriculum-courses/{course_id}/workspace/save-as",
+                headers=self.student_b_headers,
+                json={"title": "越权副本", "content_markdown": second_content, "answers": {}},
+            )).status_code, 403)
+
+            final_content = second_content + "\n\n主工程包继续更新。"
+            final_workspace = await self.client.put(
+                f"/api/curriculum-courses/{course_id}/workspace",
+                headers=self.student_a_headers,
+                json={
+                    "content_markdown": final_content,
+                    "answers": {"project_name": "AI 花园主工程", "direction": "科技"},
+                },
+            )
+            self.assertEqual(final_workspace.status_code, 200, final_workspace.text)
+            self.assertEqual(final_workspace.json()["workspace"]["project_id"], project_id)
             student_projects = (await self.client.get("/api/projects", headers=self.student_a_headers)).json()["projects"]
             course_projects = [item for item in student_projects if item["curriculum_course_id"] == course_id]
-            self.assertEqual(len(course_projects), 1)
-            self.assertEqual(course_projects[0]["summary"], second_content)
+            self.assertEqual(len(course_projects), 3)
+            primary_projects = [item for item in course_projects if item["workspace_is_primary"]]
+            self.assertEqual(len(primary_projects), 1)
+            self.assertEqual(primary_projects[0]["id"], project_id)
+            self.assertEqual(primary_projects[0]["summary"], final_content)
+            category_projects = (await self.client.get(
+                "/api/projects?project_category=course_workspace",
+                headers=self.student_a_headers,
+            )).json()["projects"]
+            self.assertEqual({item["id"] for item in category_projects}, {item["id"] for item in course_projects})
+            self.assertEqual((await self.client.get(
+                "/api/projects?project_category=unknown",
+                headers=self.student_a_headers,
+            )).status_code, 400)
+            verification_db = self.Session()
+            try:
+                self.assertEqual(
+                    verification_db.query(SubmissionVersion).filter(
+                        SubmissionVersion.project_id.in_([item["id"] for item in course_projects])
+                    ).count(),
+                    0,
+                )
+            finally:
+                verification_db.close()
 
             submitted = await self.client.post(
                 f"/api/course-schedules/{schedule_id}/submissions", headers=self.student_a_headers,
@@ -6672,7 +6830,7 @@ class AccountMigrationTests(unittest.TestCase):
             connection = sqlite3.connect(database_path)
             try:
                 revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()[0]
-                self.assertEqual(revision, "20260823_0006")
+                self.assertEqual(revision, "20260826_0007")
                 submission_rows = connection.execute(
                     "SELECT id, task_id, user_id, version_count FROM task_submissions ORDER BY id"
                 ).fetchall()
@@ -6705,6 +6863,68 @@ class AccountMigrationTests(unittest.TestCase):
                     row[1] for row in connection.execute("PRAGMA index_list(ai_generation_jobs)")
                 }
                 self.assertIn("sqlite_autoindex_ai_generation_jobs_1", ai_job_indexes)
+            finally:
+                connection.close()
+
+    def test_project_category_sqlite_migration_is_backed_up_and_allows_copies(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            database_path = root / "coderai.db"
+            connection = sqlite3.connect(database_path)
+            try:
+                connection.executescript("""
+                    CREATE TABLE projects (
+                        id INTEGER PRIMARY KEY,
+                        organization_id INTEGER NOT NULL DEFAULT 1,
+                        user_id INTEGER,
+                        curriculum_course_id INTEGER,
+                        title VARCHAR(160) NOT NULL
+                    );
+                    CREATE UNIQUE INDEX ux_projects_org_student_curriculum_course
+                    ON projects(organization_id, user_id, curriculum_course_id);
+                    INSERT INTO projects VALUES (1, 1, 10, 20, '旧工程包');
+                    INSERT INTO projects VALUES (2, 1, 10, NULL, '旧 AI 作品');
+                """)
+                connection.commit()
+            finally:
+                connection.close()
+
+            with patch.object(db_module, "DATA_DIR", root), patch.object(db_module, "DB_PATH", database_path):
+                db_module.backup_database_before_project_category_migration()
+                backup_path = root / "migration-backups" / "coderai-before-project-categories.db"
+                self.assertTrue(backup_path.is_file())
+                first_hash = hashlib.sha256(backup_path.read_bytes()).hexdigest()
+                db_module.backup_database_before_project_category_migration()
+                self.assertEqual(hashlib.sha256(backup_path.read_bytes()).hexdigest(), first_hash)
+
+            migration_engine = create_engine(f"sqlite:///{database_path}")
+            with migration_engine.begin() as migration_connection:
+                db_module.migrate_project_category_schema(migration_connection)
+                db_module.migrate_project_category_schema(migration_connection)
+            migration_engine.dispose()
+
+            connection = sqlite3.connect(database_path)
+            try:
+                rows = connection.execute(
+                    "SELECT id, project_category, workspace_is_primary FROM projects ORDER BY id"
+                ).fetchall()
+                self.assertEqual(rows, [
+                    (1, "course_workspace", 1),
+                    (2, "ai_generated", 0),
+                ])
+                connection.execute(
+                    "INSERT INTO projects (organization_id, user_id, curriculum_course_id, title, project_category, workspace_is_primary) "
+                    "VALUES (1, 10, 20, '副本一', 'course_workspace', 0)"
+                )
+                connection.execute(
+                    "INSERT INTO projects (organization_id, user_id, curriculum_course_id, title, project_category, workspace_is_primary) "
+                    "VALUES (1, 10, 20, '副本二', 'course_workspace', 0)"
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "INSERT INTO projects (organization_id, user_id, curriculum_course_id, title, project_category, workspace_is_primary) "
+                        "VALUES (1, 10, 20, '第二个主工程包', 'course_workspace', 1)"
+                    )
             finally:
                 connection.close()
 

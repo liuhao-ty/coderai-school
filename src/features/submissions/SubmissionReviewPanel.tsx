@@ -1,8 +1,8 @@
 import {
-  Alert, App as AntApp, Button, Card, Checkbox, Col, Drawer, Form, Input, InputNumber, List, Popconfirm, Row, Select, Space, Statistic, Tag, Typography
+  Alert, App as AntApp, Button, Card, Checkbox, Col, Collapse, Drawer, Form, Input, InputNumber, List, Popconfirm, Row, Select, Space, Spin, Statistic, Tag, Typography
 } from "antd";
 import dayjs from "dayjs";
-import { ClipboardList, Eye, FileDown, Library, Plus, Trash2 } from "lucide-react";
+import { ClipboardList, Eye, FileDown, Plus, Trash2 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -15,6 +15,7 @@ import { projectTypeLabel, submissionStatusColor, submissionStatusLabel } from "
 import { explainError } from "../../lib/errors";
 import { formatBeijingTime } from "../../lib/format";
 import { ProjectFileStatus } from "../projects/ProjectLibrary";
+import { SubmissionVersionFilePreview } from "./SubmissionVersionFilePreview";
 
 
 const { Text, Paragraph } = Typography;
@@ -31,13 +32,11 @@ export function SubmissionReviewPanel({
   const { message } = AntApp.useApp();
   const [reviewingId, setReviewingId] = useState<number | null>(null);
   const [previewProject, setPreviewProject] = useState<Project | null>(null);
-  const [loadingProjectId, setLoadingProjectId] = useState<number | null>(null);
+  const [previewSubmissionVersion, setPreviewSubmissionVersion] = useState<SubmissionVersion | null>(null);
+  const [loadingSubmissionId, setLoadingSubmissionId] = useState<number | null>(null);
   const [statusFilter, setStatusFilter] = useState<string>("all");
   const [submissionKeyword, setSubmissionKeyword] = useState("");
   const [bulkReviewing, setBulkReviewing] = useState(false);
-  const [versionSubmission, setVersionSubmission] = useState<TaskSubmission | null>(null);
-  const [versions, setVersions] = useState<SubmissionVersion[]>([]);
-  const [versionsLoading, setVersionsLoading] = useState(false);
   const [templateForm] = Form.useForm<{ name: string; content: string }>();
   const [feedbackTemplates, setFeedbackTemplates] = useState<FeedbackTemplateItem[]>([]);
   const [statistics, setStatistics] = useState<SubmissionStatistics | null>(null);
@@ -160,27 +159,24 @@ export function SubmissionReviewPanel({
   };
 
   const openSubmittedProject = async (submission: TaskSubmission) => {
-    setLoadingProjectId(submission.project_id);
+    setLoadingSubmissionId(submission.id);
     try {
-      const res = await api.get(`/api/projects/${submission.project_id}`);
-      setPreviewProject(res.data.project);
+      if (submission.project_id) {
+        const res = await api.get(`/api/projects/${submission.project_id}`);
+        setPreviewProject(res.data.project);
+      } else {
+        const res = await api.get(`/api/submissions/${submission.id}/versions`);
+        const latestVersion = (res.data.versions || [])[0] as SubmissionVersion | undefined;
+        if (!latestVersion) {
+          message.info("这份提交暂无可预览版本");
+          return;
+        }
+        setPreviewSubmissionVersion(latestVersion);
+      }
     } catch (error) {
       message.error(explainError(error));
     } finally {
-      setLoadingProjectId(null);
-    }
-  };
-
-  const openSubmissionVersions = async (submission: TaskSubmission) => {
-    setVersionSubmission(submission);
-    setVersionsLoading(true);
-    try {
-      const res = await api.get(`/api/submissions/${submission.id}/versions`);
-      setVersions(res.data.versions || []);
-    } catch (error) {
-      message.error(explainError(error));
-    } finally {
-      setVersionsLoading(false);
+      setLoadingSubmissionId(null);
     }
   };
 
@@ -284,15 +280,13 @@ export function SubmissionReviewPanel({
                 <Button
                   size="small"
                   icon={<Eye size={15} />}
-                  loading={loadingProjectId === submission.project_id}
+                  loading={loadingSubmissionId === submission.id}
                   onClick={() => openSubmittedProject(submission)}
                 >
                   查看作品
                 </Button>
-                <Button size="small" icon={<Library size={15} />} onClick={() => openSubmissionVersions(submission)}>
-                  查看提交历史
-                </Button>
               </Space>
+              <SubmissionHistoryCollapse submission={submission} />
               {submission.can_review === false || (submission.student_archived && audience !== "admin") ? (
                 <Alert
                   type="info"
@@ -381,13 +375,103 @@ export function SubmissionReviewPanel({
           </Space>
         )}
       </Drawer>
-      <SubmissionVersionsDrawer
-        submission={versionSubmission}
-        versions={versions}
-        loading={versionsLoading}
-        onClose={() => setVersionSubmission(null)}
-      />
+      <Drawer
+        title={previewSubmissionVersion ? `${previewSubmissionVersion.project_title} · 第 ${previewSubmissionVersion.version_number} 版` : "提交文件"}
+        open={Boolean(previewSubmissionVersion)}
+        width={820}
+        onClose={() => setPreviewSubmissionVersion(null)}
+      >
+        {previewSubmissionVersion && (
+          <Space direction="vertical" size={16} className="fullWidth">
+            <article className="markdownPreview">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                {previewSubmissionVersion.project_summary || "该版本没有 Markdown 内容。"}
+              </ReactMarkdown>
+            </article>
+            <SubmissionVersionFilePreview version={previewSubmissionVersion} />
+          </Space>
+        )}
+      </Drawer>
     </Card>
+  );
+}
+
+function SubmissionVersionHistoryList({ versions }: { versions: SubmissionVersion[] }) {
+  const [previewVersionId, setPreviewVersionId] = useState<number | null>(null);
+
+  return (
+    <List
+      dataSource={versions}
+      locale={{ emptyText: "暂无版本记录" }}
+      renderItem={(version) => {
+        const previewing = previewVersionId === version.id;
+        return (
+          <List.Item>
+            <Space direction="vertical" size={10} className="fullWidth">
+              <Space wrap>
+                <Tag color="purple">版本 {version.version_number}</Tag>
+                {version.is_late && <Tag color="red">逾期</Tag>}
+                <Text strong>{version.project_title}</Text>
+                <Text type="secondary">{formatBeijingTime(version.created_at)}</Text>
+                <Button
+                  size="small"
+                  icon={<Eye size={15} />}
+                  onClick={() => setPreviewVersionId(previewing ? null : version.id)}
+                >
+                  {previewing ? "收起预览" : "预览版本"}
+                </Button>
+              </Space>
+              {previewing && (
+                <div className="submissionHistoryPreview">
+                  <article className="markdownPreview">
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                      {version.project_summary || "这个版本暂无文字内容。"}
+                    </ReactMarkdown>
+                  </article>
+                  <SubmissionVersionFilePreview version={version} />
+                </div>
+              )}
+            </Space>
+          </List.Item>
+        );
+      }}
+    />
+  );
+}
+
+function SubmissionHistoryCollapse({ submission }: { submission: TaskSubmission }) {
+  const { message } = AntApp.useApp();
+  const [versions, setVersions] = useState<SubmissionVersion[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+
+  const loadVersions = async () => {
+    if (loaded || loading) return;
+    setLoading(true);
+    try {
+      const response = await api.get(`/api/submissions/${submission.id}/versions`);
+      setVersions(response.data.versions || []);
+      setLoaded(true);
+    } catch (error) {
+      message.error(explainError(error));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <Collapse
+      size="small"
+      className="submissionHistoryCollapse"
+      onChange={(keys) => {
+        if (keys.length) void loadVersions();
+      }}
+      items={[{
+        key: "history",
+        label: `提交历史（${submission.version_count || 0}）`,
+        children: loading ? <Spin size="small" /> : <SubmissionVersionHistoryList versions={versions} />,
+      }]}
+    />
   );
 }
 
@@ -405,26 +489,7 @@ export function SubmissionVersionsDrawer({
   return (
     <Drawer title={submission ? `${submission.task_title} · 提交历史` : "提交历史"} open={Boolean(submission)} width={760} onClose={onClose}>
       {loading ? <Alert type="info" showIcon message="正在读取提交历史" /> : (
-        <List
-          dataSource={versions}
-          locale={{ emptyText: "暂无版本记录" }}
-          renderItem={(version) => (
-            <List.Item>
-              <Space direction="vertical" size={10} className="fullWidth">
-                <Space wrap>
-                  <Tag color="purple">版本 {version.version_number}</Tag>
-                  {version.is_late && <Tag color="red">逾期</Tag>}
-                  <Text strong>{version.project_title}</Text>
-                  <Text type="secondary">{formatBeijingTime(version.created_at)}</Text>
-                </Space>
-                <article className="markdownPreview">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{version.project_summary || "这个版本暂无文字内容。"}</ReactMarkdown>
-                </article>
-                {version.project_file_path && <Text type="secondary">文件快照：{version.project_file_path}</Text>}
-              </Space>
-            </List.Item>
-          )}
-        />
+        <SubmissionVersionHistoryList versions={versions} />
       )}
     </Drawer>
   );

@@ -1,10 +1,13 @@
 export type SchoolStage = "primary_lower" | "primary_upper" | "secondary";
+export type ProjectCategory = "course_workspace" | "ai_generated";
 
 export type Project = {
   id: number;
   owner_teacher_id?: number | null;
   title: string;
   project_type: string;
+  project_category: ProjectCategory;
+  workspace_is_primary?: boolean;
   user_id?: number | null;
   curriculum_course_id?: number | null;
   student_archived?: boolean;
@@ -252,15 +255,15 @@ export type SubmissionVersion = {
   source_type: "project" | "attachment";
   project_title: string;
   project_summary: string;
-    project_file_path: string;
-    file_available: boolean;
-    file?: {
-      original_file_name: string;
-      mime_type: string;
-      file_size: number;
-      safety_status: "approved" | "pending" | "rejected";
-      source_type: "project" | "attachment";
-    } | null;
+  project_file_path: string;
+  file_available: boolean;
+  file?: {
+    original_file_name: string;
+    mime_type: string;
+    file_size: number;
+    safety_status: "approved" | "pending" | "rejected";
+    source_type: "project" | "attachment";
+  } | null;
   attachment?: {
     id: number;
     original_file_name: string;
@@ -284,7 +287,14 @@ export type AIGenerationJob = {
   provider_id?: number | null;
   model: string;
   status: "queued" | "running" | "succeeded" | "failed" | "timed_out" | "canceled";
-  result: Record<string, unknown> & { text?: string; artifact_id?: number; video_task_id?: number; file_available?: boolean };
+  result: Record<string, unknown> & {
+    text?: string;
+    artifact_id?: number;
+    video_task_id?: number;
+    file_available?: boolean;
+    moderation_status?: "approved" | "pending" | "rejected";
+    moderation_reason?: string;
+  };
   error_code: string;
   error_message: string;
   retry_count: number;

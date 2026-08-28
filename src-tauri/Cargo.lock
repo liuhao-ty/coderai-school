@@ -484,7 +484,7 @@ dependencies = [
 
 [[package]]
 name = "coderai-school"
-version = "0.2.0-beta.7"
+version = "0.2.0-beta.8"
 dependencies = [
  "keyring-core",
  "log",

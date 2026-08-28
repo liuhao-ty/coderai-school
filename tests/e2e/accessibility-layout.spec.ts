@@ -139,7 +139,8 @@ async function seedResponsiveCurriculum(request: APIRequestContext) {
     },
   });
   expect(scheduleResponse.ok()).toBeTruthy();
-  return { studentAuth, teacherAuth, packageTitle, courseTitle };
+  const scheduleId = (await scheduleResponse.json()).schedules[0].id as number;
+  return { studentAuth, teacherAuth, packageTitle, courseTitle, scheduleId };
 }
 
 async function setStudentAuth(page: Page, studentAuth: Record<string, unknown>) {
@@ -642,6 +643,8 @@ test("图片作品支持本地与云端预览下载且不显示云端地址", as
     classroom_id: 1,
     owner_name: "图片测试学生",
     project_type: "image",
+    project_category: "ai_generated",
+    workspace_is_primary: false,
     summary: "## 图片作品说明",
     lifecycle_status: "active",
     moderation_status: "approved",
@@ -708,6 +711,10 @@ test("图片作品支持本地与云端预览下载且不显示云端地址", as
   const studentSelect = studentFilter.locator("xpath=ancestor::div[contains(concat(' ',normalize-space(@class),' '),' ant-select ')][1]");
   await studentSelect.hover();
   await studentSelect.locator(".ant-select-clear").click();
+  await expect(page.locator(".projectLedgerRow")).toHaveCount(projects.length);
+  await page.locator(".projectCategorySwitcher .ant-segmented-item").filter({ hasText: "工程包" }).click();
+  await expect(page.locator(".projectLedgerRow")).toHaveCount(0);
+  await page.locator(".projectCategorySwitcher .ant-segmented-item").filter({ hasText: "AI 生成" }).click();
   await expect(page.locator(".projectLedgerRow")).toHaveCount(projects.length);
   const classroomFilter = page.getByRole("combobox", { name: "按班级筛选作品" });
   await classroomFilter.fill("默认");
@@ -1015,6 +1022,56 @@ test("学生学习工作台使用二级导航并兼容旧工作流地址", async
   await expect(page.getByText("代码解释", { exact: true })).toHaveCount(0);
 });
 
+test("学生图片任务在教师审批前隐藏预览并可刷新放行状态", async ({ page, request }) => {
+  const { studentAuth } = await loginData(request);
+  let reviewStatus: "pending" | "approved" = "pending";
+  const jobPayload = () => ({
+    id: 515,
+    client_request_id: "e2e-image-review",
+    capability: "image",
+    operation: "generate",
+    model: "seedream-test",
+    status: "succeeded",
+    result: {
+      moderation_status: reviewStatus,
+      moderation_reason: reviewStatus === "pending" ? "等待教师审批" : "教师已审批",
+      file_available: reviewStatus === "approved",
+    },
+    error_code: "",
+    error_message: "",
+    retry_count: 0,
+    cancel_requested: false,
+    project_id: 616,
+    created_at: "2026-08-28T10:00:00+08:00",
+    updated_at: "2026-08-28T10:01:00+08:00",
+  });
+  await page.route("**/api/ai/jobs", (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({ jobs: [jobPayload()] }),
+  }));
+  await page.route("**/api/ai/jobs/515", (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({ job: jobPayload() }),
+  }));
+  await page.route("**/api/ai/jobs/515/file", (route) => route.fulfill({
+    status: 200,
+    contentType: "image/png",
+    body: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"),
+  }));
+
+  await setStudentAuth(page, studentAuth);
+  await page.getByRole("menuitem", { name: "图片生成" }).click();
+  await expect(page.getByText("等待教师审批", { exact: true })).toBeVisible();
+  await expect(page.locator("img.generatedImage")).toHaveCount(0);
+
+  reviewStatus = "approved";
+  await page.getByRole("button", { name: "刷新状态" }).click();
+  await expect(page.getByText("等待教师审批", { exact: true })).toHaveCount(0);
+  await expect(page.locator("img.generatedImage")).toBeVisible();
+});
+
 test("长文字标题和实时 Markdown 编辑器适配三个目标视口", async ({ browser, request }) => {
   test.setTimeout(120_000);
   const { studentAuth } = await loginData(request);
@@ -1075,7 +1132,19 @@ test("学生端和管理员端适配三个目标 Windows 分辨率", async ({ br
 
 test("课程目录、排课表和管理员 PDF 抽屉适配三个目标 Windows 分辨率", async ({ browser, request }) => {
   test.setTimeout(180_000);
-  const { studentAuth, teacherAuth, packageTitle, courseTitle } = await seedResponsiveCurriculum(request);
+  const { studentAuth, teacherAuth, packageTitle, courseTitle, scheduleId } = await seedResponsiveCurriculum(request);
+  const attachmentResponse = await request.post(`${API_URL}/api/course-schedules/${scheduleId}/submissions/file`, {
+    headers: { "X-CoderAI-Student-Token": studentAuth.token as string },
+    multipart: {
+      title: "本机预览作业",
+      file: {
+        name: "本机预览作业.md",
+        mimeType: "text/markdown",
+        buffer: Buffer.from("# 本机附件预览\n\n教师和学生均可通过鉴权接口预览。", "utf8"),
+      },
+    },
+  });
+  expect(attachmentResponse.ok()).toBeTruthy();
 
   for (const viewport of viewportCases) {
     await test.step(viewport.name, async () => {
@@ -1086,6 +1155,15 @@ test("课程目录、排课表和管理员 PDF 抽屉适配三个目标 Windows 
       const page = await context.newPage();
 
       await setTeacherAuth(page, teacherAuth);
+      await page.getByRole("menuitem", { name: "作业批改" }).click();
+      const reviewItem = page.locator(".ant-list-item").filter({ hasText: courseTitle }).first();
+      const reviewHistory = reviewItem.locator(".submissionHistoryCollapse");
+      await expect(reviewHistory).toBeVisible();
+      await reviewHistory.locator(".ant-collapse-header").click();
+      const attachmentVersion = reviewHistory.locator(".ant-list-item").filter({ hasText: "本机预览作业" });
+      await attachmentVersion.getByRole("button", { name: "预览版本" }).click();
+      await expect(attachmentVersion.getByRole("heading", { name: "本机附件预览" })).toBeVisible();
+      await expectNoHorizontalOverflow(page);
       const packageMenuItem = page.getByRole("menuitem").filter({ hasText: packageTitle });
       await expect(packageMenuItem).toBeVisible();
       await packageMenuItem.click();
@@ -1151,6 +1229,11 @@ test("课程目录、排课表和管理员 PDF 抽屉适配三个目标 Windows 
       await expect(workspaceDrawer.locator(".liveMarkdownPreview")).toContainText(`${viewport.name} 已完成在线编辑。`);
       await workspaceDrawer.getByRole("button", { name: "保存", exact: true }).click();
       await expect(workspaceDrawer.getByText(/保存于/)).toBeVisible();
+      await workspaceDrawer.getByRole("button", { name: "另存为", exact: true }).click();
+      const saveAsDialog = page.getByRole("dialog", { name: "另存为工程包副本" });
+      await saveAsDialog.getByLabel("工程包副本名称").fill(`${courseTitle} - ${viewport.name} 副本`);
+      await saveAsDialog.getByRole("button", { name: "保存副本", exact: true }).click();
+      await expect(page.getByText("已另存为新的工程包副本", { exact: true })).toBeVisible();
       await workspaceDrawer.locator(".ant-segmented-item").filter({ hasText: "预览" }).click();
       await expect(workspaceDrawer.getByRole("heading", { name: "我的课堂工程" })).toBeVisible();
       await workspaceDrawer.locator(".ant-drawer-close").click();
@@ -1166,6 +1249,10 @@ test("课程目录、排课表和管理员 PDF 抽屉适配三个目标 Windows 
       await expect(page).toHaveURL(/#\/student\/submissions\/\d+\/versions\/\d+$/);
       await expect(page.getByText("提交内容快照", { exact: true })).toBeVisible();
       await page.screenshot({ path: `test-results/layout-student-course-${viewport.name}.png`, fullPage: true });
+      await page.getByRole("menuitem", { name: "我的作品" }).click();
+      await expect(page.getByRole("heading", { name: "作品库" })).toBeVisible();
+      await page.locator(".projectCategorySwitcher .ant-segmented-item").filter({ hasText: "工程包" }).click();
+      await expect(page.locator(".projectCard").filter({ hasText: /主工程包|工程包副本/ }).first()).toBeVisible();
       await context.close();
     });
   }

@@ -11,7 +11,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import { LiveMarkdownEditor } from "../../components/LiveMarkdownEditor";
-import type { Classroom, Project } from "../../domain-types";
+import type { Classroom, Project, ProjectCategory } from "../../domain-types";
 import { EmptyState } from "../../components/PageState";
 import { api } from "../../lib/api";
 import { saveBlobFile } from "../../lib/downloads";
@@ -22,6 +22,14 @@ import type { StudentProfile } from "../../types";
 
 
 const { Title, Text, Paragraph } = Typography;
+type ProjectCategoryFilter = "all" | ProjectCategory;
+
+const projectCategoryOf = (project: Project): ProjectCategory =>
+  project.project_category || (project.curriculum_course_id ? "course_workspace" : "ai_generated");
+
+const projectCategoryTag = (project: Project) => projectCategoryOf(project) === "course_workspace"
+  ? <Tag color="cyan">{project.workspace_is_primary ? "主工程包" : "工程包副本"}</Tag>
+  : <Tag color="purple">AI 生成</Tag>;
 
 export function ProjectFileStatus({ project, compact = false }: { project: Project; compact?: boolean }) {
   if (project.file_status === "none") {
@@ -66,6 +74,7 @@ export function ProjectLibrary({
   const [draftSummary, setDraftSummary] = useState("");
   const [searchText, setSearchText] = useState("");
   const [typeFilter, setTypeFilter] = useState<string>("all");
+  const [categoryFilter, setCategoryFilter] = useState<ProjectCategoryFilter>("all");
   const [studentFilter, setStudentFilter] = useState<number>();
   const [classroomFilter, setClassroomFilter] = useState<number>();
   const [submittedRange, setSubmittedRange] = useState<[Dayjs | null, Dayjs | null] | null>(null);
@@ -101,6 +110,7 @@ export function ProjectLibrary({
         scope,
         ...(isTeacherView && searchText.trim() ? { q: searchText.trim() } : {}),
         ...(isTeacherView && typeFilter !== "all" ? { project_type: typeFilter } : {}),
+        ...(categoryFilter !== "all" ? { project_category: categoryFilter } : {}),
         ...(isTeacherView && studentFilter ? { student_id: studentFilter } : {}),
         ...(isTeacherView && classroomFilter ? { classroom_id: classroomFilter } : {}),
         ...(isTeacherView && submittedRange?.[0]
@@ -149,7 +159,7 @@ export function ProjectLibrary({
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [classroomFilter, isTeacherView, projectScope, searchText, studentFilter, submittedRange, typeFilter]);
+  }, [categoryFilter, classroomFilter, isTeacherView, projectScope, searchText, studentFilter, submittedRange, typeFilter]);
 
   useEffect(() => () => {
     projectRequestRef.current?.abort();
@@ -171,14 +181,21 @@ export function ProjectLibrary({
         project.summary.toLowerCase().includes(keyword) ||
         student?.username.toLowerCase().includes(keyword);
       const matchesType = typeFilter === "all" || project.project_type === typeFilter;
+      const matchesCategory = categoryFilter === "all" || projectCategoryOf(project) === categoryFilter;
       const matchesStudent = !studentFilter || project.user_id === studentFilter;
       const matchesClassroom = !classroomFilter || project.classroom_id === classroomFilter;
       const submittedAt = project.latest_submitted_at ? dayjs(project.latest_submitted_at) : null;
       const matchesSubmittedFrom = !submittedRange?.[0] || Boolean(submittedAt?.isAfter(submittedRange[0].startOf("day")) || submittedAt?.isSame(submittedRange[0].startOf("day")));
       const matchesSubmittedTo = !submittedRange?.[1] || Boolean(submittedAt?.isBefore(submittedRange[1].endOf("day")) || submittedAt?.isSame(submittedRange[1].endOf("day")));
-      return matchesKeyword && matchesType && matchesStudent && matchesClassroom && matchesSubmittedFrom && matchesSubmittedTo;
+      return matchesKeyword && matchesType && matchesCategory && matchesStudent && matchesClassroom && matchesSubmittedFrom && matchesSubmittedTo;
     });
-  }, [classroomFilter, libraryProjects, searchText, studentFilter, students, submittedRange, typeFilter]);
+  }, [categoryFilter, classroomFilter, libraryProjects, searchText, studentFilter, students, submittedRange, typeFilter]);
+
+  const emptyProjectDescription = categoryFilter === "course_workspace"
+    ? "在课程学习中保存工程包后，会显示在这里"
+    : categoryFilter === "ai_generated"
+      ? "使用文字、图片、视频或工作流工具生成内容后，会显示在这里"
+      : "保存工程包或完成一次 AI 创作后，作品会显示在这里";
 
   const classroomName = (classroomId?: number | null) =>
     classrooms.find((classroom) => classroom.id === classroomId)?.name || (classroomId ? "未命名班级" : "未分配班级");
@@ -450,6 +467,7 @@ export function ProjectLibrary({
       width: 160,
       render: (_, project) => (
         <Space wrap size={[4, 4]}>
+          {projectCategoryTag(project)}
           <Tag>{projectTypeLabel(project.project_type)}</Tag>
           {lifecycleLabel(project)}
           {moderationLabel(project)}
@@ -510,24 +528,37 @@ export function ProjectLibrary({
           <Title level={2}>{isTeacherView ? "作品管理" : "作品库"}</Title>
           <Text>
             {isTeacherView
-              ? "查看学生保存和提交过的 AI 作品，支持按班级、学生和作品类型筛选。"
-              : "学生生成的文字、图片、视频和工作流结果会保存在这里。"}
+              ? "查看学生保存的工程包与 AI 生成内容，支持按分类、班级、学生和作品类型筛选。"
+              : "工程包保存内容与 AI 生成内容会分类保存在这里。"}
           </Text>
         </div>
         <Button icon={<Save size={16} />} onClick={refreshLibrary}>
           刷新
         </Button>
       </div>
-      <Segmented
-        className="projectScopeSwitcher"
-        value={projectScope}
-        onChange={(value) => setProjectScope(value as "active" | "archived" | "trash")}
-        options={[
-          { value: "active", label: <Space size={6}><Library size={15} />正常作品</Space> },
-          { value: "archived", label: <Space size={6}><Archive size={15} />已归档</Space> },
-          { value: "trash", label: <Space size={6}><Trash2 size={15} />回收站</Space> }
-        ]}
-      />
+      <div className="projectLibrarySwitchers">
+        <Segmented
+          className="projectScopeSwitcher"
+          value={projectScope}
+          onChange={(value) => setProjectScope(value as "active" | "archived" | "trash")}
+          options={[
+            { value: "active", label: <Space size={6}><Library size={15} />正常作品</Space> },
+            { value: "archived", label: <Space size={6}><Archive size={15} />已归档</Space> },
+            { value: "trash", label: <Space size={6}><Trash2 size={15} />回收站</Space> }
+          ]}
+        />
+        <Segmented
+          className="projectCategorySwitcher"
+          aria-label="作品内容分类"
+          value={categoryFilter}
+          onChange={(value) => setCategoryFilter(value as ProjectCategoryFilter)}
+          options={[
+            { value: "all", label: "全部内容" },
+            { value: "course_workspace", label: "工程包" },
+            { value: "ai_generated", label: "AI 生成" },
+          ]}
+        />
+      </div>
       {isTeacherView && (
         <div className="projectLedgerControls">
           <section className="teachingMetricStrip projectMetricStrip" aria-label="作品统计">
@@ -629,7 +660,7 @@ export function ProjectLibrary({
                 ? <EmptyState title="还没有归档作品" description="归档后的作品会显示在这里" />
                 : projectScope === "trash"
                   ? <EmptyState title="回收站为空" description="移入回收站的作品会暂存在这里" />
-                  : <EmptyState title="还没有作品" description="完成一次 AI 创作后，作品会自动保存在这里" />
+                  : <EmptyState title="还没有作品" description={emptyProjectDescription} />
             }}
             onRow={(project) => ({
               className: "projectLedgerRow",
@@ -647,7 +678,7 @@ export function ProjectLibrary({
               ? <EmptyState title="还没有归档作品" description="归档后的作品会显示在这里" />
               : projectScope === "trash"
                 ? <EmptyState title="回收站为空" description="移入回收站的作品会暂存在这里" />
-                : <EmptyState title="还没有作品" description="完成一次 AI 创作后，作品会自动保存在这里" />
+                : <EmptyState title="还没有作品" description={emptyProjectDescription} />
           }}
           renderItem={(project) => (
             <List.Item>
@@ -659,6 +690,7 @@ export function ProjectLibrary({
               >
                 <Space direction="vertical" size={8}>
                   <Space wrap>
+                    {projectCategoryTag(project)}
                     <Tag>{projectTypeLabel(project.project_type)}</Tag>
                     {lifecycleLabel(project)}
                   </Space>
@@ -687,6 +719,7 @@ export function ProjectLibrary({
               <Col xs={24} md={16}>
                 <Text type="secondary">作品类型</Text>
                 <div>
+                  {projectCategoryTag(selectedProject)}
                   <Tag>{projectTypeLabel(selectedProject.project_type)}</Tag>
                   {lifecycleLabel(selectedProject)}
                   {isTeacherView && moderationLabel(selectedProject)}
